@@ -113,7 +113,7 @@ if __name__ == "__main__":
     parser.add_argument("--render", action="store_true", help="Render during training")
     parser.add_argument("--debug", action="store_true", help="Show debug info")
     parser.add_argument("--resume", action="store_true", help="Resume training")
-    parser.add_argument("--timesteps", type=int, default=1_000_000, help="Total timesteps")
+    parser.add_argument("--timesteps", type=int, default=90_000, help="Total timesteps")
     parser.add_argument("--model_path", default="kungfu_ppo", help="Model path")
     
     args = parser.parse_args()

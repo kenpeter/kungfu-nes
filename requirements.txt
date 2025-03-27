@@ -1,9 +1,10 @@
-# Stable Baselines3 and Gym Retro Requirements
-gym==0.21.0
+# requirements.txt
+gym==0.26.2
 stable-baselines3==1.8.0
-gym-retro==0.8.0
-pyglet==1.5.0  # Compatible with Python 3.7
-numpy>=1.18.0
-opencv-python>=4.2.0  # For image processing
-tensorboard>=2.4.0  # For training visualization
-torch==1.8.1  # Matching stable-baselines3 compatibility
+gym-retro==0.7.1
+pyglet==1.5.27
+numpy==1.26.4
+opencv-python==4.9.0.80
+tensorboard==2.16.2
+torch==2.2.1
+tqdm==4.66.2
