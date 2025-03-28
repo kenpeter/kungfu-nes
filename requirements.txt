@@ -1,10 +1,9 @@
-# requirements.txt
-gym==0.26.2
+gym==0.21.0
 stable-baselines3==1.8.0
 gym-retro==0.7.1
 pyglet==1.5.27
-numpy==1.26.4
-opencv-python==4.9.0.80
-tensorboard==2.16.2
-torch==2.2.1
+numpy==1.21.6
+opencv-python==4.5.5.64
+tensorboard==2.8.0
+torch==1.13.1
 tqdm==4.66.2
