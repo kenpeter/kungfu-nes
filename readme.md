@@ -1,11 +1,3 @@
-# Train with rendering
-python train.py --render --timesteps 2000000
-
-# Resume training
-python train.py --resume --model_path my_saved_model
-
-# Play trained model
-python train.py --play --model_path kungfu_ppo
-
-# Debug mode
-python train.py --play --debug
+python script.py --train --num_envs 8 --cuda --progress_bar
+For playing/testing a trained model:
+Copypython script.py --play --render --deterministic
