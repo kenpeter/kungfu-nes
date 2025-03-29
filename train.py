@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import signal
 import sys
+import logging
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
 from stable_baselines3.common.env_util import make_vec_env
@@ -16,45 +17,33 @@ from tqdm import tqdm
 from gym import spaces, Wrapper
 from gym.wrappers import TimeLimit
 
-# Global variable to store the model for Ctrl+C handling
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Global variables for Ctrl+C handling
 global_model = None
 global_model_path = None
-
-class FrameStackWrapper(Wrapper):
-    """Custom frame stack wrapper for play mode"""
-    def __init__(self, env, n_stack=4):
-        super().__init__(env)
-        self.n_stack = n_stack
-        self.frames = []
-        self.observation_space = spaces.Box(
-            low=0, high=255,
-            shape=(n_stack, *env.observation_space.shape[:-1]),  # Remove channel dim
-            dtype=np.uint8
-        )
-
-    def reset(self):
-        obs = self.env.reset()
-        self.frames = [obs[..., 0]] * self.n_stack  # Use only first channel
-        return np.stack(self.frames)
-
-    def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        self.frames.pop(0)
-        self.frames.append(obs[..., 0])  # Use only first channel
-        return np.stack(self.frames), reward, done, info
 
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.action_space = spaces.Discrete(14)
+        # NES Kung Fu button mapping: [B, A, Select, Start, Up, Down, Left, Right, B+A, etc.]
         self._actions = [
-            [0]*12, [1,0,0,0,0,0,0,0,0,0,0,0], [0,1,0,0,0,0,0,0,0,0,0,0],
-            [1,1,0,0,0,0,0,0,0,0,0,0], [0,0,0,0,1,0,0,0,0,0,0,0],
-            [0,0,0,0,0,1,0,0,0,0,0,0], [0,0,0,0,0,0,1,0,0,0,0,0],
-            [0,0,0,0,0,0,0,1,0,0,0,0], [1,0,0,0,0,0,0,1,0,0,0,0],
-            [0,1,0,0,0,0,1,0,0,0,0,0], [1,0,0,0,1,0,0,0,0,0,0,0],
-            [0,0,0,0,1,0,1,0,0,0,0,0], [1,0,0,0,0,0,1,0,0,0,0,0],
-            [0,1,0,0,0,0,0,1,0,0,0,0]
+            [0,0,0,0,0,0,0,0,0,0,0,0],  # No action
+            [1,0,0,0,0,0,0,0,0,0,0,0],  # B (Punch)
+            [0,1,0,0,0,0,0,0,0,0,0,0],  # A (Kick)
+            [1,1,0,0,0,0,0,0,0,0,0,0],  # B+A
+            [0,0,0,0,1,0,0,0,0,0,0,0],  # Up
+            [0,0,0,0,0,1,0,0,0,0,0,0],  # Down
+            [0,0,0,0,0,0,1,0,0,0,0,0],  # Left
+            [0,0,0,0,0,0,0,1,0,0,0,0],  # Right
+            [1,0,0,0,0,0,0,1,0,0,0,0],  # B+Right
+            [0,1,0,0,0,0,1,0,0,0,0,0],  # A+Left
+            [1,0,0,0,1,0,0,0,0,0,0,0],  # B+Up
+            [0,0,0,0,1,0,1,0,0,0,0,0],  # Up+Left
+            [1,0,0,0,0,0,1,0,0,0,0,0],  # B+Left
+            [0,1,0,0,0,0,0,1,0,0,0,0]   # A+Right
         ]
 
     def action(self, action):
@@ -78,12 +67,17 @@ class KungFuRewardWrapper(Wrapper):
         current_x = info.get('x_pos', 0)
         health = info.get('health', 3)
         
+        # Reward moving left (decreasing x), penalize moving right or staying still
+        x_delta = self.last_x - current_x  # Positive if moving left
         reward = (
-            (current_score - self.last_score) * 0.1 +
-            max(0, current_x - self.last_x) * 0.3 +
-            (health - self.last_health) * 2.0 -
-            0.01  # Time penalty
+            (current_score - self.last_score) * 0.1 +  # Reward score increase
+            max(0, x_delta) * 0.5 +                    # Reward moving left
+            (health - self.last_health) * 2.0 -        # Health changes
+            0.01                                       # Time penalty
         )
+        
+        # Debug logging
+        logging.debug(f"x_pos: {current_x}, x_delta: {x_delta}, reward: {reward}")
         
         self.last_score = current_score
         self.last_x = current_x
@@ -109,17 +103,17 @@ class ProgressBarCallback(BaseCallback):
         self.pbar.close()
 
 class SaveCheckpointCallback(BaseCallback):
-    """
-    Callback for saving model checkpoints at regular intervals.
-    """
     def __init__(self, save_freq, save_path, name_prefix="model"):
         super().__init__()
         self.save_freq = save_freq
-        self.save_path = save_path
+        # Ensure save_path has a directory; default to current dir if none specified
+        if os.path.dirname(save_path) == '':
+            self.save_path = os.path.join(".", save_path)
+        else:
+            self.save_path = save_path
         self.name_prefix = name_prefix
         self.timesteps_elapsed = 0
         
-        # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
     
     def _on_step(self):
@@ -127,46 +121,34 @@ class SaveCheckpointCallback(BaseCallback):
         
         if self.timesteps_elapsed >= self.save_freq:
             self.timesteps_elapsed = 0
-            timesteps = self.num_timesteps
-            
-            # Create checkpoint filename with timesteps
-            checkpoint_path = f"{self.save_path}_{timesteps}.zip"
-            
-            # Save the model
+            checkpoint_path = f"{self.save_path}.zip"
             self.model.save(checkpoint_path)
-            print(f"\nCheckpoint saved: {checkpoint_path}")
+            logging.info(f"Checkpoint saved (overwritten): {checkpoint_path} at {self.num_timesteps:,} timesteps")
             
         return True
 
 def signal_handler(sig, frame):
-    """Handle Ctrl+C by saving the model before exiting"""
     if global_model is not None and global_model_path is not None:
-        print("\nCaught Ctrl+C! Saving model before exiting...")
-        
-        # Create emergency save filename with timestamp
+        logging.info("Caught Ctrl+C! Saving model before exiting...")
         emergency_path = f"{global_model_path}_emergency_{int(time.time())}.zip"
         global_model.save(emergency_path)
-        print(f"Emergency save completed: {emergency_path}")
-    
-    print("Exiting...")
+        logging.info(f"Emergency save completed: {emergency_path}")
+    logging.info("Exiting...")
     sys.exit(0)
 
-def make_env(render=False, test=False):
-    env = retro.make(
-        "KungFu-Nes",
-        use_restricted_actions=retro.Actions.ALL
-    )
+def make_env(render=False):
+    env = retro.make("KungFu-Nes", use_restricted_actions=retro.Actions.ALL)
     if render:
         env.render()
     env = KungFuDiscreteWrapper(env)
     env = KungFuRewardWrapper(env)
     env = TimeLimit(env, max_episode_steps=5000)
-    if test:  # Only apply frame stack in test mode
-        env = FrameStackWrapper(env, n_stack=4)
     return env
 
 def train(args):
     global global_model, global_model_path
+    
+    logging.info("Starting training")
     
     env = make_vec_env(
         lambda: make_env(args.render),
@@ -180,20 +162,11 @@ def train(args):
     
     model_path = args.model_path
     base_model_path = model_path + ".zip" if not model_path.endswith(".zip") else model_path
-    
-    # Set global model path for signal handler
     global_model_path = model_path
-    
-    # Create checkpoints directory
-    checkpoints_dir = os.path.join(os.path.dirname(model_path) or ".", "checkpoints")
-    os.makedirs(checkpoints_dir, exist_ok=True)
-    
-    # Set checkpoint base path
-    checkpoint_base = os.path.join(checkpoints_dir, os.path.basename(model_path))
     
     if args.resume and os.path.exists(base_model_path):
         model = PPO.load(base_model_path, env=env, device=device)
-        print(f"Resuming training from {base_model_path}")
+        logging.info(f"Resuming training from {base_model_path}")
     else:
         model = PPO(
             "CnnPolicy",
@@ -207,20 +180,16 @@ def train(args):
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
+            ent_coef=0.01,  # Increase exploration
             tensorboard_log="./logs"
         )
-        print("Starting new training session")
+        logging.info("Starting new training session")
     
-    # Set global model for signal handler
     global_model = model
 
-    # Create callbacks
     callbacks = [
         ProgressBarCallback(args.timesteps),
-        SaveCheckpointCallback(
-            save_freq=args.save_freq,
-            save_path=checkpoint_base
-        )
+        SaveCheckpointCallback(save_freq=args.save_freq, save_path=model_path)
     ]
 
     try:
@@ -229,10 +198,19 @@ def train(args):
             callback=callbacks,
             tb_log_name=os.path.basename(args.model_path)
         )
+        logging.info("Training completed successfully")
+    except KeyboardInterrupt:
+        logging.info("Training interrupted by user")
     finally:
+        logging.info("Saving final model")
         model.save(base_model_path)
-        env.close()
-        print(f"Final model saved to {base_model_path}")
+        try:
+            env.close()
+            logging.info("Environment closed successfully")
+        except BrokenPipeError:
+            logging.warning("Could not cleanly close subprocesses (BrokenPipeError)")
+        logging.info(f"Final model saved to {base_model_path}")
+        sys.exit(0)
 
 def play(args):
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -244,10 +222,14 @@ def play(args):
         raise FileNotFoundError(f"Model file not found: {model_path}")
     
     model = PPO.load(model_path, device=device)
-    print(f"Loaded model from {model_path}")
+    logging.info(f"Loaded model from {model_path}")
     
-    # Use test mode to apply frame stacking
-    env = make_env(render=args.render, test=True)
+    env = make_vec_env(
+        lambda: make_env(render=args.render),
+        n_envs=1,
+        vec_env_cls=DummyVecEnv
+    )
+    env = VecFrameStack(env, n_stack=4)
     
     obs = env.reset()
     try:
@@ -256,56 +238,39 @@ def play(args):
             obs, reward, done, info = env.step(action)
             if args.render:
                 env.render()
-                time.sleep(0.01)  # Small delay to make visualization smoother
+                time.sleep(0.01)
             if done:
-                print(f"Episode finished. Score: {info.get('score', 0)}")
+                logging.info(f"Episode finished. Score: {info[0].get('score', 0)}")
                 obs = env.reset()
     except KeyboardInterrupt:
-        print("\nPlay session ended")
+        logging.info("Play session ended by user")
     finally:
         env.close()
+        logging.info("Play environment closed")
 
 def list_checkpoints(args):
-    # Get the directory containing checkpoints
     model_path = args.model_path
-    checkpoints_dir = os.path.join(os.path.dirname(model_path) or ".", "checkpoints")
+    checkpoint_path = model_path + ".zip" if not model_path.endswith(".zip") else model_path
     
-    if not os.path.exists(checkpoints_dir):
-        print(f"No checkpoints directory found at {checkpoints_dir}")
-        return
+    emergency_saves = [f for f in os.listdir(".") if f.startswith(os.path.basename(model_path)) and "emergency" in f and f.endswith(".zip")]
     
-    # Get base name of the model
-    base_name = os.path.basename(model_path)
-    
-    # List all files matching the pattern
-    checkpoints = [f for f in os.listdir(checkpoints_dir) if f.startswith(base_name) and f.endswith(".zip")]
-    emergency_saves = [f for f in os.listdir(".") if f.startswith(base_name) and "emergency" in f and f.endswith(".zip")]
-    
-    if not checkpoints and not emergency_saves:
-        print(f"No checkpoints or emergency saves found for {base_name}")
-        return
-    
-    if checkpoints:
-        # Sort by timesteps (numerical part after the last underscore before .zip)
-        checkpoints.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
-        
-        print(f"Available checkpoints for {base_name}:")
-        for i, checkpoint in enumerate(checkpoints):
-            timesteps = checkpoint.split("_")[-1].split(".")[0]
-            print(f"  {i+1}. {checkpoint} ({int(timesteps):,} timesteps)")
+    if os.path.exists(checkpoint_path):
+        print(f"Current checkpoint exists: {checkpoint_path}")
+        print(f"Last modified: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(checkpoint_path)))}")
+    else:
+        print(f"No checkpoint found at {checkpoint_path}")
     
     if emergency_saves:
-        # Sort by timestamp
         emergency_saves.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
-        
-        print(f"\nEmergency saves for {base_name}:")
+        print(f"\nEmergency saves for {os.path.basename(model_path)}:")
         for i, save in enumerate(emergency_saves):
             timestamp = save.split("_")[-1].split(".")[0]
             save_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(timestamp)))
             print(f"  {i+1}. {save} (saved on {save_time})")
+    else:
+        print(f"\nNo emergency saves found for {os.path.basename(model_path)}")
 
 if __name__ == "__main__":
-    # Register the signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
     
     parser = argparse.ArgumentParser()
