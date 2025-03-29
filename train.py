@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from tqdm import tqdm
 from gym import spaces, Wrapper
@@ -84,8 +86,23 @@ class KungFuRewardWrapper(Wrapper):
         done = done or health <= 0
         return obs, reward, done, info
 
+class ProgressBarCallback(BaseCallback):
+    def __init__(self, total_timesteps):
+        super().__init__()
+        self.pbar = None
+        self.total_timesteps = total_timesteps
+    
+    def _on_training_start(self):
+        self.pbar = tqdm(total=self.total_timesteps)
+    
+    def _on_step(self):
+        self.pbar.update(self.training_env.num_envs)
+        return True
+    
+    def _on_training_end(self):
+        self.pbar.close()
+
 def make_env(render=False, test=False):
-    # Remove render_mode for retro compatibility
     env = retro.make(
         "KungFu-Nes",
         use_restricted_actions=retro.Actions.ALL
@@ -103,7 +120,7 @@ def train(args):
     env = make_vec_env(
         lambda: make_env(args.render),
         n_envs=4 if not args.render else 1,
-        vec_env_cls=DummyVecEnv
+        vec_env_cls=SubprocVecEnv
     )
     env = VecFrameStack(env, n_stack=4)
     env = VecMonitor(env)
@@ -114,6 +131,7 @@ def train(args):
     
     if args.resume and os.path.exists(model_path):
         model = PPO.load(model_path, env=env, device=device)
+        print(f"Resuming training from {model_path}")
     else:
         model = PPO(
             "CnnPolicy",
@@ -129,6 +147,7 @@ def train(args):
             clip_range=0.2,
             tensorboard_log="./logs"
         )
+        print("Starting new training session")
 
     try:
         model.learn(
@@ -139,6 +158,7 @@ def train(args):
     finally:
         model.save(model_path)
         env.close()
+        print(f"Model saved to {model_path}")
 
 def play(args):
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -153,22 +173,27 @@ def play(args):
     env = make_env(render=args.render, test=True)
     
     obs = env.reset()
-    while True:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, _, done, _ = env.step(action)
-        if args.render:
-            env.render()
-        if done:
-            obs = env.reset()
+    try:
+        while True:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, done, _ = env.step(action)
+            if args.render:
+                env.render()
+            if done:
+                obs = env.reset()
+    except KeyboardInterrupt:
+        print("\nPlay session ended")
+    finally:
+        env.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--play", action="store_true")
-    parser.add_argument("--render", action="store_true")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=1_000_000)
-    parser.add_argument("--model_path", default="kungfu_ppo")
-    parser.add_argument("--cuda", action="store_true")
+    parser.add_argument("--play", action="store_true", help="Run in play mode")
+    parser.add_argument("--render", action="store_true", help="Render the environment")
+    parser.add_argument("--resume", action="store_true", help="Resume training from saved model")
+    parser.add_argument("--timesteps", type=int, default=90_000, help="Number of training timesteps")
+    parser.add_argument("--model_path", default="kungfu_ppo", help="Path to save/load model")
+    parser.add_argument("--cuda", action="store_true", help="Use GPU acceleration")
     
     args = parser.parse_args()
     
