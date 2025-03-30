@@ -18,11 +18,11 @@ from gym import spaces, Wrapper
 from gym.wrappers import TimeLimit
 from stable_baselines3.common.utils import set_random_seed
 
-# Configure logging
+# Configure logging (terminal only by default)
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('training.log')]
+    level=logging.INFO,  # Show logs in terminal
+    format='%(asctime)s - %(levelname)s - %(message)s'
+    # No handlers specified here; file logging added only if --enable_file_logging is used
 )
 
 global_model = None
@@ -56,6 +56,7 @@ class KungFuDiscreteWrapper(gym.ActionWrapper):
             [0,1,0,0,0,0,1,0,0,0,0,0],  # A+Left
             [0,1,0,0,0,0,0,0,1,0,0,0]   # A+Right
         ]
+        self.action_names = ["No action", "Left", "Right", "Kick", "Punch", "Kick+Left", "Kick+Right", "Punch+Left", "Punch+Right"]
 
     def action(self, action):
         if isinstance(action, (list, np.ndarray)):
@@ -267,6 +268,10 @@ def train(args):
     global global_model, global_model_path
     global_model_path = args.model_path
     
+    # Add file handler only if file logging is enabled
+    if args.enable_file_logging:
+        logging.getLogger().addHandler(logging.FileHandler('training.log'))
+    
     os.makedirs(args.model_path, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
     
@@ -282,11 +287,11 @@ def train(args):
         env = DummyVecEnv([make_env(0, args.seed, args.render)])
     
     env = VecFrameStack(env, n_stack=4)  # Shape: (4, 84, 84)
-    env = VecTransposeImage(env)  # Transpose to (84, 84, 4) if needed
+    env = VecTransposeImage(env)  # Transpose to (84, 84, 4)
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
     # Verify observation space
-    expected_obs_space = spaces.Box(low=0, high=255, shape=(84, 84, 4), dtype=np.uint8)  # Adjusted for transpose
+    expected_obs_space = spaces.Box(low=0, high=255, shape=(84, 84, 4), dtype=np.uint8)
     print(f"Current environment observation space: {env.observation_space}")
     if env.observation_space != expected_obs_space:
         print(f"Warning: Observation space mismatch. Expected {expected_obs_space}, got {env.observation_space}")
@@ -299,17 +304,12 @@ def train(args):
     if args.resume and os.path.exists(model_file):
         print(f"Resuming training from {model_file}")
         try:
-            # Load the model without passing env initially
             loaded_model = PPO.load(model_file, device=device, print_system_info=True)
-            # Access observation space from the model's metadata, not env
             old_obs_space = loaded_model.observation_space
             print(f"Saved model observation space: {old_obs_space}")
             
-            # Check if observation spaces differ
             if old_obs_space != env.observation_space:
                 print("Observation space mismatch detected. Adapting model to new observation space...")
-                
-                # Create a new PPO model with the new environment
                 model = PPO(
                     "CnnPolicy",
                     env,
@@ -321,26 +321,19 @@ def train(args):
                     gae_lambda=args.gae_lambda,
                     clip_range=args.clip_range,
                     tensorboard_log=args.log_dir,
-                    verbose=1,
+                    verbose=1 if args.verbose else 0,  # Control PPO logs
                     device=device
                 )
-                
-                # Transfer weights from the old model to the new one where possible
                 old_policy_state_dict = loaded_model.policy.state_dict()
                 new_policy_state_dict = model.policy.state_dict()
-                
-                # Copy weights for layers that match in shape
                 for key in old_policy_state_dict:
                     if key in new_policy_state_dict and old_policy_state_dict[key].shape == new_policy_state_dict[key].shape:
                         new_policy_state_dict[key] = old_policy_state_dict[key]
                     else:
                         print(f"Skipping weight transfer for {key} due to shape mismatch.")
-                
-                # Load the adapted weights into the new model
                 model.policy.load_state_dict(new_policy_state_dict)
                 print("Weights transferred successfully where compatible.")
             else:
-                # If observation spaces match, load with the environment
                 model = PPO.load(
                     model_file,
                     env=env,
@@ -370,7 +363,7 @@ def train(args):
                 gae_lambda=args.gae_lambda,
                 clip_range=args.clip_range,
                 tensorboard_log=args.log_dir,
-                verbose=1,
+                verbose=1 if args.verbose else 0,  # Control PPO logs
                 device=device
             )
     else:
@@ -386,7 +379,7 @@ def train(args):
             gae_lambda=args.gae_lambda,
             clip_range=args.clip_range,
             tensorboard_log=args.log_dir,
-            verbose=1,
+            verbose=1 if args.verbose else 0,  # Control PPO logs
             device=device
         )
     
@@ -400,6 +393,9 @@ def train(args):
         )
         model.save(model_file)
         print(f"Training completed. Model saved to {model_file}")
+        
+        # Evaluate the model after training
+        evaluate(args, model=model, baseline_file=args.baseline_file if hasattr(args, 'baseline_file') else None)
     except Exception as e:
         print(f"Error during training: {str(e)}")
         logging.error(f"Error during training: {str(e)}")
@@ -414,10 +410,14 @@ def train(args):
             print("Training terminated by signal.")
 
 def play(args):
+    # Add file handler if file logging is enabled
+    if args.enable_file_logging:
+        logging.getLogger().addHandler(logging.FileHandler('training.log'))
+    
     env = make_kungfu_env(render=args.render)
-    env = DummyVecEnv([lambda: env])  # Wrap in DummyVecEnv for consistency
-    env = VecFrameStack(env, n_stack=4)  # Match training setup
-    env = VecTransposeImage(env)  # Match the transposed shape
+    env = DummyVecEnv([lambda: env])
+    env = VecFrameStack(env, n_stack=4)
+    env = VecTransposeImage(env)
     
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     if not os.path.exists(model_file):
@@ -460,8 +460,117 @@ def play(args):
     finally:
         env.close()
 
-def evaluate(args):
-    pass  # Placeholder for evaluate function
+def evaluate(args, model=None, baseline_file=None):
+    # Add file handler if file logging is enabled
+    if args.enable_file_logging:
+        logging.getLogger().addHandler(logging.FileHandler('training.log'))
+    
+    # Create evaluation environment
+    env = make_kungfu_env(render=False)
+    env = DummyVecEnv([lambda: env])
+    env = VecFrameStack(env, n_stack=4)
+    env = VecTransposeImage(env)
+    
+    model_file = f"{args.model_path}/kungfu_ppo.zip"
+    if model is None:
+        if not os.path.exists(model_file):
+            print(f"No model found at {model_file}. Please train a model first.")
+            return
+        print(f"Loading model from {model_file}")
+        model = PPO.load(model_file, env=env)
+    
+    # Action tracking
+    action_counts = np.zeros(9)  # 9 discrete actions
+    total_steps = 0
+    total_score = 0
+    episode_lengths = []
+    episode_scores = []
+    
+    # Run evaluation episodes
+    for episode in range(args.eval_episodes):
+        obs = env.reset()
+        done = False
+        episode_steps = 0
+        episode_score = 0
+        
+        while not done and not terminate_flag:
+            action, _ = model.predict(obs, deterministic=args.deterministic)
+            action_counts[action] += 1
+            obs, reward, done, info = env.step(action)
+            episode_steps += 1
+            # Access the first info dict since it's a list from DummyVecEnv
+            episode_score += info[0].get('score', reward[0] if isinstance(reward, np.ndarray) else reward)
+            total_steps += 1
+        
+        episode_lengths.append(episode_steps)
+        episode_scores.append(episode_score)
+        total_score += episode_score
+    
+    env.close()
+    
+    # Calculate action percentages
+    action_percentages = (action_counts / total_steps) * 100 if total_steps > 0 else np.zeros(9)
+    
+    # Average metrics
+    avg_steps = np.mean(episode_lengths)
+    avg_score = np.mean(episode_scores)
+    
+    # Compare with baseline if provided
+    baseline_stats = None
+    if baseline_file and os.path.exists(baseline_file):
+        baseline_env = make_kungfu_env(render=False)
+        baseline_env = DummyVecEnv([lambda: baseline_env])
+        baseline_env = VecFrameStack(baseline_env, n_stack=4)
+        baseline_env = VecTransposeImage(baseline_env)
+        baseline_model = PPO.load(baseline_file, env=baseline_env)
+        
+        baseline_steps = []
+        baseline_scores = []
+        for _ in range(args.eval_episodes):
+            obs = baseline_env.reset()
+            done = False
+            steps = 0
+            score = 0
+            while not done:
+                action, _ = baseline_model.predict(obs, deterministic=args.deterministic)
+                obs, reward, done, info = baseline_env.step(action)
+                steps += 1
+                score += info[0].get('score', reward[0] if isinstance(reward, np.ndarray) else reward)
+            baseline_steps.append(steps)
+            baseline_scores.append(score)
+        baseline_env.close()
+        baseline_stats = {
+            'avg_steps': np.mean(baseline_steps),
+            'avg_score': np.mean(baseline_scores)
+        }
+    
+    # Generate report
+    report = f"Evaluation Report for {model_file} ({args.eval_episodes} episodes)\n"
+    report += "-" * 50 + "\n"
+    report += "Action Percentages:\n"
+    for i, (name, percent) in enumerate(zip(env.envs[0].action_names, action_percentages)):
+        report += f"  {name}: {percent:.2f}%\n"
+    report += f"\nAverage Episode Length: {avg_steps:.2f} steps\n"
+    report += f"Average Score: {avg_score:.2f}\n"
+    report += f"Total Steps: {total_steps}\n"
+    report += f"Total Score: {total_score:.2f}\n"
+    
+    if baseline_stats:
+        report += "\nComparison with Baseline:\n"
+        report += f"  Baseline Avg Episode Length: {baseline_stats['avg_steps']:.2f} steps\n"
+        report += f"  Baseline Avg Score: {baseline_stats['avg_score']:.2f}\n"
+        report += f"  Plays Longer: {'Yes' if avg_steps > baseline_stats['avg_steps'] else 'No'} " \
+                  f"(+{avg_steps - baseline_stats['avg_steps']:.2f} steps)\n"
+        report += f"  Scores More: {'Yes' if avg_score > baseline_stats['avg_score'] else 'No'} " \
+                  f"(+{avg_score - baseline_stats['avg_score']:.2f})\n"
+    
+    # Print report to terminal
+    print(report)
+    
+    # Save report to file only if file logging is enabled
+    if args.enable_file_logging:
+        with open(os.path.join(args.log_dir, 'evaluation_report.txt'), 'w') as f:
+            f.write(report)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or play KungFu Master using PPO")
@@ -487,6 +596,9 @@ if __name__ == "__main__":
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument("--clip_range", type=float, default=0.2)
     parser.add_argument("--log_dir", default="logs")
+    parser.add_argument("--baseline_file", type=str, default=None, help="Path to baseline model for comparison")
+    parser.add_argument("--enable_file_logging", action="store_true", help="Enable logging to file")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output from PPO")
     
     args = parser.parse_args()
     if not any([args.train, args.play, args.evaluate]):
