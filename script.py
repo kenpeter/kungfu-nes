@@ -472,7 +472,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=10_000)
+    parser.add_argument("--timesteps", type=int, default=30_000)
     parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--progress_bar", action="store_true")
     parser.add_argument("--eval_episodes", type=int, default=10)
