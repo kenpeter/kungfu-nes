@@ -10,7 +10,7 @@ import sys
 import logging
 from PIL import Image
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor, SubprocVecEnv, VecTransposeImage
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import BaseCallback
 from tqdm import tqdm
@@ -281,11 +281,12 @@ def train(args):
     else:
         env = DummyVecEnv([make_env(0, args.seed, args.render)])
     
-    env = VecFrameStack(env, n_stack=4)  # New shape: (4, 84, 84)
+    env = VecFrameStack(env, n_stack=4)  # Shape: (4, 84, 84)
+    env = VecTransposeImage(env)  # Transpose to (84, 84, 4) if needed
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
     # Verify observation space
-    expected_obs_space = spaces.Box(low=0, high=255, shape=(4, 84, 84), dtype=np.uint8)
+    expected_obs_space = spaces.Box(low=0, high=255, shape=(84, 84, 4), dtype=np.uint8)  # Adjusted for transpose
     print(f"Current environment observation space: {env.observation_space}")
     if env.observation_space != expected_obs_space:
         print(f"Warning: Observation space mismatch. Expected {expected_obs_space}, got {env.observation_space}")
@@ -298,9 +299,10 @@ def train(args):
     if args.resume and os.path.exists(model_file):
         print(f"Resuming training from {model_file}")
         try:
-            # Load the model without immediately passing the env to bypass the check
+            # Load the model without passing env initially
             loaded_model = PPO.load(model_file, device=device, print_system_info=True)
-            old_obs_space = loaded_model.env.observation_space
+            # Access observation space from the model's metadata, not env
+            old_obs_space = loaded_model.observation_space
             print(f"Saved model observation space: {old_obs_space}")
             
             # Check if observation spaces differ
@@ -338,7 +340,7 @@ def train(args):
                 model.policy.load_state_dict(new_policy_state_dict)
                 print("Weights transferred successfully where compatible.")
             else:
-                # If observation spaces match, load normally
+                # If observation spaces match, load with the environment
                 model = PPO.load(
                     model_file,
                     env=env,
@@ -415,6 +417,7 @@ def play(args):
     env = make_kungfu_env(render=args.render)
     env = DummyVecEnv([lambda: env])  # Wrap in DummyVecEnv for consistency
     env = VecFrameStack(env, n_stack=4)  # Match training setup
+    env = VecTransposeImage(env)  # Match the transposed shape
     
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     if not os.path.exists(model_file):
@@ -472,7 +475,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=30_000)
+    parser.add_argument("--timesteps", type=int, default=10_000)
     parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--progress_bar", action="store_true")
     parser.add_argument("--eval_episodes", type=int, default=10)
