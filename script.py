@@ -12,7 +12,7 @@ import multiprocessing as mp
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor, SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback
 from tqdm import tqdm
 from gym import spaces, Wrapper
 from gym.wrappers import TimeLimit
@@ -33,16 +33,14 @@ def signal_handler(sig, frame):
     global terminate_flag, global_model, global_model_path
     print(f"Signal {sig} received! Preparing to terminate...")
     if global_model is not None and global_model_path is not None:
-        emergency_path = f"{global_model_path}_emergency_{int(time.time())}"
-        global_model.save(emergency_path)
-        print(f"Emergency save completed: {emergency_path}")
+        global_model.save(f"{global_model_path}/kungfu_ppo")
+        print(f"Emergency save completed: {global_model_path}/kungfu_ppo.zip")
     terminate_flag = True
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# Wrappers
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -60,7 +58,6 @@ class KungFuDiscreteWrapper(gym.ActionWrapper):
         ]
 
     def action(self, action):
-        # Ensure action is an integer
         if isinstance(action, (list, np.ndarray)):
             action = int(action.item() if isinstance(action, np.ndarray) else action[0])
         return self._actions[action]
@@ -84,20 +81,18 @@ class FrameSkipWrapper(gym.Wrapper):
 class KungFuRewardWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.reset()
+        if not hasattr(self.env, 'get_ram'):
+            raise ValueError("Environment must support get_ram() method")
         self.enemy_positions = {
             'player_x': 0x0050, 'player_y': 0x0053,
             'enemy1_x': 0x036E, 'enemy1_y': 0x0371,
             'enemy2_x': 0x0372, 'enemy2_y': 0x0375
         }
         self.enemy_proximity_threshold = 50
-        self.no_attack_penalty_cooldown = 0
-        self.consecutive_attacks = 0
-        self.frames_since_last_enemy_hit = 0
-        self.enemy_health_previous = {}
-        self.successful_hits = 0
+        self.reset_state()
 
-    def reset(self):
+    def reset_state(self):
+        """Reset all tracking variables"""
         self.last_score = 0
         self.last_x = 0
         self.last_health = 46
@@ -109,22 +104,31 @@ class KungFuRewardWrapper(Wrapper):
         self.frames_since_last_enemy_hit = 0
         self.enemy_health_previous = {}
         self.successful_hits = 0
+
+    def reset(self):
+        self.reset_state()
         return self.env.reset()
 
-    def _is_enemy_nearby(self, ram):
-        player_x = ram[self.enemy_positions['player_x']]
-        player_y = ram[self.enemy_positions['player_y']]
-        for i in range(1, 3):
-            enemy_x = ram[self.enemy_positions[f'enemy{i}_x']]
-            enemy_y = ram[self.enemy_positions[f'enemy{i}_y']]
-            if enemy_x > 0 and enemy_y > 0:
-                x_dist = abs(player_x - enemy_x)
-                y_dist = abs(player_y - enemy_y)
-                if x_dist < self.enemy_proximity_threshold and y_dist < 25:
-                    return True
-        return False
+    def is_enemy_nearby(self, ram):
+        """Check if an enemy is within proximity threshold"""
+        try:
+            player_x = ram[self.enemy_positions['player_x']]
+            player_y = ram[self.enemy_positions['player_y']]
+            for i in range(1, 3):
+                enemy_x = ram[self.enemy_positions[f'enemy{i}_x']]
+                enemy_y = ram[self.enemy_positions[f'enemy{i}_y']]
+                if enemy_x > 0 and enemy_y > 0:
+                    x_dist = abs(player_x - enemy_x)
+                    y_dist = abs(player_y - enemy_y)
+                    if x_dist < self.enemy_proximity_threshold and y_dist < 25:
+                        return True
+            return False
+        except (IndexError, KeyError):
+            logging.warning("Failed to read RAM for enemy proximity check")
+            return False
 
-    def _detect_enemy_hit(self, ram, info):
+    def detect_enemy_hit(self, ram, info):
+        """Detect if an enemy was hit"""
         if info.get('score', 0) > self.last_score:
             self.successful_hits += 1
             return True
@@ -138,18 +142,21 @@ class KungFuRewardWrapper(Wrapper):
         return False
 
     def step(self, action):
-        # Ensure action is an integer
         if isinstance(action, (list, np.ndarray)):
             action = int(action.item() if isinstance(action, np.ndarray) else action[0])
             
         obs, reward, done, info = self.env.step(action)
-        ram = self.env.get_ram()
-        
+        try:
+            ram = self.env.get_ram()
+        except Exception as e:
+            logging.error(f"Failed to get RAM: {e}")
+            return obs, reward, done, info
+
         current_score = info.get('score', 0)
         current_x = info.get('x_pos', 0)
         health = info.get('health', 46)
-        enemy_nearby = self._is_enemy_nearby(ram)
-        enemy_hit = self._detect_enemy_hit(ram, info)
+        enemy_nearby = self.is_enemy_nearby(ram)
+        enemy_hit = self.detect_enemy_hit(ram, info)
         
         for i in range(1, 3):
             self.enemy_health_previous[self.enemy_positions[f'enemy{i}_x']] = ram[self.enemy_positions[f'enemy{i}_x']]
@@ -173,9 +180,11 @@ class KungFuRewardWrapper(Wrapper):
         if health_delta < 0:
             reward += health_delta * 5.0
         reward -= 0.05
+        
         if health <= 0 and not self.death_penalty_applied:
             reward -= 100
             self.death_penalty_applied = True
+        
         if abs(x_delta) < 1:
             self.time_without_progress += 1
             if self.time_without_progress > 100:
@@ -213,19 +222,20 @@ def make_kungfu_env(render=False, seed=None):
     env = FrameSkipWrapper(env, skip=4)
     env = KungFuRewardWrapper(env)
     env = TimeLimit(env, max_episode_steps=5000)
+    if seed is not None:
+        env.seed(seed)
     return env
 
 def make_env(rank, seed=0, render=False):
     def _init():
-        env = make_kungfu_env(render=(rank == 0 and render), seed=seed)
-        env.seed(seed + rank)
+        env = make_kungfu_env(render=(rank == 0 and render), seed=seed + rank)
         return env
     set_random_seed(seed)
     return _init
 
 class TqdmCallback(BaseCallback):
     def __init__(self, total_timesteps, verbose=0):
-        super(TqdmCallback, self).__init__(verbose)
+        super().__init__(verbose)
         self.pbar = None
         self.total_timesteps = total_timesteps
         self.update_interval = max(self.total_timesteps // 1000, 1)
@@ -238,7 +248,7 @@ class TqdmCallback(BaseCallback):
         self.n_calls += 1
         if self.n_calls % self.update_interval == 0 or self.n_calls == self.total_timesteps:
             self.pbar.update(self.n_calls - self.pbar.n)
-        return not terminate_flag  # Stop training if terminate_flag is set
+        return not terminate_flag
 
     def _on_training_end(self):
         self.pbar.n = self.total_timesteps
@@ -265,24 +275,14 @@ def train(args):
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
     callbacks = []
-    
-    checkpoint_callback = CheckpointCallback(
-        save_freq=5000,
-        save_path=args.model_path,
-        name_prefix="kungfu_model",
-        save_replay_buffer=True,
-        verbose=1
-    )
-    callbacks.append(checkpoint_callback)
-    
     if args.progress_bar:
-        tqdm_callback = TqdmCallback(total_timesteps=args.timesteps)
-        callbacks.append(tqdm_callback)
+        callbacks.append(TqdmCallback(total_timesteps=args.timesteps))
     
-    if args.resume and os.path.exists(f"{args.model_path}/kungfu_model.zip"):
-        print(f"Resuming training from {args.model_path}/kungfu_model.zip")
+    model_file = f"{args.model_path}/kungfu_ppo.zip"
+    if args.resume and os.path.exists(model_file):
+        print(f"Resuming training from {model_file}")
         model = PPO.load(
-            f"{args.model_path}/kungfu_model",
+            model_file,
             env=env,
             custom_objects={
                 "learning_rate": args.learning_rate,
@@ -297,6 +297,7 @@ def train(args):
             device=device
         )
     else:
+        print("Starting new training.")
         model = PPO(
             "CnnPolicy",
             env,
@@ -318,16 +319,15 @@ def train(args):
         model.learn(
             total_timesteps=args.timesteps,
             callback=callbacks,
-            reset_num_timesteps=not args.resume
+            reset_num_timesteps=False if args.resume and os.path.exists(model_file) else True
         )
-        model.save(f"{args.model_path}/kungfu_model_final")
-        print(f"Training completed. Model saved to {args.model_path}/kungfu_model_final")
+        model.save(model_file)
+        print(f"Training completed. Model saved to {model_file}")
     except Exception as e:
         print(f"Error during training: {str(e)}")
         logging.error(f"Error during training: {str(e)}")
-        error_path = f"{args.model_path}/kungfu_model_error_{int(time.time())}"
-        model.save(error_path)
-        print(f"Model saved to {error_path} due to error")
+        model.save(model_file)
+        print(f"Model saved to {model_file} due to error")
     finally:
         try:
             env.close()
@@ -338,16 +338,14 @@ def train(args):
 
 def play(args):
     env = make_kungfu_env(render=args.render, seed=args.seed)
-    model_path = f"{args.model_path}/kungfu_model_final"
+    model_file = f"{args.model_path}/kungfu_ppo.zip"
     
-    if not os.path.exists(model_path + ".zip"):
-        model_path = f"{args.model_path}/kungfu_model"
-        if not os.path.exists(model_path + ".zip"):
-            print(f"No model found at {model_path}. Please train a model first.")
-            return
+    if not os.path.exists(model_file):
+        print(f"No model found at {model_file}. Please train a model first.")
+        return
     
-    print(f"Loading model from {model_path}")
-    model = PPO.load(model_path)
+    print(f"Loading model from {model_file}")
+    model = PPO.load(model_file)
     
     episode_count = 0
     try:
@@ -361,7 +359,6 @@ def play(args):
             
             while not done and not terminate_flag:
                 action, _ = model.predict(np.array(obs)[None], deterministic=args.deterministic)
-                # Ensure action is an integer
                 if isinstance(action, np.ndarray):
                     action = int(action.item())
                 obs, reward, done, info = env.step(action)
@@ -377,7 +374,6 @@ def play(args):
             
             print(f"Episode {episode_count} - Total reward: {total_reward}, Steps: {steps}")
             if args.episodes > 0 and episode_count >= args.episodes:
-                print(f"Completed {args.episodes} episodes.")
                 break
     
     except Exception as e:
@@ -385,12 +381,9 @@ def play(args):
         logging.error(f"Error during play: {str(e)}")
     finally:
         env.close()
-        if terminate_flag:
-            print("Play terminated by signal.")
 
 def evaluate(args):
-    # Placeholder for evaluate function
-    pass
+    pass  # Placeholder for evaluate function
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or play KungFu Master using PPO")
