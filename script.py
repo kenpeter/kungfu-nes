@@ -296,12 +296,16 @@ def train(args):
         callbacks.append(TqdmCallback(total_timesteps=args.timesteps))
     
     model_file = f"{args.model_path}/kungfu_ppo.zip"
+    total_trained_steps = 0  # Track overall steps
+    
     if args.resume and os.path.exists(model_file):
         print(f"Resuming training from {model_file}")
         try:
             loaded_model = PPO.load(model_file, device=device, print_system_info=True)
             old_obs_space = loaded_model.observation_space
+            total_trained_steps = loaded_model.total_trained_steps if hasattr(loaded_model, 'total_trained_steps') else 0
             print(f"Saved model observation space: {old_obs_space}")
+            print(f"Total trained steps so far: {total_trained_steps}")
             
             if old_obs_space != env.observation_space:
                 print("Observation space mismatch detected. Adapting model to new observation space...")
@@ -327,6 +331,7 @@ def train(args):
                     else:
                         print(f"Skipping weight transfer for {key} due to shape mismatch.")
                 model.policy.load_state_dict(new_policy_state_dict)
+                model.total_trained_steps = total_trained_steps  # Preserve total steps
                 print("Weights transferred successfully where compatible.")
             else:
                 model = PPO.load(
@@ -340,7 +345,8 @@ def train(args):
                         "gamma": args.gamma,
                         "gae_lambda": args.gae_lambda,
                         "clip_range": args.clip_range,
-                        "tensorboard_log": args.log_dir
+                        "tensorboard_log": args.log_dir,
+                        "total_trained_steps": total_trained_steps  # Load existing steps
                     },
                     device=device
                 )
@@ -386,15 +392,22 @@ def train(args):
             callback=callbacks,
             reset_num_timesteps=False if args.resume and os.path.exists(model_file) else True
         )
+        # Update total trained steps
+        total_trained_steps += args.timesteps
+        model.total_trained_steps = total_trained_steps  # Store in model
         model.save(model_file)
         print(f"Training completed. Model saved to {model_file}")
+        print(f"Overall training steps: {total_trained_steps}")
         
         evaluate(args, model=model, baseline_file=args.baseline_file if hasattr(args, 'baseline_file') else None)
     except Exception as e:
         print(f"Error during training: {str(e)}")
         logging.error(f"Error during training: {str(e)}")
+        total_trained_steps += model.num_timesteps  # Add steps completed before error
+        model.total_trained_steps = total_trained_steps
         model.save(model_file)
         print(f"Model saved to {model_file} due to error")
+        print(f"Overall training steps: {total_trained_steps}")
     finally:
         try:
             env.close()
@@ -419,6 +432,8 @@ def play(args):
     
     print(f"Loading model from {model_file}")
     model = PPO.load(model_file, env=env)
+    total_trained_steps = model.total_trained_steps if hasattr(model, 'total_trained_steps') else 0
+    print(f"Overall training steps: {total_trained_steps}")
     
     episode_count = 0
     try:
@@ -469,6 +484,8 @@ def evaluate(args, model=None, baseline_file=None):
             return
         print(f"Loading model from {model_file}")
         model = PPO.load(model_file, env=env)
+    
+    total_trained_steps = model.total_trained_steps if hasattr(model, 'total_trained_steps') else 0
     
     action_counts = np.zeros(9)
     total_steps = 0
@@ -529,6 +546,7 @@ def evaluate(args, model=None, baseline_file=None):
         }
     
     report = f"Evaluation Report for {model_file} ({args.eval_episodes} episodes)\n"
+    report += f"Overall Training Steps: {total_trained_steps}\n"
     report += "-" * 50 + "\n"
     report += "Action Percentages:\n"
     for i, (name, percent) in enumerate(zip(env.envs[0].action_names, action_percentages)):
