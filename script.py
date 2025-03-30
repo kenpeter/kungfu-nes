@@ -8,11 +8,11 @@ import torch
 import signal
 import sys
 import logging
+import multiprocessing as mp
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor, SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from tqdm import tqdm
 from gym import spaces, Wrapper
 from gym.wrappers import TimeLimit
@@ -22,13 +22,27 @@ from stable_baselines3.common.utils import set_random_seed
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler('training.log')]
+    handlers=[logging.FileHandler('training.log')]
 )
 
-# Global variables for signal handler
 global_model = None
 global_model_path = None
+terminate_flag = False
 
+def signal_handler(sig, frame):
+    global terminate_flag, global_model, global_model_path
+    print(f"Signal {sig} received! Preparing to terminate...")
+    if global_model is not None and global_model_path is not None:
+        emergency_path = f"{global_model_path}_emergency_{int(time.time())}"
+        global_model.save(emergency_path)
+        print(f"Emergency save completed: {emergency_path}")
+    terminate_flag = True
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# Wrappers
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -46,6 +60,9 @@ class KungFuDiscreteWrapper(gym.ActionWrapper):
         ]
 
     def action(self, action):
+        # Ensure action is an integer
+        if isinstance(action, (list, np.ndarray)):
+            action = int(action.item() if isinstance(action, np.ndarray) else action[0])
         return self._actions[action]
 
 class FrameSkipWrapper(gym.Wrapper):
@@ -69,14 +86,11 @@ class KungFuRewardWrapper(Wrapper):
         super().__init__(env)
         self.reset()
         self.enemy_positions = {
-            'player_x': 0x0050,  # Player X position
-            'player_y': 0x0053,  # Player Y position
-            'enemy1_x': 0x036E,  # Enemy 1 X position
-            'enemy1_y': 0x0371,  # Enemy 1 Y position
-            'enemy2_x': 0x0372,  # Enemy 2 X position
-            'enemy2_y': 0x0375   # Enemy 2 Y position
+            'player_x': 0x0050, 'player_y': 0x0053,
+            'enemy1_x': 0x036E, 'enemy1_y': 0x0371,
+            'enemy2_x': 0x0372, 'enemy2_y': 0x0375
         }
-        self.enemy_proximity_threshold = 50  # Increased from 30 to detect enemies from further away
+        self.enemy_proximity_threshold = 50
         self.no_attack_penalty_cooldown = 0
         self.consecutive_attacks = 0
         self.frames_since_last_enemy_hit = 0
@@ -103,35 +117,31 @@ class KungFuRewardWrapper(Wrapper):
         for i in range(1, 3):
             enemy_x = ram[self.enemy_positions[f'enemy{i}_x']]
             enemy_y = ram[self.enemy_positions[f'enemy{i}_y']]
-            if enemy_x > 0 and enemy_y > 0:  # Check if enemy is active
+            if enemy_x > 0 and enemy_y > 0:
                 x_dist = abs(player_x - enemy_x)
                 y_dist = abs(player_y - enemy_y)
-                if x_dist < self.enemy_proximity_threshold and y_dist < 25:  # Increased from 20
+                if x_dist < self.enemy_proximity_threshold and y_dist < 25:
                     return True
         return False
 
     def _detect_enemy_hit(self, ram, info):
-        # Check if score increased, which often indicates a successful hit
         if info.get('score', 0) > self.last_score:
             self.successful_hits += 1
             return True
-        
-        # Try to detect hits by monitoring enemy state changes (simplified)
-        # In a real implementation, you'd track specific memory locations for enemy health/state
         for i in range(1, 3):
             enemy_x_addr = self.enemy_positions[f'enemy{i}_x']
-            enemy_y_addr = self.enemy_positions[f'enemy{i}_y']
-            
-            # Check if enemy was present before but now disappeared
             if (enemy_x_addr in self.enemy_health_previous and 
                 self.enemy_health_previous[enemy_x_addr] > 0 and
                 ram[enemy_x_addr] == 0):
                 self.successful_hits += 1
                 return True
-                
         return False
 
     def step(self, action):
+        # Ensure action is an integer
+        if isinstance(action, (list, np.ndarray)):
+            action = int(action.item() if isinstance(action, np.ndarray) else action[0])
+            
         obs, reward, done, info = self.env.step(action)
         ram = self.env.get_ram()
         
@@ -141,7 +151,6 @@ class KungFuRewardWrapper(Wrapper):
         enemy_nearby = self._is_enemy_nearby(ram)
         enemy_hit = self._detect_enemy_hit(ram, info)
         
-        # Track enemy positions for hit detection in the next frame
         for i in range(1, 3):
             self.enemy_health_previous[self.enemy_positions[f'enemy{i}_x']] = ram[self.enemy_positions[f'enemy{i}_x']]
         
@@ -154,327 +163,236 @@ class KungFuRewardWrapper(Wrapper):
         x_delta = current_x - self.last_x
         health_delta = health - self.last_health
         
-        # Initialize reward
         reward = 0
-        
-        # Reward for score increases (defeating enemies)
         if score_delta > 0:
-            reward += score_delta * 200.0  # Increased from 150
-            reward += 150.0  # Bonus for defeating enemies, increased from 100
-        
-        # Reward for forward progress
+            reward += score_delta * 200.0 + 150.0
         if x_delta > 0:
-            reward += x_delta * 10.0  # Reduced from 20 to prioritize combat over movement
+            reward += x_delta * 10.0
         if x_delta < 0:
-            reward += x_delta * 2.0  # Penalty for moving backward remains the same
-        
-        # Penalty for taking damage
+            reward += x_delta * 2.0
         if health_delta < 0:
             reward += health_delta * 5.0
-        
-        # Small time penalty to encourage faster completion
         reward -= 0.05
-        
-        # Death penalty
         if health <= 0 and not self.death_penalty_applied:
-            reward -= 100  # Increased from 50
+            reward -= 100
             self.death_penalty_applied = True
-        
-        # Penalty for being stuck
         if abs(x_delta) < 1:
             self.time_without_progress += 1
             if self.time_without_progress > 100:
-                reward -= 0.8  # Increased from 0.5
+                reward -= 5
         else:
             self.time_without_progress = 0
         
-        # Enhanced rewards for attacking, especially when enemies are nearby
-        is_attack_action = action in [3, 4, 5, 6, 7, 8]
-        
-        if is_attack_action:
-            # Base reward for attacking
-            reward += 5.0  # Small reward just for attacking
-            self.frames_since_last_attack = 0
-            self.consecutive_attacks += 1
-            
-            # Extra reward for consecutive attacks (combo bonus)
-            combo_bonus = min(self.consecutive_attacks * 2, 20)  # Cap at 20
-            reward += combo_bonus
-            
-            if enemy_nearby:
-                # Much higher reward for attacking when enemies are nearby
-                reward += 50.0  # Increased from 25
-                
-                # Extra reward for successful hits
-                if enemy_hit:
-                    reward += 100.0  # Big reward for landing hits
-                    self.frames_since_last_enemy_hit = 0
-                else:
-                    self.frames_since_last_enemy_hit += 1
-                    # Gradually decrease reward if attacks aren't landing
-                    if self.frames_since_last_enemy_hit > 20:
-                        penalty_factor = min(self.frames_since_last_enemy_hit - 20, 30) / 30
-                        reward -= 10.0 * penalty_factor
-            
-            # Reset no-attack penalty cooldown
-            self.no_attack_penalty_cooldown = 5  # Reduced from 10 to encourage more frequent attacks
-        else:
-            # Reset consecutive attack counter if not attacking
-            self.consecutive_attacks = 0
+        if enemy_nearby:
             self.frames_since_last_attack += 1
-            
-            # Increased penalty for not attacking when enemies are nearby
-            if enemy_nearby and self.no_attack_penalty_cooldown <= 0:
-                # Escalating penalty based on how long enemies have been nearby without attacking
-                penalty = min(self.enemy_nearby_frames, 60) / 10
-                reward -= 5.0 + penalty  # Increased from 2.0
-            elif not enemy_nearby:
-                # Small reward for movement/exploration when no enemies around
-                reward += 0.5  # Reduced from 1.0 to prioritize combat
+            if self.frames_since_last_attack > 30 and action < 3:
+                reward -= 1
         
-        if self.no_attack_penalty_cooldown > 0:
-            self.no_attack_penalty_cooldown -= 1
+        if action >= 3:
+            self.frames_since_last_attack = 0
+            if enemy_nearby:
+                reward += 0.5
+        
+        if enemy_hit:
+            reward += 20
+            self.frames_since_last_enemy_hit = 0
+        else:
+            self.frames_since_last_enemy_hit += 1
+            if self.frames_since_last_enemy_hit > 100 and enemy_nearby:
+                reward -= 0.5
         
         self.last_score = current_score
         self.last_x = current_x
         self.last_health = health
         
-        done = done or health <= 0
-        info['custom_reward'] = reward
-        info['successful_hits'] = self.successful_hits
-        
         return obs, reward, done, info
 
-class ProgressBarCallback(BaseCallback):
-    def __init__(self, total_timesteps, num_envs):
-        super().__init__()
-        self.pbar = None
-        self.total_timesteps = total_timesteps
-        self.num_envs = num_envs
-    
-    def _on_training_start(self):
-        self.pbar = tqdm(total=self.total_timesteps, desc="Training", unit="step")
-    
-    def _on_step(self):
-        # Update by the number of environments to reflect parallel steps
-        self.pbar.update(self.num_envs)
-        return True
-    
-    def _on_training_end(self):
-        self.pbar.close()
-
-class RewardLoggerCallback(BaseCallback):
-    def __init__(self, log_freq=1000):
-        super().__init__()
-        self.log_freq = log_freq
-        self.episode_rewards = []
-        self.episode_lengths = []
-    
-    def _on_step(self):
-        if len(self.model.ep_info_buffer) > 0:
-            for info in self.model.ep_info_buffer:
-                if 'r' in info and 'l' in info:
-                    self.episode_rewards.append(info['r'])
-                    self.episode_lengths.append(info['l'])
-        
-        if self.n_calls % self.log_freq == 0 and len(self.episode_rewards) > 0:
-            avg_reward = np.mean(self.episode_rewards[-10:])
-            avg_length = np.mean(self.episode_lengths[-10:])
-            print(f"Timestep: {self.num_timesteps}, Avg Reward: {avg_reward:.2f}, Avg Length: {avg_length:.2f}")
-        return True
-
-class ActionDistributionCallback(BaseCallback):
-    def __init__(self, log_freq=5000):
-        super().__init__()
-        self.log_freq = log_freq
-        self.actions_taken = []
-    
-    def _on_step(self):
-        if 'actions' in self.locals:
-            self.actions_taken.extend(self.locals['actions'])
-        
-        if self.n_calls % self.log_freq == 0 and len(self.actions_taken) > 0:
-            action_counts = np.bincount(self.actions_taken, minlength=9)
-            total_actions = len(self.actions_taken)
-            action_percentages = (action_counts / total_actions) * 100
-            print("\n===== Action Distribution =====")
-            action_names = ["None", "Left", "Right", "Kick", "Punch", "Kick+Left", "Kick+Right", "Punch+Left", "Punch+Right"]
-            for i, (name, percentage) in enumerate(zip(action_names, action_percentages)):
-                print(f"{name}: {percentage:.2f}%")
-            print(f"Total Attack Actions: {sum(action_percentages[3:]):.2f}%")
-            self.actions_taken = []
-        return True
-
-def signal_handler(sig, frame):
-    if global_model is not None and global_model_path is not None:
-        print("Interrupt received! Saving model...")
-        emergency_path = f"{global_model_path}_emergency_{int(time.time())}"
-        global_model.save(emergency_path)
-        print(f"Emergency save completed: {emergency_path}")
-    sys.exit(0)
-
-def make_env(render=False, seed=None):
-    env = retro.make(
-        game="KungFu-Nes",
-        use_restricted_actions=retro.Actions.ALL,
-        obs_type=retro.Observations.IMAGE
-    )
+def make_kungfu_env(render=False, seed=None):
+    env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
     env = FrameSkipWrapper(env, skip=4)
     env = KungFuRewardWrapper(env)
     env = TimeLimit(env, max_episode_steps=5000)
-    if seed is not None:
-        env.seed(seed)
     return env
+
+def make_env(rank, seed=0, render=False):
+    def _init():
+        env = make_kungfu_env(render=(rank == 0 and render), seed=seed)
+        env.seed(seed + rank)
+        return env
+    set_random_seed(seed)
+    return _init
+
+class TqdmCallback(BaseCallback):
+    def __init__(self, total_timesteps, verbose=0):
+        super(TqdmCallback, self).__init__(verbose)
+        self.pbar = None
+        self.total_timesteps = total_timesteps
+        self.update_interval = max(self.total_timesteps // 1000, 1)
+        self.n_calls = 0
+
+    def _on_training_start(self):
+        self.pbar = tqdm(total=self.total_timesteps, desc="Training Progress")
+
+    def _on_step(self):
+        self.n_calls += 1
+        if self.n_calls % self.update_interval == 0 or self.n_calls == self.total_timesteps:
+            self.pbar.update(self.n_calls - self.pbar.n)
+        return not terminate_flag  # Stop training if terminate_flag is set
+
+    def _on_training_end(self):
+        self.pbar.n = self.total_timesteps
+        self.pbar.close()
 
 def train(args):
     global global_model, global_model_path
+    global_model_path = args.model_path
     
-    set_random_seed(args.seed)
-    env = make_vec_env(
-        lambda: make_env(args.render, args.seed),
-        n_envs=args.num_envs,
-        vec_env_cls=SubprocVecEnv if args.num_envs > 1 else DummyVecEnv,
-        monitor_dir="./monitor_logs"
-    )
-    env = VecFrameStack(env, n_stack=4)
-    env = VecMonitor(env)
+    os.makedirs(args.model_path, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
     
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    model_path = os.path.abspath(args.model_path)
-    global_model_path = model_path
+    print(f"Using device: {device}")
     
-    if args.resume and os.path.exists(f"{model_path}.zip"):
-        model = PPO.load(f"{model_path}.zip", env=env, device=device)
-        print(f"Resumed from {model_path}.zip")
+    set_random_seed(args.seed)
+    
+    if args.num_envs > 1:
+        env = SubprocVecEnv([make_env(i, args.seed, args.render) for i in range(args.num_envs)])
+    else:
+        env = DummyVecEnv([make_env(0, args.seed, args.render)])
+    
+    env = VecFrameStack(env, n_stack=4)
+    env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
+    
+    callbacks = []
+    
+    checkpoint_callback = CheckpointCallback(
+        save_freq=5000,
+        save_path=args.model_path,
+        name_prefix="kungfu_model",
+        save_replay_buffer=True,
+        verbose=1
+    )
+    callbacks.append(checkpoint_callback)
+    
+    if args.progress_bar:
+        tqdm_callback = TqdmCallback(total_timesteps=args.timesteps)
+        callbacks.append(tqdm_callback)
+    
+    if args.resume and os.path.exists(f"{args.model_path}/kungfu_model.zip"):
+        print(f"Resuming training from {args.model_path}/kungfu_model.zip")
+        model = PPO.load(
+            f"{args.model_path}/kungfu_model",
+            env=env,
+            custom_objects={
+                "learning_rate": args.learning_rate,
+                "n_steps": 2048,
+                "batch_size": 64,
+                "n_epochs": args.n_epochs,
+                "gamma": args.gamma,
+                "gae_lambda": args.gae_lambda,
+                "clip_range": args.clip_range,
+                "tensorboard_log": args.log_dir
+            },
+            device=device
+        )
     else:
         model = PPO(
             "CnnPolicy",
             env,
-            device=device,
-            verbose=1,
             learning_rate=args.learning_rate,
-            n_steps=4096,
-            batch_size=256,
+            n_steps=2048,
+            batch_size=64,
             n_epochs=args.n_epochs,
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
             clip_range=args.clip_range,
-            ent_coef=0.15,  # Reduced from 0.2 to make the policy more aggressive/focused
-            tensorboard_log=args.log_dir
+            tensorboard_log=args.log_dir,
+            verbose=1,
+            device=device
         )
     
     global_model = model
-    callbacks = [
-        RewardLoggerCallback(log_freq=1000),
-        ActionDistributionCallback(log_freq=5000)
-    ]
     
-    # Add progress bar callback if requested
-    if args.progress_bar:
-        callbacks.append(ProgressBarCallback(args.timesteps, args.num_envs))
-    
-    model.learn(
-        total_timesteps=args.timesteps,
-        callback=callbacks,
-        reset_num_timesteps=not args.resume,
-        progress_bar=False  # Set to True if you prefer the built-in progress bar
-    )
-    model.save(model_path)
-    env.close()
-    print(f"Model saved to {model_path}.zip")
+    try:
+        model.learn(
+            total_timesteps=args.timesteps,
+            callback=callbacks,
+            reset_num_timesteps=not args.resume
+        )
+        model.save(f"{args.model_path}/kungfu_model_final")
+        print(f"Training completed. Model saved to {args.model_path}/kungfu_model_final")
+    except Exception as e:
+        print(f"Error during training: {str(e)}")
+        logging.error(f"Error during training: {str(e)}")
+        error_path = f"{args.model_path}/kungfu_model_error_{int(time.time())}"
+        model.save(error_path)
+        print(f"Model saved to {error_path} due to error")
+    finally:
+        try:
+            env.close()
+        except Exception as e:
+            print(f"Error closing environment: {str(e)}")
+        if terminate_flag:
+            print("Training terminated by signal.")
 
 def play(args):
-    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    model_path = f"{args.model_path}.zip"
-    model = PPO.load(model_path, device=device)
+    env = make_kungfu_env(render=args.render, seed=args.seed)
+    model_path = f"{args.model_path}/kungfu_model_final"
     
-    env = make_vec_env(lambda: make_env(args.render), n_envs=1, vec_env_cls=DummyVecEnv)
-    env = VecFrameStack(env, n_stack=4)
-    raw_env = env.envs[0].env.env
+    if not os.path.exists(model_path + ".zip"):
+        model_path = f"{args.model_path}/kungfu_model"
+        if not os.path.exists(model_path + ".zip"):
+            print(f"No model found at {model_path}. Please train a model first.")
+            return
     
-    obs = env.reset()
-    total_reward = 0
+    print(f"Loading model from {model_path}")
+    model = PPO.load(model_path)
+    
     episode_count = 0
-    action_counts = [0] * 9
-    action_names = ["None", "Left", "Right", "Kick", "Punch", "Kick+Left", "Kick+Right", "Punch+Left", "Punch+Right"]
-    
-    while True:
-        action, _ = model.predict(obs, deterministic=args.deterministic)
-        action_counts[action[0]] += 1
-        obs, reward, done, info = env.step(action)
-        total_reward += reward[0]
-        
-        if args.render:
-            raw_env.render()
-            time.sleep(0.01)
-        
-        if done:
-            episode_count += 1
-            print(f"Episode {episode_count} - Score: {info[0].get('score', 0)}, Reward: {total_reward:.2f}")
-            total_actions = sum(action_counts)
-            print("\n===== Action Distribution =====")
-            for i, (name, count) in enumerate(zip(action_names, action_counts)):
-                print(f"{name}: {count/total_actions*100:.2f}% ({count})")
-            print(f"Total Attack Actions: {sum(action_counts[3:])/total_actions*100:.2f}%")
-            print(f"Successful Hits: {info[0].get('successful_hits', 0)}")
-            total_reward = 0
-            action_counts = [0] * 9
+    try:
+        while not terminate_flag:
             obs = env.reset()
+            done = False
+            total_reward = 0
+            steps = 0
+            episode_count += 1
+            print(f"Starting episode {episode_count}")
+            
+            while not done and not terminate_flag:
+                action, _ = model.predict(np.array(obs)[None], deterministic=args.deterministic)
+                # Ensure action is an integer
+                if isinstance(action, np.ndarray):
+                    action = int(action.item())
+                obs, reward, done, info = env.step(action)
+                total_reward += reward
+                steps += 1
+                
+                if args.render:
+                    env.render()
+                    time.sleep(0.01)
+                
+                if terminate_flag:
+                    break
+            
+            print(f"Episode {episode_count} - Total reward: {total_reward}, Steps: {steps}")
             if args.episodes > 0 and episode_count >= args.episodes:
+                print(f"Completed {args.episodes} episodes.")
                 break
-    env.close()
+    
+    except Exception as e:
+        print(f"Error during play: {str(e)}")
+        logging.error(f"Error during play: {str(e)}")
+    finally:
+        env.close()
+        if terminate_flag:
+            print("Play terminated by signal.")
 
 def evaluate(args):
-    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    model_path = f"{args.model_path}.zip"
-    model = PPO.load(model_path, device=device)
-    
-    env = make_vec_env(lambda: make_env(args.render), n_envs=1, vec_env_cls=DummyVecEnv)
-    env = VecFrameStack(env, n_stack=4)
-    
-    n_episodes = args.eval_episodes
-    episode_rewards = []
-    episode_scores = []
-    episode_lengths = []
-    action_counts = [0] * 9
-    action_names = ["None", "Left", "Right", "Kick", "Punch", "Kick+Left", "Kick+Right", "Punch+Left", "Punch+Right"]
-    
-    for episode in range(n_episodes):
-        obs = env.reset()
-        total_reward = 0
-        step_count = 0
-        while True:
-            action, _ = model.predict(obs, deterministic=True)
-            action_counts[action[0]] += 1
-            obs, reward, done, info = env.step(action)
-            total_reward += reward[0]
-            step_count += 1
-            if args.render:
-                env.envs[0].env.env.render()
-                time.sleep(0.01)
-            if done:
-                episode_rewards.append(total_reward)
-                episode_scores.append(info[0].get('score', 0))
-                episode_lengths.append(step_count)
-                print(f"Episode {episode+1}/{n_episodes} - Score: {episode_scores[-1]}, Reward: {total_reward:.2f}")
-                break
-    
-    avg_reward = np.mean(episode_rewards)
-    avg_score = np.mean(episode_scores)
-    avg_length = np.mean(episode_lengths)
-    total_actions = sum(action_counts)
-    print("===== Evaluation Results =====")
-    print(f"Avg Score: {avg_score:.2f}, Avg Reward: {avg_reward:.2f}, Avg Length: {avg_length:.2f}")
-    print("\n===== Action Distribution =====")
-    for i, (name, count) in enumerate(zip(action_names, action_counts)):
-        print(f"{name}: {count/total_actions*100:.2f}% ({count})")
-    print(f"Total Attack Actions: {sum(action_counts[3:])/total_actions*100:.2f}%")
-    env.close()
+    # Placeholder for evaluate function
+    pass
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal_handler)
-    
     parser = argparse.ArgumentParser(description="Train or play KungFu Master using PPO")
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--train", action="store_true")
@@ -486,9 +404,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=90_000)
+    parser.add_argument("--timesteps", type=int, default=10_000)
     parser.add_argument("--num_envs", type=int, default=8)
-    parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
+    parser.add_argument("--progress_bar", action="store_true")
     parser.add_argument("--eval_episodes", type=int, default=10)
     parser.add_argument("--episodes", type=int, default=0)
     parser.add_argument("--deterministic", action="store_true")
