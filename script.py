@@ -20,7 +20,7 @@ from stable_baselines3.common.utils import set_random_seed
 
 # Configure logging (terminal only by default)
 logging.basicConfig(
-    level=logging.INFO,  # Show logs in terminal
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
@@ -84,9 +84,9 @@ class PreprocessFrame(gym.ObservationWrapper):
         self.observation_space = spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8)
         
     def observation(self, obs):
-        obs = np.dot(obs[...,:3], [0.299, 0.587, 0.114])  # Convert to grayscale
-        obs = np.array(Image.fromarray(obs).resize((84, 84), Image.BILINEAR))  # Resize
-        obs = np.expand_dims(obs, axis=-1)  # Add channel dimension
+        obs = np.dot(obs[...,:3], [0.299, 0.587, 0.114])
+        obs = np.array(Image.fromarray(obs).resize((84, 84), Image.BILINEAR))
+        obs = np.expand_dims(obs, axis=-1)
         return obs.astype(np.uint8)
 
 class KungFuRewardWrapper(Wrapper):
@@ -99,6 +99,7 @@ class KungFuRewardWrapper(Wrapper):
             'enemy1_x': 0x036E, 'enemy1_y': 0x0371,
             'enemy2_x': 0x0372, 'enemy2_y': 0x0375
         }
+        self.screen_position = 0x004D  # RAM address for screen/level progress
         self.enemy_proximity_threshold = 50
         self.reset_state()
 
@@ -115,6 +116,7 @@ class KungFuRewardWrapper(Wrapper):
         self.enemy_health_previous = {}
         self.successful_hits = 0
         self.max_x = 0
+        self.last_screen = 0
 
     def reset(self):
         self.reset_state()
@@ -164,6 +166,7 @@ class KungFuRewardWrapper(Wrapper):
         current_score = info.get('score', 0)
         current_x = info.get('x_pos', 0)
         health = info.get('health', 46)
+        current_screen = ram[self.screen_position]
         enemy_nearby = self.is_enemy_nearby(ram)
         enemy_hit = self.detect_enemy_hit(ram, info)
         
@@ -178,48 +181,66 @@ class KungFuRewardWrapper(Wrapper):
         score_delta = current_score - self.last_score
         x_delta = current_x - self.last_x
         health_delta = health - self.last_health
+        screen_delta = current_screen - self.last_screen
         
         self.max_x = max(self.max_x, current_x)
 
         reward = 0
+        # Score reward
         if score_delta > 0:
-            reward += score_delta * 500.0 + 300.0
+            reward += score_delta * 1000.0 + 500.0  # Massively boost killing enemies
+        
+        # Movement rewards
         if x_delta > 0:
-            reward += x_delta * 5.0
+            reward += x_delta * 1.0  # Drastically reduce right reward
         if x_delta < 0:
-            reward += x_delta * -10.0
+            reward += x_delta * -50.0  # Massively increase left reward
+        
+        # Health penalty
         if health_delta < 0:
-            reward += health_delta * 10.0
-        reward -= 0.1
+            reward += health_delta * 20.0  # Increase penalty for damage
+        
+        # Constant step penalty
+        reward -= 0.5  # Increase to discourage stalling
+        
+        # Death penalty
         if health <= 0 and not self.death_penalty_applied:
-            reward -= 200
+            reward -= 500  # Increase death penalty
             self.death_penalty_applied = True
+        
+        # Progress penalties and rewards
         if abs(x_delta) < 1:
             self.time_without_progress += 1
-            if self.time_without_progress > 50:
-                reward -= 10
+            if self.time_without_progress > 30:  # Tighter threshold
+                reward -= 20  # Stronger penalty
         else:
             self.time_without_progress = 0
+        
+        # Combat incentives
         if enemy_nearby:
             self.frames_since_last_attack += 1
-            if self.frames_since_last_attack > 20:
-                reward -= 5
-            if action >= 3:
-                reward += 10
+            if self.frames_since_last_attack > 10:  # Tighter threshold
+                reward -= 20  # Strong penalty for not attacking
+            if action >= 3:  # Attack actions
+                reward += 50  # Big reward for attacking
                 self.frames_since_last_attack = 0
+        
         if enemy_hit:
-            reward += 100
+            reward += 200  # Big reward for hitting enemies
             self.frames_since_last_enemy_hit = 0
         else:
             self.frames_since_last_enemy_hit += 1
-            if self.frames_since_last_enemy_hit > 50 and enemy_nearby:
-                reward -= 2
-        if current_x > self.max_x - 10 and x_delta > 0:
-            reward += 50
+            if self.frames_since_last_enemy_hit > 30 and enemy_nearby:
+                reward -= 10
+        
+        # Screen progress bonus
+        if screen_delta > 0:
+            reward += 1000  # Huge reward for advancing screens
         
         self.last_score = current_score
         self.last_x = current_x
         self.last_health = health
+        self.last_screen = current_screen
         
         return obs, reward, done, info
 
@@ -296,7 +317,7 @@ def train(args):
         callbacks.append(TqdmCallback(total_timesteps=args.timesteps))
     
     model_file = f"{args.model_path}/kungfu_ppo.zip"
-    total_trained_steps = 0  # Track overall steps
+    total_trained_steps = 0
     
     if args.resume and os.path.exists(model_file):
         print(f"Resuming training from {model_file}")
@@ -304,7 +325,6 @@ def train(args):
             loaded_model = PPO.load(model_file, device=device, print_system_info=True)
             old_obs_space = loaded_model.observation_space
             total_trained_steps = loaded_model.total_trained_steps if hasattr(loaded_model, 'total_trained_steps') else 0
-            print(f"Saved model observation space: {old_obs_space}")
             print(f"Total trained steps so far: {total_trained_steps}")
             
             if old_obs_space != env.observation_space:
@@ -319,6 +339,7 @@ def train(args):
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
                     clip_range=args.clip_range,
+                    ent_coef=0.01,  # Increase entropy for exploration
                     tensorboard_log=args.log_dir,
                     verbose=1 if args.verbose else 0,
                     device=device
@@ -331,7 +352,7 @@ def train(args):
                     else:
                         print(f"Skipping weight transfer for {key} due to shape mismatch.")
                 model.policy.load_state_dict(new_policy_state_dict)
-                model.total_trained_steps = total_trained_steps  # Preserve total steps
+                model.total_trained_steps = total_trained_steps
                 print("Weights transferred successfully where compatible.")
             else:
                 model = PPO.load(
@@ -345,11 +366,13 @@ def train(args):
                         "gamma": args.gamma,
                         "gae_lambda": args.gae_lambda,
                         "clip_range": args.clip_range,
+                        "ent_coef": 0.01,  # Increase entropy for exploration
                         "tensorboard_log": args.log_dir,
-                        "total_trained_steps": total_trained_steps  # Load existing steps
+                        "total_trained_steps": total_trained_steps
                     },
                     device=device
                 )
+            print(f"Loaded model num_timesteps: {model.num_timesteps}")
         except Exception as e:
             print(f"Error during model loading/adaptation: {e}")
             print("Starting new training instead.")
@@ -363,12 +386,15 @@ def train(args):
                 gamma=args.gamma,
                 gae_lambda=args.gae_lambda,
                 clip_range=args.clip_range,
+                ent_coef=0.01,  # Increase entropy for exploration
                 tensorboard_log=args.log_dir,
                 verbose=1 if args.verbose else 0,
                 device=device
             )
     else:
         print("Starting new training.")
+        if os.path.exists(model_file):
+            print(f"Warning: {model_file} exists but --resume not specified. Overwriting.")
         model = PPO(
             "CnnPolicy",
             env,
@@ -379,6 +405,7 @@ def train(args):
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
             clip_range=args.clip_range,
+            ent_coef=0.01,  # Increase entropy for exploration
             tensorboard_log=args.log_dir,
             verbose=1 if args.verbose else 0,
             device=device
@@ -392,9 +419,8 @@ def train(args):
             callback=callbacks,
             reset_num_timesteps=False if args.resume and os.path.exists(model_file) else True
         )
-        # Update total trained steps
-        total_trained_steps += args.timesteps
-        model.total_trained_steps = total_trained_steps  # Store in model
+        total_trained_steps = model.num_timesteps
+        model.total_trained_steps = total_trained_steps
         model.save(model_file)
         print(f"Training completed. Model saved to {model_file}")
         print(f"Overall training steps: {total_trained_steps}")
@@ -403,7 +429,7 @@ def train(args):
     except Exception as e:
         print(f"Error during training: {str(e)}")
         logging.error(f"Error during training: {str(e)}")
-        total_trained_steps += model.num_timesteps  # Add steps completed before error
+        total_trained_steps = model.num_timesteps
         model.total_trained_steps = total_trained_steps
         model.save(model_file)
         print(f"Model saved to {model_file} due to error")
