@@ -22,7 +22,6 @@ from stable_baselines3.common.utils import set_random_seed
 logging.basicConfig(
     level=logging.INFO,  # Show logs in terminal
     format='%(asctime)s - %(levelname)s - %(message)s'
-    # No handlers specified here; file logging added only if --enable_file_logging is used
 )
 
 global_model = None
@@ -115,6 +114,7 @@ class KungFuRewardWrapper(Wrapper):
         self.frames_since_last_enemy_hit = 0
         self.enemy_health_previous = {}
         self.successful_hits = 0
+        self.max_x = 0
 
     def reset(self):
         self.reset_state()
@@ -179,45 +179,43 @@ class KungFuRewardWrapper(Wrapper):
         x_delta = current_x - self.last_x
         health_delta = health - self.last_health
         
+        self.max_x = max(self.max_x, current_x)
+
         reward = 0
         if score_delta > 0:
-            reward += score_delta * 200.0 + 150.0
+            reward += score_delta * 500.0 + 300.0
         if x_delta > 0:
-            reward += x_delta * 10.0
+            reward += x_delta * 5.0
         if x_delta < 0:
-            reward += x_delta * 2.0
+            reward += x_delta * -10.0
         if health_delta < 0:
-            reward += health_delta * 5.0
-        reward -= 0.05
-        
+            reward += health_delta * 10.0
+        reward -= 0.1
         if health <= 0 and not self.death_penalty_applied:
-            reward -= 100
+            reward -= 200
             self.death_penalty_applied = True
-        
         if abs(x_delta) < 1:
             self.time_without_progress += 1
-            if self.time_without_progress > 100:
-                reward -= 5
+            if self.time_without_progress > 50:
+                reward -= 10
         else:
             self.time_without_progress = 0
-        
         if enemy_nearby:
             self.frames_since_last_attack += 1
-            if self.frames_since_last_attack > 30 and action < 3:
-                reward -= 1
-        
-        if action >= 3:
-            self.frames_since_last_attack = 0
-            if enemy_nearby:
-                reward += 0.5
-        
+            if self.frames_since_last_attack > 20:
+                reward -= 5
+            if action >= 3:
+                reward += 10
+                self.frames_since_last_attack = 0
         if enemy_hit:
-            reward += 20
+            reward += 100
             self.frames_since_last_enemy_hit = 0
         else:
             self.frames_since_last_enemy_hit += 1
-            if self.frames_since_last_enemy_hit > 100 and enemy_nearby:
-                reward -= 0.5
+            if self.frames_since_last_enemy_hit > 50 and enemy_nearby:
+                reward -= 2
+        if current_x > self.max_x - 10 and x_delta > 0:
+            reward += 50
         
         self.last_score = current_score
         self.last_x = current_x
@@ -268,7 +266,6 @@ def train(args):
     global global_model, global_model_path
     global_model_path = args.model_path
     
-    # Add file handler only if file logging is enabled
     if args.enable_file_logging:
         logging.getLogger().addHandler(logging.FileHandler('training.log'))
     
@@ -280,17 +277,15 @@ def train(args):
     
     set_random_seed(args.seed)
     
-    # Create vectorized environment with new shape
     if args.num_envs > 1:
         env = SubprocVecEnv([make_env(i, args.seed, args.render) for i in range(args.num_envs)])
     else:
         env = DummyVecEnv([make_env(0, args.seed, args.render)])
     
-    env = VecFrameStack(env, n_stack=4)  # Shape: (4, 84, 84)
-    env = VecTransposeImage(env)  # Transpose to (84, 84, 4)
+    env = VecFrameStack(env, n_stack=4)
+    env = VecTransposeImage(env)
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
-    # Verify observation space
     expected_obs_space = spaces.Box(low=0, high=255, shape=(84, 84, 4), dtype=np.uint8)
     print(f"Current environment observation space: {env.observation_space}")
     if env.observation_space != expected_obs_space:
@@ -321,7 +316,7 @@ def train(args):
                     gae_lambda=args.gae_lambda,
                     clip_range=args.clip_range,
                     tensorboard_log=args.log_dir,
-                    verbose=1 if args.verbose else 0,  # Control PPO logs
+                    verbose=1 if args.verbose else 0,
                     device=device
                 )
                 old_policy_state_dict = loaded_model.policy.state_dict()
@@ -363,7 +358,7 @@ def train(args):
                 gae_lambda=args.gae_lambda,
                 clip_range=args.clip_range,
                 tensorboard_log=args.log_dir,
-                verbose=1 if args.verbose else 0,  # Control PPO logs
+                verbose=1 if args.verbose else 0,
                 device=device
             )
     else:
@@ -379,7 +374,7 @@ def train(args):
             gae_lambda=args.gae_lambda,
             clip_range=args.clip_range,
             tensorboard_log=args.log_dir,
-            verbose=1 if args.verbose else 0,  # Control PPO logs
+            verbose=1 if args.verbose else 0,
             device=device
         )
     
@@ -394,7 +389,6 @@ def train(args):
         model.save(model_file)
         print(f"Training completed. Model saved to {model_file}")
         
-        # Evaluate the model after training
         evaluate(args, model=model, baseline_file=args.baseline_file if hasattr(args, 'baseline_file') else None)
     except Exception as e:
         print(f"Error during training: {str(e)}")
@@ -410,7 +404,6 @@ def train(args):
             print("Training terminated by signal.")
 
 def play(args):
-    # Add file handler if file logging is enabled
     if args.enable_file_logging:
         logging.getLogger().addHandler(logging.FileHandler('training.log'))
     
@@ -461,11 +454,9 @@ def play(args):
         env.close()
 
 def evaluate(args, model=None, baseline_file=None):
-    # Add file handler if file logging is enabled
     if args.enable_file_logging:
         logging.getLogger().addHandler(logging.FileHandler('training.log'))
     
-    # Create evaluation environment
     env = make_kungfu_env(render=False)
     env = DummyVecEnv([lambda: env])
     env = VecFrameStack(env, n_stack=4)
@@ -479,14 +470,12 @@ def evaluate(args, model=None, baseline_file=None):
         print(f"Loading model from {model_file}")
         model = PPO.load(model_file, env=env)
     
-    # Action tracking
-    action_counts = np.zeros(9)  # 9 discrete actions
+    action_counts = np.zeros(9)
     total_steps = 0
     total_score = 0
     episode_lengths = []
     episode_scores = []
     
-    # Run evaluation episodes
     for episode in range(args.eval_episodes):
         obs = env.reset()
         done = False
@@ -498,7 +487,6 @@ def evaluate(args, model=None, baseline_file=None):
             action_counts[action] += 1
             obs, reward, done, info = env.step(action)
             episode_steps += 1
-            # Access the first info dict since it's a list from DummyVecEnv
             episode_score += info[0].get('score', reward[0] if isinstance(reward, np.ndarray) else reward)
             total_steps += 1
         
@@ -508,14 +496,10 @@ def evaluate(args, model=None, baseline_file=None):
     
     env.close()
     
-    # Calculate action percentages
     action_percentages = (action_counts / total_steps) * 100 if total_steps > 0 else np.zeros(9)
-    
-    # Average metrics
     avg_steps = np.mean(episode_lengths)
     avg_score = np.mean(episode_scores)
     
-    # Compare with baseline if provided
     baseline_stats = None
     if baseline_file and os.path.exists(baseline_file):
         baseline_env = make_kungfu_env(render=False)
@@ -544,7 +528,6 @@ def evaluate(args, model=None, baseline_file=None):
             'avg_score': np.mean(baseline_scores)
         }
     
-    # Generate report
     report = f"Evaluation Report for {model_file} ({args.eval_episodes} episodes)\n"
     report += "-" * 50 + "\n"
     report += "Action Percentages:\n"
@@ -564,10 +547,7 @@ def evaluate(args, model=None, baseline_file=None):
         report += f"  Scores More: {'Yes' if avg_score > baseline_stats['avg_score'] else 'No'} " \
                   f"(+{avg_score - baseline_stats['avg_score']:.2f})\n"
     
-    # Print report to terminal
     print(report)
-    
-    # Save report to file only if file logging is enabled
     if args.enable_file_logging:
         with open(os.path.join(args.log_dir, 'evaluation_report.txt'), 'w') as f:
             f.write(report)
