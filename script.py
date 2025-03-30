@@ -5,6 +5,7 @@ import gym
 import retro
 import numpy as np
 import torch
+import torch.nn as nn
 import signal
 import sys
 import logging
@@ -13,6 +14,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor, SubprocVecEnv, VecTransposeImage
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from tqdm import tqdm
 from gym import spaces, Wrapper
 from gym.wrappers import TimeLimit
@@ -40,6 +43,75 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# --- Custom Transformer Feature Extractor ---
+class TransformerFeatureExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space: spaces.Box, d_model=256, nhead=8, num_layers=2):
+        super(TransformerFeatureExtractor, self).__init__(observation_space, features_dim=d_model)
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_layers = num_layers
+        
+        # Input shape: (84, 84, 4) -> Flatten to sequence of patches
+        self.patch_size = 7  # Divide 84x84 into 12x12 patches (84/7 = 12)
+        self.num_patches = (84 // self.patch_size) ** 2  # 144 patches
+        self.patch_dim = self.patch_size * self.patch_size * 4  # 7*7*4 = 196
+        
+        # Linear layer to project patches to d_model
+        self.patch_embedding = nn.Linear(self.patch_dim, d_model)
+        
+        # Positional encoding
+        self.positional_encoding = nn.Parameter(torch.zeros(1, self.num_patches, d_model))
+        
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Final layer to reduce to features_dim
+        self.fc = nn.Linear(d_model * self.num_patches, d_model)
+        
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, height, width = observations.shape
+        
+        # Extract patches
+        x = observations.unfold(2, self.patch_size, self.patch_size)
+        x = x.unfold(3, self.patch_size, self.patch_size)
+        
+        num_patches_height = height // self.patch_size
+        num_patches_width = width // self.patch_size
+        num_patches = num_patches_height * num_patches_width
+        
+        # Reshape to (batch_size, num_patches, patch_dim)
+        x = x.contiguous().view(batch_size, channels, num_patches, self.patch_size * self.patch_size)
+        x = x.permute(0, 2, 1, 3).contiguous().view(batch_size, num_patches, channels * self.patch_size * self.patch_size)
+        
+        # Project patches to embedding dimension
+        x = self.patch_embedding(x)
+        
+        # Add positional encoding
+        x = x + self.positional_encoding
+        
+        # Transformer encoder
+        x = self.transformer_encoder(x)
+        
+        # Flatten and project to feature dimension
+        x = x.reshape(batch_size, -1)
+        x = self.fc(x)
+        
+        return x
+
+# --- Custom Transformer Policy ---
+class TransformerPolicy(ActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
+        super(TransformerPolicy, self).__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            features_extractor_class=TransformerFeatureExtractor,
+            features_extractor_kwargs=dict(d_model=256, nhead=8, num_layers=2),
+            **kwargs
+        )
+
+# --- Existing Wrappers ---
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -99,8 +171,11 @@ class KungFuRewardWrapper(Wrapper):
             'enemy1_x': 0x036E, 'enemy1_y': 0x0371,
             'enemy2_x': 0x0372, 'enemy2_y': 0x0375
         }
-        self.screen_position = 0x004D  # RAM address for screen/level progress
+        self.screen_position = 0x004D
         self.enemy_proximity_threshold = 50
+        self.action_history = []
+        self.action_window = 20
+        self.repetition_penalty = -10
         self.reset_state()
 
     def reset_state(self):
@@ -120,6 +195,7 @@ class KungFuRewardWrapper(Wrapper):
 
     def reset(self):
         self.reset_state()
+        self.action_history = []
         return self.env.reset()
 
     def is_enemy_nearby(self, ram):
@@ -186,57 +262,61 @@ class KungFuRewardWrapper(Wrapper):
         self.max_x = max(self.max_x, current_x)
 
         reward = 0
-        # Score reward
         if score_delta > 0:
-            reward += score_delta * 1000.0 + 500.0  # Massively boost killing enemies
+            reward += score_delta * 1000.0 + 500.0
         
-        # Movement rewards
         if x_delta > 0:
-            reward += x_delta * 1.0  # Drastically reduce right reward
+            reward += x_delta * 0.5
         if x_delta < 0:
-            reward += x_delta * -50.0  # Massively increase left reward
+            reward += x_delta * -20.0
         
-        # Health penalty
         if health_delta < 0:
-            reward += health_delta * 20.0  # Increase penalty for damage
+            reward += health_delta * 20.0
         
-        # Constant step penalty
-        reward -= 0.5  # Increase to discourage stalling
+        reward -= 0.5
         
-        # Death penalty
         if health <= 0 and not self.death_penalty_applied:
-            reward -= 500  # Increase death penalty
+            reward -= 500
             self.death_penalty_applied = True
         
-        # Progress penalties and rewards
         if abs(x_delta) < 1:
             self.time_without_progress += 1
-            if self.time_without_progress > 30:  # Tighter threshold
-                reward -= 20  # Stronger penalty
+            if self.time_without_progress > 30:
+                reward -= 20
         else:
             self.time_without_progress = 0
         
-        # Combat incentives
         if enemy_nearby:
             self.frames_since_last_attack += 1
-            if self.frames_since_last_attack > 10:  # Tighter threshold
-                reward -= 20  # Strong penalty for not attacking
-            if action >= 3:  # Attack actions
-                reward += 50  # Big reward for attacking
+            if self.frames_since_last_attack > 10:
+                reward -= 20
+            if action >= 3:
+                reward += 75
                 self.frames_since_last_attack = 0
         
         if enemy_hit:
-            reward += 200  # Big reward for hitting enemies
+            reward += 200
             self.frames_since_last_enemy_hit = 0
         else:
             self.frames_since_last_enemy_hit += 1
             if self.frames_since_last_enemy_hit > 30 and enemy_nearby:
                 reward -= 10
         
-        # Screen progress bonus
         if screen_delta > 0:
-            reward += 1000  # Huge reward for advancing screens
+            reward += 1000
         
+        if action in [1, 5, 7]:
+            reward += 50
+        
+        self.action_history.append(action)
+        if len(self.action_history) > self.action_window:
+            self.action_history.pop(0)
+        if len(self.action_history) == self.action_window:
+            action_counts = np.bincount(self.action_history, minlength=9)
+            most_used_action_count = np.max(action_counts)
+            if most_used_action_count > self.action_window * 0.7:
+                reward += self.repetition_penalty
+
         self.last_score = current_score
         self.last_x = current_x
         self.last_health = health
@@ -330,16 +410,16 @@ def train(args):
             if old_obs_space != env.observation_space:
                 print("Observation space mismatch detected. Adapting model to new observation space...")
                 model = PPO(
-                    "CnnPolicy",
+                    TransformerPolicy,
                     env,
-                    learning_rate=args.learning_rate,
+                    learning_rate=1e-4,
                     n_steps=2048,
                     batch_size=64,
                     n_epochs=args.n_epochs,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
-                    clip_range=args.clip_range,
-                    ent_coef=0.01,  # Increase entropy for exploration
+                    clip_range=0.1,
+                    ent_coef=0.1,
                     tensorboard_log=args.log_dir,
                     verbose=1 if args.verbose else 0,
                     device=device
@@ -359,16 +439,17 @@ def train(args):
                     model_file,
                     env=env,
                     custom_objects={
-                        "learning_rate": args.learning_rate,
+                        "learning_rate": 1e-4,
                         "n_steps": 2048,
                         "batch_size": 64,
                         "n_epochs": args.n_epochs,
                         "gamma": args.gamma,
                         "gae_lambda": args.gae_lambda,
-                        "clip_range": args.clip_range,
-                        "ent_coef": 0.01,  # Increase entropy for exploration
+                        "clip_range": 0.1,
+                        "ent_coef": 0.1,
                         "tensorboard_log": args.log_dir,
-                        "total_trained_steps": total_trained_steps
+                        "total_trained_steps": total_trained_steps,
+                        "policy": TransformerPolicy
                     },
                     device=device
                 )
@@ -377,16 +458,16 @@ def train(args):
             print(f"Error during model loading/adaptation: {e}")
             print("Starting new training instead.")
             model = PPO(
-                "CnnPolicy",
+                TransformerPolicy,
                 env,
-                learning_rate=args.learning_rate,
+                learning_rate=1e-4,
                 n_steps=2048,
                 batch_size=64,
                 n_epochs=args.n_epochs,
                 gamma=args.gamma,
                 gae_lambda=args.gae_lambda,
-                clip_range=args.clip_range,
-                ent_coef=0.01,  # Increase entropy for exploration
+                clip_range=0.1,
+                ent_coef=0.1,
                 tensorboard_log=args.log_dir,
                 verbose=1 if args.verbose else 0,
                 device=device
@@ -396,16 +477,16 @@ def train(args):
         if os.path.exists(model_file):
             print(f"Warning: {model_file} exists but --resume not specified. Overwriting.")
         model = PPO(
-            "CnnPolicy",
+            TransformerPolicy,
             env,
-            learning_rate=args.learning_rate,
+            learning_rate=1e-4,
             n_steps=2048,
             batch_size=64,
             n_epochs=args.n_epochs,
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
-            clip_range=args.clip_range,
-            ent_coef=0.01,  # Increase entropy for exploration
+            clip_range=0.1,
+            ent_coef=0.1,
             tensorboard_log=args.log_dir,
             verbose=1 if args.verbose else 0,
             device=device
@@ -518,16 +599,19 @@ def evaluate(args, model=None, baseline_file=None):
     total_score = 0
     episode_lengths = []
     episode_scores = []
+    action_history_per_episode = []
     
     for episode in range(args.eval_episodes):
         obs = env.reset()
         done = False
         episode_steps = 0
         episode_score = 0
+        episode_actions = []
         
         while not done and not terminate_flag:
             action, _ = model.predict(obs, deterministic=args.deterministic)
             action_counts[action] += 1
+            episode_actions.append(action)
             obs, reward, done, info = env.step(action)
             episode_steps += 1
             episode_score += info[0].get('score', reward[0] if isinstance(reward, np.ndarray) else reward)
@@ -536,12 +620,14 @@ def evaluate(args, model=None, baseline_file=None):
         episode_lengths.append(episode_steps)
         episode_scores.append(episode_score)
         total_score += episode_score
-    
+        action_history_per_episode.append(episode_actions)
+
     env.close()
     
     action_percentages = (action_counts / total_steps) * 100 if total_steps > 0 else np.zeros(9)
     avg_steps = np.mean(episode_lengths)
     avg_score = np.mean(episode_scores)
+    action_entropy = -np.sum(action_percentages / 100 * np.log(action_percentages / 100 + 1e-10))
     
     baseline_stats = None
     if baseline_file and os.path.exists(baseline_file):
@@ -577,6 +663,7 @@ def evaluate(args, model=None, baseline_file=None):
     report += "Action Percentages:\n"
     for i, (name, percent) in enumerate(zip(env.envs[0].action_names, action_percentages)):
         report += f"  {name}: {percent:.2f}%\n"
+    report += f"\nAction Distribution Entropy: {action_entropy:.3f} (higher = more diverse)\n"
     report += f"\nAverage Episode Length: {avg_steps:.2f} steps\n"
     report += f"Average Score: {avg_score:.2f}\n"
     report += f"Total Steps: {total_steps}\n"
