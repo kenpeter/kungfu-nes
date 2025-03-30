@@ -8,7 +8,7 @@ import torch
 import signal
 import sys
 import logging
-import multiprocessing as mp
+from PIL import Image
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor, SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env
@@ -78,6 +78,17 @@ class FrameSkipWrapper(gym.Wrapper):
                 break
         return obs, total_reward, done, info
 
+class PreprocessFrame(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.observation_space = spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8)
+        
+    def observation(self, obs):
+        obs = np.dot(obs[...,:3], [0.299, 0.587, 0.114])  # Convert to grayscale
+        obs = np.array(Image.fromarray(obs).resize((84, 84), Image.BILINEAR))  # Resize
+        obs = np.expand_dims(obs, axis=-1)  # Add channel dimension
+        return obs.astype(np.uint8)
+
 class KungFuRewardWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -92,7 +103,6 @@ class KungFuRewardWrapper(Wrapper):
         self.reset_state()
 
     def reset_state(self):
-        """Reset all tracking variables"""
         self.last_score = 0
         self.last_x = 0
         self.last_health = 46
@@ -110,7 +120,6 @@ class KungFuRewardWrapper(Wrapper):
         return self.env.reset()
 
     def is_enemy_nearby(self, ram):
-        """Check if an enemy is within proximity threshold"""
         try:
             player_x = ram[self.enemy_positions['player_x']]
             player_y = ram[self.enemy_positions['player_y']]
@@ -128,7 +137,6 @@ class KungFuRewardWrapper(Wrapper):
             return False
 
     def detect_enemy_hit(self, ram, info):
-        """Detect if an enemy was hit"""
         if info.get('score', 0) > self.last_score:
             self.successful_hits += 1
             return True
@@ -220,6 +228,7 @@ def make_kungfu_env(render=False, seed=None):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
     env = FrameSkipWrapper(env, skip=4)
+    env = PreprocessFrame(env)
     env = KungFuRewardWrapper(env)
     env = TimeLimit(env, max_episode_steps=5000)
     if seed is not None:
@@ -266,14 +275,21 @@ def train(args):
     
     set_random_seed(args.seed)
     
+    # Create vectorized environment with new shape
     if args.num_envs > 1:
         env = SubprocVecEnv([make_env(i, args.seed, args.render) for i in range(args.num_envs)])
     else:
         env = DummyVecEnv([make_env(0, args.seed, args.render)])
     
-    env = VecFrameStack(env, n_stack=4)
+    env = VecFrameStack(env, n_stack=4)  # New shape: (4, 84, 84)
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
+    # Verify observation space
+    expected_obs_space = spaces.Box(low=0, high=255, shape=(4, 84, 84), dtype=np.uint8)
+    print(f"Current environment observation space: {env.observation_space}")
+    if env.observation_space != expected_obs_space:
+        print(f"Warning: Observation space mismatch. Expected {expected_obs_space}, got {env.observation_space}")
+
     callbacks = []
     if args.progress_bar:
         callbacks.append(TqdmCallback(total_timesteps=args.timesteps))
@@ -281,21 +297,80 @@ def train(args):
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     if args.resume and os.path.exists(model_file):
         print(f"Resuming training from {model_file}")
-        model = PPO.load(
-            model_file,
-            env=env,
-            custom_objects={
-                "learning_rate": args.learning_rate,
-                "n_steps": 2048,
-                "batch_size": 64,
-                "n_epochs": args.n_epochs,
-                "gamma": args.gamma,
-                "gae_lambda": args.gae_lambda,
-                "clip_range": args.clip_range,
-                "tensorboard_log": args.log_dir
-            },
-            device=device
-        )
+        try:
+            # Load the model without immediately passing the env to bypass the check
+            loaded_model = PPO.load(model_file, device=device, print_system_info=True)
+            old_obs_space = loaded_model.env.observation_space
+            print(f"Saved model observation space: {old_obs_space}")
+            
+            # Check if observation spaces differ
+            if old_obs_space != env.observation_space:
+                print("Observation space mismatch detected. Adapting model to new observation space...")
+                
+                # Create a new PPO model with the new environment
+                model = PPO(
+                    "CnnPolicy",
+                    env,
+                    learning_rate=args.learning_rate,
+                    n_steps=2048,
+                    batch_size=64,
+                    n_epochs=args.n_epochs,
+                    gamma=args.gamma,
+                    gae_lambda=args.gae_lambda,
+                    clip_range=args.clip_range,
+                    tensorboard_log=args.log_dir,
+                    verbose=1,
+                    device=device
+                )
+                
+                # Transfer weights from the old model to the new one where possible
+                old_policy_state_dict = loaded_model.policy.state_dict()
+                new_policy_state_dict = model.policy.state_dict()
+                
+                # Copy weights for layers that match in shape
+                for key in old_policy_state_dict:
+                    if key in new_policy_state_dict and old_policy_state_dict[key].shape == new_policy_state_dict[key].shape:
+                        new_policy_state_dict[key] = old_policy_state_dict[key]
+                    else:
+                        print(f"Skipping weight transfer for {key} due to shape mismatch.")
+                
+                # Load the adapted weights into the new model
+                model.policy.load_state_dict(new_policy_state_dict)
+                print("Weights transferred successfully where compatible.")
+            else:
+                # If observation spaces match, load normally
+                model = PPO.load(
+                    model_file,
+                    env=env,
+                    custom_objects={
+                        "learning_rate": args.learning_rate,
+                        "n_steps": 2048,
+                        "batch_size": 64,
+                        "n_epochs": args.n_epochs,
+                        "gamma": args.gamma,
+                        "gae_lambda": args.gae_lambda,
+                        "clip_range": args.clip_range,
+                        "tensorboard_log": args.log_dir
+                    },
+                    device=device
+                )
+        except Exception as e:
+            print(f"Error during model loading/adaptation: {e}")
+            print("Starting new training instead.")
+            model = PPO(
+                "CnnPolicy",
+                env,
+                learning_rate=args.learning_rate,
+                n_steps=2048,
+                batch_size=64,
+                n_epochs=args.n_epochs,
+                gamma=args.gamma,
+                gae_lambda=args.gae_lambda,
+                clip_range=args.clip_range,
+                tensorboard_log=args.log_dir,
+                verbose=1,
+                device=device
+            )
     else:
         print("Starting new training.")
         model = PPO(
@@ -337,15 +412,17 @@ def train(args):
             print("Training terminated by signal.")
 
 def play(args):
-    env = make_kungfu_env(render=args.render, seed=args.seed)
-    model_file = f"{args.model_path}/kungfu_ppo.zip"
+    env = make_kungfu_env(render=args.render)
+    env = DummyVecEnv([lambda: env])  # Wrap in DummyVecEnv for consistency
+    env = VecFrameStack(env, n_stack=4)  # Match training setup
     
+    model_file = f"{args.model_path}/kungfu_ppo.zip"
     if not os.path.exists(model_file):
         print(f"No model found at {model_file}. Please train a model first.")
         return
     
     print(f"Loading model from {model_file}")
-    model = PPO.load(model_file)
+    model = PPO.load(model_file, env=env)
     
     episode_count = 0
     try:
@@ -358,9 +435,7 @@ def play(args):
             print(f"Starting episode {episode_count}")
             
             while not done and not terminate_flag:
-                action, _ = model.predict(np.array(obs)[None], deterministic=args.deterministic)
-                if isinstance(action, np.ndarray):
-                    action = int(action.item())
+                action, _ = model.predict(obs, deterministic=args.deterministic)
                 obs, reward, done, info = env.step(action)
                 total_reward += reward
                 steps += 1
