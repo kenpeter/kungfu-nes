@@ -141,29 +141,37 @@ class KungFuRewardWrapper(Wrapper):
         super().__init__(env)
         self.last_score = 0
         self.last_scroll = 0
-        # RAM addresses from provided SystemID NES map
+        self.last_stage = 0
+        self.last_hp = None
+        self.total_hp_loss = 0
         self.ram_positions = {
             'score_1': 0x0531,  # Score digit 5 (highest)
             'score_2': 0x0532,  # Score digit 4
             'score_3': 0x0533,  # Score digit 3
             'score_4': 0x0534,  # Score digit 2
-            'score_5': 0x0535,  # Score digit 1 (lowest)
+            'score_5': 0x0535,  # Score digit 1 (lowest, tens place)
             'scroll_1': 0x00E5, # Screen Scroll 1 (primary scroll value)
             'scroll_2': 0x00D4, # Screen Scroll 2 (secondary, if needed)
-            'current_stage': 0x0058  # Current Stage
+            'current_stage': 0x0058,  # Current Stage (1-5)
+            'hero_pos_x': 0x0094,  # Hero Screen Pos X
+            'hero_hp': 0x04A6  # Hero HP
         }
 
     def reset(self):
         self.last_score = 0
         self.last_scroll = 0
-        return super().reset()
+        self.last_stage = 0
+        self.total_hp_loss = 0
+        obs = super().reset()
+        ram = self.env.get_ram()
+        self.last_hp = ram[self.ram_positions['hero_hp']]
+        return obs
 
     def step(self, action):
         obs, _, done, info = super().step(action)
         
         # Get current game state from RAM
         ram = self.env.get_ram()
-        # Score in BCD-like format across 5 bytes
         current_score = (
             ram[self.ram_positions['score_1']] * 100000 +
             ram[self.ram_positions['score_2']] * 10000 +
@@ -171,29 +179,46 @@ class KungFuRewardWrapper(Wrapper):
             ram[self.ram_positions['score_4']] * 100 +
             ram[self.ram_positions['score_5']] * 10
         )
-        current_scroll = int(ram[self.ram_positions['scroll_1']])  # Primary scroll value
+        current_scroll = int(ram[self.ram_positions['scroll_1']])
+        current_stage = ram[self.ram_positions['current_stage']]
+        hero_pos_x = ram[self.ram_positions['hero_pos_x']]
+        current_hp = ram[self.ram_positions['hero_hp']]
 
-        # Handle score overflow (assuming max score fits in 5 digits)
+        # Calculate HP loss
+        if self.last_hp is not None and current_hp < self.last_hp:
+            hp_loss = self.last_hp - current_hp
+            self.total_hp_loss += hp_loss
+        self.last_hp = current_hp
+
+        # Handle score overflow (assuming 6-digit max: 999,990)
         if current_score < self.last_score:
-            score_delta = (999990 - self.last_score) + current_score  # Adjust for 5-digit max
+            score_delta = (999990 - self.last_score) + current_score
         else:
             score_delta = current_score - self.last_score
 
-        # Calculate scroll progress (assume increasing scroll = progress)
+        # Calculate scroll progress
         scroll_delta = current_scroll - self.last_scroll
-        if scroll_delta < 0:  # Handle wrap-around (255 to 0)
+        if scroll_delta < 0:
             scroll_delta += 256
 
         # Reward calculation
         reward = 0
         if score_delta > 0:
-            reward += score_delta * 10  # Reward for enemy kills via score increase
+            reward += score_delta * 100
         if scroll_delta > 0:
-            reward += scroll_delta * 50  # Reward for progressing further (50 per scroll unit)
+            reward += scroll_delta * 50
+        if current_stage > self.last_stage:
+            reward += 1000
 
         # Update trackers
         self.last_score = current_score
         self.last_scroll = current_scroll
+        self.last_stage = current_stage
+        info['score'] = current_score
+        info['hero_pos_x'] = hero_pos_x
+        info['current_stage'] = current_stage
+        info['hp'] = current_hp
+        info['total_hp_loss'] = self.total_hp_loss
 
         return obs, reward, done, info
     
@@ -256,7 +281,7 @@ def train(args):
     else:
         env = DummyVecEnv([make_env(0, args.seed, args.render)])
     
-    env = VecFrameStack(env, n_stack=4)  # Corrected: Removed erroneous '*'
+    env = VecFrameStack(env, n_stack=4)
     env = VecTransposeImage(env)
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
@@ -469,9 +494,11 @@ def evaluate(args, model=None, baseline_file=None):
     
     action_counts = np.zeros(9)
     total_steps = 0
-    total_score = 0
     episode_lengths = []
     episode_scores = []
+    max_positions = []
+    max_stages = []
+    hp_loss_rates = []
     action_history_per_episode = []
     
     for episode in range(args.eval_episodes):
@@ -479,6 +506,9 @@ def evaluate(args, model=None, baseline_file=None):
         done = False
         episode_steps = 0
         episode_score = 0
+        episode_max_pos_x = 0
+        episode_max_stage = 0
+        episode_hp_loss = 0
         episode_actions = []
         
         while not done and not terminate_flag:
@@ -487,12 +517,21 @@ def evaluate(args, model=None, baseline_file=None):
             episode_actions.append(action)
             obs, reward, done, info = env.step(action)
             episode_steps += 1
-            episode_score += info[0].get('score', reward[0] if isinstance(reward, np.ndarray) else reward)
+            current_score = info[0].get('score', 0)
+            episode_score = current_score  # Final score at episode end
+            hero_pos_x = info[0].get('hero_pos_x', 0)
+            current_stage = info[0].get('current_stage', 0)
+            episode_hp_loss = info[0].get('total_hp_loss', 0)
+            episode_max_pos_x = max(episode_max_pos_x, hero_pos_x)
+            episode_max_stage = max(episode_max_stage, current_stage)
             total_steps += 1
         
         episode_lengths.append(episode_steps)
         episode_scores.append(episode_score)
-        total_score += episode_score
+        max_positions.append(episode_max_pos_x)
+        max_stages.append(episode_max_stage)
+        hp_loss_rate = episode_hp_loss / episode_steps if episode_steps > 0 else 0
+        hp_loss_rates.append(hp_loss_rate)
         action_history_per_episode.append(episode_actions)
 
     env.close()
@@ -500,6 +539,9 @@ def evaluate(args, model=None, baseline_file=None):
     action_percentages = (action_counts / total_steps) * 100 if total_steps > 0 else np.zeros(9)
     avg_steps = np.mean(episode_lengths)
     avg_score = np.mean(episode_scores)
+    avg_max_pos_x = np.mean(max_positions)
+    avg_max_stage = np.mean(max_stages)
+    avg_hp_loss_rate = np.mean(hp_loss_rates)
     action_entropy = -np.sum(action_percentages / 100 * np.log(action_percentages / 100 + 1e-10))
     
     baseline_stats = None
@@ -512,22 +554,38 @@ def evaluate(args, model=None, baseline_file=None):
         
         baseline_steps = []
         baseline_scores = []
+        baseline_max_positions = []
+        baseline_max_stages = []
+        baseline_hp_loss_rates = []
         for _ in range(args.eval_episodes):
             obs = baseline_env.reset()
             done = False
             steps = 0
             score = 0
+            max_pos_x = 0
+            max_stage = 0
+            hp_loss = 0
             while not done:
                 action, _ = baseline_model.predict(obs, deterministic=args.deterministic)
                 obs, reward, done, info = baseline_env.step(action)
                 steps += 1
-                score += info[0].get('score', reward[0] if isinstance(reward, np.ndarray) else reward)
+                score = info[0].get('score', 0)
+                max_pos_x = max(max_pos_x, info[0].get('hero_pos_x', 0))
+                max_stage = max(max_stage, info[0].get('current_stage', 0))
+                hp_loss = info[0].get('total_hp_loss', 0)
+            hp_loss_rate = hp_loss / steps if steps > 0 else 0
             baseline_steps.append(steps)
             baseline_scores.append(score)
+            baseline_max_positions.append(max_pos_x)
+            baseline_max_stages.append(max_stage)
+            baseline_hp_loss_rates.append(hp_loss_rate)
         baseline_env.close()
         baseline_stats = {
             'avg_steps': np.mean(baseline_steps),
-            'avg_score': np.mean(baseline_scores)
+            'avg_score': np.mean(baseline_scores),
+            'avg_max_pos_x': np.mean(baseline_max_positions),
+            'avg_max_stage': np.mean(baseline_max_stages),
+            'avg_hp_loss_rate': np.mean(baseline_hp_loss_rates)
         }
     
     report = f"Evaluation Report for {model_file} ({args.eval_episodes} episodes)\n"
@@ -537,19 +595,29 @@ def evaluate(args, model=None, baseline_file=None):
     for i, (name, percent) in enumerate(zip(env.envs[0].action_names, action_percentages)):
         report += f"  {name}: {percent:.2f}%\n"
     report += f"\nAction Distribution Entropy: {action_entropy:.3f} (higher = more diverse)\n"
-    report += f"\nAverage Episode Length: {avg_steps:.2f} steps\n"
-    report += f"Average Score: {avg_score:.2f}\n"
-    report += f"Total Steps: {total_steps}\n"
-    report += f"Total Score: {total_score:.2f}\n"
+    report += f"\nAverage Survival Time: {avg_steps:.2f} steps\n"
+    report += f"Average Score per Episode: {avg_score:.2f}\n"
+    report += f"Average Furthest Position (Hero Pos X): {avg_max_pos_x:.2f}\n"
+    report += f"Average Highest Stage Reached: {avg_max_stage:.2f} (out of 5)\n"
+    report += f"Average HP Loss Rate: {avg_hp_loss_rate:.3f} HP/step (lower = better survival)\n"
     
     if baseline_stats:
         report += "\nComparison with Baseline:\n"
-        report += f"  Baseline Avg Episode Length: {baseline_stats['avg_steps']:.2f} steps\n"
-        report += f"  Baseline Avg Score: {baseline_stats['avg_score']:.2f}\n"
+        report += f"  Baseline Avg Survival Time: {baseline_stats['avg_steps']:.2f} steps\n"
+        report += f"  Baseline Avg Score per Episode: {baseline_stats['avg_score']:.2f}\n"
+        report += f"  Baseline Avg Furthest Position: {baseline_stats['avg_max_pos_x']:.2f}\n"
+        report += f"  Baseline Avg Highest Stage: {baseline_stats['avg_max_stage']:.2f}\n"
+        report += f"  Baseline Avg HP Loss Rate: {baseline_stats['avg_hp_loss_rate']:.3f} HP/step\n"
         report += f"  Plays Longer: {'Yes' if avg_steps > baseline_stats['avg_steps'] else 'No'} " \
                   f"(+{avg_steps - baseline_stats['avg_steps']:.2f} steps)\n"
         report += f"  Scores More: {'Yes' if avg_score > baseline_stats['avg_score'] else 'No'} " \
                   f"(+{avg_score - baseline_stats['avg_score']:.2f})\n"
+        report += f"  Reaches Further: {'Yes' if avg_max_pos_x > baseline_stats['avg_max_pos_x'] else 'No'} " \
+                  f"(+{avg_max_pos_x - baseline_stats['avg_max_pos_x']:.2f})\n"
+        report += f"  Progresses Further (Stages): {'Yes' if avg_max_stage > baseline_stats['avg_max_stage'] else 'No'} " \
+                  f"(+{avg_max_stage - baseline_stats['avg_max_stage']:.2f})\n"
+        report += f"  Loses HP Slower: {'Yes' if avg_hp_loss_rate < baseline_stats['avg_hp_loss_rate'] else 'No'} " \
+                  f"(-{baseline_stats['avg_hp_loss_rate'] - avg_hp_loss_rate:.3f} HP/step)\n"
     
     print(report)
     if args.enable_file_logging:
@@ -568,7 +636,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=50_000)
+    parser.add_argument("--timesteps", type=int, default=20_000)
     parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--progress_bar", action="store_true")
     parser.add_argument("--eval_episodes", type=int, default=10)
