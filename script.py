@@ -42,37 +42,47 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-class TransformerFeatureExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, d_model=256, nhead=8, num_layers=3):  # Increased num_layers
-        super(TransformerFeatureExtractor, self).__init__(observation_space, features_dim=d_model)
-        self.d_model = d_model
-        self.nhead = nhead
-        self.num_layers = num_layers
-        
-        self.patch_size = 7
-        self.num_patches = (84 // self.patch_size) ** 2
-        self.patch_dim = self.patch_size * self.patch_size * 4  # 4 channels from frame stack
-        
-        self.patch_embedding = nn.Linear(self.patch_dim, d_model)
-        self.positional_encoding = nn.Parameter(torch.zeros(1, self.num_patches, d_model))
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc = nn.Linear(d_model * self.num_patches, d_model)
-        
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        batch_size, channels, height, width = observations.shape
-        x = observations.unfold(2, self.patch_size, self.patch_size)
-        x = x.unfold(3, self.patch_size, self.patch_size)
-        num_patches_height = height // self.patch_size
-        num_patches_width = width // self.patch_size
-        num_patches = num_patches_height * num_patches_width
-        x = x.contiguous().view(batch_size, channels, num_patches, self.patch_size * self.patch_size)
-        x = x.permute(0, 2, 1, 3).contiguous().view(batch_size, num_patches, channels * self.patch_size * self.patch_size)
-        x = self.patch_embedding(x)
-        x = x + self.positional_encoding
-        x = self.transformer_encoder(x)
-        x = x.reshape(batch_size, -1)
-        x = self.fc(x)
+class VisionTransformer(BaseFeaturesExtractor):
+    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):
+        super(VisionTransformer, self).__init__(observation_space, features_dim=embed_dim)
+        self.img_size = observation_space.shape[1]  # 84
+        self.in_channels = observation_space.shape[0]  # 4 (from frame stack)
+        self.patch_size = patch_size
+        self.num_patches = (self.img_size // self.patch_size) ** 2  # (84 // 7) ^ 2 = 144
+        self.embed_dim = embed_dim
+
+        # Patch embedding: Conv2d to convert image patches to vectors
+        self.patch_embed = nn.Conv2d(
+            in_channels=self.in_channels,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
+        )
+
+        # Positional encoding
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=1024,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Layer norm
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch_size, channels=4, height=84, width=84]
+        x = self.patch_embed(x)  # [batch_size, embed_dim, 12, 12]
+        x = x.flatten(2).transpose(1, 2)  # [batch_size, num_patches=144, embed_dim]
+        x = x + self.pos_embed  # Add positional encoding
+        x = self.transformer(x)  # [batch_size, num_patches, embed_dim]
+        x = self.norm(x)  # Normalize
+        x = x.mean(dim=1)  # Global average pooling over patches: [batch_size, embed_dim]
         return x
 
 class TransformerPolicy(ActorCriticPolicy):
@@ -81,8 +91,8 @@ class TransformerPolicy(ActorCriticPolicy):
             observation_space,
             action_space,
             lr_schedule,
-            features_extractor_class=TransformerFeatureExtractor,
-            features_extractor_kwargs=dict(d_model=256, nhead=8, num_layers=3),
+            features_extractor_class=VisionTransformer,
+            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=6, patch_size=14),
             **kwargs
         )
 
@@ -287,7 +297,7 @@ def train(args):
     env = VecTransposeImage(env)
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
-    expected_obs_space = spaces.Box(low=0, high=255, shape=(84, 84, 4), dtype=np.uint8)
+    expected_obs_space = spaces.Box(low=0, high=255, shape=(4, 84, 84), dtype=np.uint8)  # Channels-first
     print(f"Current environment observation space: {env.observation_space}")
     if env.observation_space != expected_obs_space:
         print(f"Warning: Observation space mismatch. Expected {expected_obs_space}, got {env.observation_space}")
@@ -321,7 +331,7 @@ def train(args):
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
                     clip_range=0.1,
-                    ent_coef=0.2,  # Increased for more exploration
+                    ent_coef=0.2,
                     tensorboard_log=args.log_dir,
                     verbose=1 if args.verbose else 0,
                     device=device
@@ -388,7 +398,7 @@ def train(args):
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
             clip_range=0.1,
-            ent_coef=0.2,  # Increased for more exploration
+            ent_coef=0.2,
             tensorboard_log=args.log_dir,
             verbose=1 if args.verbose else 0,
             device=device
@@ -631,7 +641,7 @@ def evaluate(args, model=None, baseline_file=None):
             f.write(report)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train or play KungFu Master using PPO")
+    parser = argparse.ArgumentParser(description="Train or play KungFu Master using PPO with Vision Transformer")
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--train", action="store_true")
     mode_group.add_argument("--play", action="store_true")
@@ -642,7 +652,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=200_000)  # Increased for vision-based learning
+    parser.add_argument("--timesteps", type=int, default=10_000)
     parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--progress_bar", action="store_true")
     parser.add_argument("--eval_episodes", type=int, default=10)
