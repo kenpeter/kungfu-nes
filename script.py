@@ -11,7 +11,6 @@ import logging
 from PIL import Image
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor, SubprocVecEnv, VecTransposeImage
-from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -145,7 +144,6 @@ class KungFuRewardWrapper(Wrapper):
             'hero_action': 0x0069, 'hero_air_mode': 0x036A,
             'enemy1_action': 0x0080, 'enemy2_action': 0x0081, 'enemy3_action': 0x0082, 'enemy4_action': 0x0083,
             'enemy1_pos_x': 0x008E, 'enemy2_pos_x': 0x008F, 'enemy3_pos_x': 0x0090, 'enemy4_pos_x': 0x0091,
-            # Hypothesized Y positions (unverified)
             'enemy1_pos_y': 0x00A0, 'enemy2_pos_y': 0x00A1, 'enemy3_pos_y': 0x00A2, 'enemy4_pos_y': 0x00A3,
         }
 
@@ -225,13 +223,11 @@ class KungFuRewardWrapper(Wrapper):
                     elif not is_low_knife and ram[self.ram_positions['hero_action']] == HERO_DUCK_ACTION:
                         reward += AVOIDANCE_REWARD
 
-                # Gap-closing bonus
                 if self.last_knife_x[i-1] is not None and distance < abs(hero_pos_x - self.last_knife_x[i-1]):
                     reward += GAP_CLOSING_BONUS
 
             self.last_knife_x[i-1] = enemy_pos_x if enemy_action in (KNIFE_LOW_ACTION, KNIFE_HIGH_ACTION) else None
 
-        # Update state
         self.last_score = current_score
         self.last_scroll = current_scroll
         self.last_stage = current_stage
@@ -357,89 +353,39 @@ def train(args):
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     total_trained_steps = 0
     
+    # Define PPO hyperparameters
+    ppo_kwargs = dict(
+        policy=TransformerPolicy,
+        env=env,
+        learning_rate=args.learning_rate,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=args.n_epochs,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_range=args.clip_range,
+        ent_coef=0.5,
+        tensorboard_log=args.log_dir,
+        verbose=1 if args.verbose else 0,
+        device=device
+    )
+
     if os.path.exists(model_file) and args.resume:
         print(f"Resuming training from {model_file}")
         try:
-            loaded_model = PPO.load(model_file, device=device, print_system_info=True)
-            old_obs_space = loaded_model.observation_space
-            total_trained_steps = loaded_model.num_timesteps if hasattr(loaded_model, 'num_timesteps') else 0
+            model = PPO.load(model_file, env=env, device=device, print_system_info=True)
+            total_trained_steps = model.num_timesteps if hasattr(model, 'num_timesteps') else 0
             print(f"Total trained steps so far: {total_trained_steps}")
-            
-            if old_obs_space != env.observation_space:
-                print("Observation space mismatch detected. Adapting model...")
-                model = PPO(
-                    TransformerPolicy,
-                    env,
-                    learning_rate=args.learning_rate,
-                    n_steps=2048,
-                    batch_size=64,
-                    n_epochs=args.n_epochs,
-                    gamma=args.gamma,
-                    gae_lambda=args.gae_lambda,
-                    clip_range=args.clip_range,
-                    ent_coef=0.5,
-                    tensorboard_log=args.log_dir,
-                    verbose=1 if args.verbose else 0,
-                    device=device
-                )
-                old_policy_state_dict = loaded_model.policy.state_dict()
-                new_policy_state_dict = model.policy.state_dict()
-                for key in old_policy_state_dict:
-                    if key in new_policy_state_dict and old_policy_state_dict[key].shape == new_policy_state_dict[key].shape:
-                        new_policy_state_dict[key] = old_policy_state_dict[key]
-                model.policy.load_state_dict(new_policy_state_dict)
-                model.num_timesteps = total_trained_steps
-            else:
-                model = loaded_model
-                model.set_env(env)
-                model.learning_rate = args.learning_rate
-                model.n_steps = 2048
-                model.batch_size = 64
-                model.n_epochs = args.n_epochs
-                model.gamma = args.gamma
-                model.gae_lambda = args.gae_lambda
-                model.clip_range = args.clip_range
-                model.ent_coef = 0.5
-                model.tensorboard_log = args.log_dir
-                model.verbose = 1 if args.verbose else 0
             print(f"Loaded model num_timesteps: {model.num_timesteps}")
         except Exception as e:
             print(f"Error loading model: {e}")
             print("Starting new training.")
-            model = PPO(
-                TransformerPolicy,
-                env,
-                learning_rate=args.learning_rate,
-                n_steps=2048,
-                batch_size=64,
-                n_epochs=args.n_epochs,
-                gamma=args.gamma,
-                gae_lambda=args.gae_lambda,
-                clip_range=args.clip_range,
-                ent_coef=0.5,
-                tensorboard_log=args.log_dir,
-                verbose=1 if args.verbose else 0,
-                device=device
-            )
+            model = PPO(**ppo_kwargs)
     else:
         print("Starting new training.")
         if os.path.exists(model_file):
             print(f"Warning: {model_file} exists but --resume not specified. Overwriting.")
-        model = PPO(
-            TransformerPolicy,
-            env,
-            learning_rate=args.learning_rate,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=args.n_epochs,
-            gamma=args.gamma,
-            gae_lambda=args.gae_lambda,
-            clip_range=args.clip_range,
-            ent_coef=0.5,
-            tensorboard_log=args.log_dir,
-            verbose=1 if args.verbose else 0,
-            device=device
-        )
+        model = PPO(**ppo_kwargs)
     
     global_model = model
     
