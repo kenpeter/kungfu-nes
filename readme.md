@@ -22,6 +22,14 @@ python script.py --capture --state_file knife_state.state --enable_file_logging
 
 
 
+
+python capture_state.py --state_file knife_state.state --enable_file_logging
+
+
+
+
+
+
 python script.py --train --render --num_envs 1 --timesteps 5000 --enable_file_logging
 
 
