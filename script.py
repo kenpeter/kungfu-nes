@@ -44,6 +44,7 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# Vision Transformer for feature extraction
 class VisionTransformer(BaseFeaturesExtractor):
     def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):
         super(VisionTransformer, self).__init__(observation_space, features_dim=embed_dim)
@@ -79,6 +80,7 @@ class VisionTransformer(BaseFeaturesExtractor):
         x = x.mean(dim=1)
         return x
 
+# Custom policy using Vision Transformer
 class TransformerPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super(TransformerPolicy, self).__init__(
@@ -90,6 +92,7 @@ class TransformerPolicy(ActorCriticPolicy):
             **kwargs
         )
 
+# Discrete action space wrapper
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -114,17 +117,19 @@ class KungFuDiscreteWrapper(gym.ActionWrapper):
             action = int(action.item() if isinstance(action, np.ndarray) else action[0])
         return self._actions[action]
 
+# Frame preprocessing wrapper
 class PreprocessFrame(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.observation_space = spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8)
         
     def observation(self, obs):
-        obs = np.dot(obs[...,:3], [0.299, 0.587, 0.114])
+        obs = np.dot(obs[...,:3], [0.299, 0.587, 0.114])  # Grayscale
         obs = np.array(Image.fromarray(obs).resize((84, 84), Image.BILINEAR))
         obs = np.expand_dims(obs, axis=-1)
         return obs.astype(np.uint8)
 
+# Enhanced reward wrapper with knife avoidance
 class KungFuRewardWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -133,9 +138,15 @@ class KungFuRewardWrapper(Wrapper):
         self.last_stage = 0
         self.last_hp = None
         self.total_hp_loss = 0
+        self.last_knife_x = [None] * 4  # Track knife positions
         self.ram_positions = {
             'score_1': 0x0531, 'score_2': 0x0532, 'score_3': 0x0533, 'score_4': 0x0534, 'score_5': 0x0535,
-            'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 'hero_hp': 0x04A6
+            'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 'hero_hp': 0x04A6,
+            'hero_action': 0x0069, 'hero_air_mode': 0x036A,
+            'enemy1_action': 0x0080, 'enemy2_action': 0x0081, 'enemy3_action': 0x0082, 'enemy4_action': 0x0083,
+            'enemy1_pos_x': 0x008E, 'enemy2_pos_x': 0x008F, 'enemy3_pos_x': 0x0090, 'enemy4_pos_x': 0x0091,
+            # Hypothesized Y positions (unverified)
+            'enemy1_pos_y': 0x00A0, 'enemy2_pos_y': 0x00A1, 'enemy3_pos_y': 0x00A2, 'enemy4_pos_y': 0x00A3,
         }
 
     def reset(self):
@@ -143,6 +154,7 @@ class KungFuRewardWrapper(Wrapper):
         self.last_scroll = 0
         self.last_stage = 0
         self.total_hp_loss = 0
+        self.last_knife_x = [None] * 4
         obs = super().reset()
         ram = self.env.get_ram()
         self.last_hp = ram[self.ram_positions['hero_hp']]
@@ -162,19 +174,18 @@ class KungFuRewardWrapper(Wrapper):
         hero_pos_x = ram[self.ram_positions['hero_pos_x']]
         current_hp = ram[self.ram_positions['hero_hp']]
 
+        # Health loss
         hp_loss = 0
         if self.last_hp is not None and current_hp < self.last_hp:
             hp_loss = self.last_hp - current_hp
             self.total_hp_loss += hp_loss
         self.last_hp = current_hp
 
-        if current_score < self.last_score:
-            score_delta = (999990 - self.last_score) + current_score
-        else:
-            score_delta = current_score - self.last_score
-
+        # Score and scroll deltas
+        score_delta = current_score - self.last_score if current_score >= self.last_score else (999990 - self.last_score) + current_score
         scroll_delta = current_scroll - self.last_scroll if current_scroll >= self.last_scroll else (current_scroll + 256 - self.last_scroll)
 
+        # Base rewards
         reward = 0
         if score_delta > 0:
             reward += score_delta * 10
@@ -187,6 +198,40 @@ class KungFuRewardWrapper(Wrapper):
         else:
             reward += 10
 
+        # Knife avoidance and gap-closing
+        KNIFE_LOW_ACTION = 0x20  # Placeholder - verify with debugger
+        KNIFE_HIGH_ACTION = 0x21  # Placeholder - verify with debugger
+        HERO_DUCK_ACTION = 0x05  # Placeholder - verify with debugger
+        DISTANCE_THRESHOLD = 20
+        AVOIDANCE_REWARD = 100
+        GAP_CLOSING_BONUS = 10
+
+        knife_detected = False
+        for i in range(1, 5):
+            action_addr = self.ram_positions[f'enemy{i}_action']
+            pos_x_addr = self.ram_positions[f'enemy{i}_pos_x']
+            pos_y_addr = self.ram_positions[f'enemy{i}_pos_y']
+            enemy_action = ram[action_addr]
+            enemy_pos_x = ram[pos_x_addr]
+            enemy_pos_y = ram[pos_y_addr] if pos_y_addr in self.ram_positions else 0
+
+            if enemy_action in (KNIFE_LOW_ACTION, KNIFE_HIGH_ACTION):
+                knife_detected = True
+                distance = abs(hero_pos_x - enemy_pos_x)
+                if distance < DISTANCE_THRESHOLD:
+                    is_low_knife = enemy_action == KNIFE_LOW_ACTION or (enemy_pos_y > 50 and enemy_pos_y != 0)
+                    if is_low_knife and ram[self.ram_positions['hero_air_mode']] == 1:
+                        reward += AVOIDANCE_REWARD
+                    elif not is_low_knife and ram[self.ram_positions['hero_action']] == HERO_DUCK_ACTION:
+                        reward += AVOIDANCE_REWARD
+
+                # Gap-closing bonus
+                if self.last_knife_x[i-1] is not None and distance < abs(hero_pos_x - self.last_knife_x[i-1]):
+                    reward += GAP_CLOSING_BONUS
+
+            self.last_knife_x[i-1] = enemy_pos_x if enemy_action in (KNIFE_LOW_ACTION, KNIFE_HIGH_ACTION) else None
+
+        # Update state
         self.last_score = current_score
         self.last_scroll = current_scroll
         self.last_stage = current_stage
@@ -195,9 +240,11 @@ class KungFuRewardWrapper(Wrapper):
         info['current_stage'] = current_stage
         info['hp'] = current_hp
         info['total_hp_loss'] = self.total_hp_loss
+        info['knife_detected'] = knife_detected
 
         return obs, reward, done, info
 
+# State loader wrapper
 class StateLoaderWrapper(Wrapper):
     def __init__(self, env, state_file="custom_state.state"):
         super().__init__(env)
@@ -213,6 +260,7 @@ class StateLoaderWrapper(Wrapper):
         self.env.unwrapped.set_state(self.custom_state)
         return self.env.unwrapped.get_observation()
 
+# Environment creation functions
 def make_kungfu_env(render=False, seed=None, state_only=False, state_file="custom_state.state"):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
@@ -235,6 +283,7 @@ def make_env(rank, seed=0, render=False, state_only=False, state_file="custom_st
     set_random_seed(seed)
     return _init
 
+# Callbacks
 class RenderCallback(BaseCallback):
     def __init__(self, verbose=0):
         super(RenderCallback, self).__init__(verbose)
@@ -265,6 +314,7 @@ class TqdmCallback(BaseCallback):
         self.pbar.n = self.total_timesteps
         self.pbar.close()
 
+# Training function
 def train(args):
     global global_model, global_model_path
     global_model_path = args.model_path
@@ -312,21 +362,21 @@ def train(args):
         try:
             loaded_model = PPO.load(model_file, device=device, print_system_info=True)
             old_obs_space = loaded_model.observation_space
-            total_trained_steps = loaded_model.total_trained_steps if hasattr(loaded_model, 'total_trained_steps') else 0
+            total_trained_steps = loaded_model.num_timesteps if hasattr(loaded_model, 'num_timesteps') else 0
             print(f"Total trained steps so far: {total_trained_steps}")
             
             if old_obs_space != env.observation_space:
-                print("Observation space mismatch detected. Adapting model to new observation space...")
+                print("Observation space mismatch detected. Adapting model...")
                 model = PPO(
                     TransformerPolicy,
                     env,
-                    learning_rate=1e-4,
+                    learning_rate=args.learning_rate,
                     n_steps=2048,
                     batch_size=64,
                     n_epochs=args.n_epochs,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
-                    clip_range=0.1,
+                    clip_range=args.clip_range,
                     ent_coef=0.5,
                     tensorboard_log=args.log_dir,
                     verbose=1 if args.verbose else 0,
@@ -337,44 +387,35 @@ def train(args):
                 for key in old_policy_state_dict:
                     if key in new_policy_state_dict and old_policy_state_dict[key].shape == new_policy_state_dict[key].shape:
                         new_policy_state_dict[key] = old_policy_state_dict[key]
-                    else:
-                        print(f"Skipping weight transfer for {key} due to shape mismatch.")
                 model.policy.load_state_dict(new_policy_state_dict)
-                model.total_trained_steps = total_trained_steps
-                print("Weights transferred successfully where compatible.")
+                model.num_timesteps = total_trained_steps
             else:
-                model = PPO.load(
-                    model_file,
-                    env=env,
-                    custom_objects={
-                        "learning_rate": 1e-4,
-                        "n_steps": 2048,
-                        "batch_size": 64,
-                        "n_epochs": args.n_epochs,
-                        "gamma": args.gamma,
-                        "gae_lambda": args.gae_lambda,
-                        "clip_range": 0.1,
-                        "ent_coef": 0.5,
-                        "tensorboard_log": args.log_dir,
-                        "total_trained_steps": total_trained_steps,
-                        "policy": TransformerPolicy
-                    },
-                    device=device
-                )
+                model = loaded_model
+                model.set_env(env)
+                model.learning_rate = args.learning_rate
+                model.n_steps = 2048
+                model.batch_size = 64
+                model.n_epochs = args.n_epochs
+                model.gamma = args.gamma
+                model.gae_lambda = args.gae_lambda
+                model.clip_range = args.clip_range
+                model.ent_coef = 0.5
+                model.tensorboard_log = args.log_dir
+                model.verbose = 1 if args.verbose else 0
             print(f"Loaded model num_timesteps: {model.num_timesteps}")
         except Exception as e:
-            print(f"Error during model loading/adaptation: {e}")
-            print("Starting new training instead.")
+            print(f"Error loading model: {e}")
+            print("Starting new training.")
             model = PPO(
                 TransformerPolicy,
                 env,
-                learning_rate=1e-4,
+                learning_rate=args.learning_rate,
                 n_steps=2048,
                 batch_size=64,
                 n_epochs=args.n_epochs,
                 gamma=args.gamma,
                 gae_lambda=args.gae_lambda,
-                clip_range=0.1,
+                clip_range=args.clip_range,
                 ent_coef=0.5,
                 tensorboard_log=args.log_dir,
                 verbose=1 if args.verbose else 0,
@@ -387,13 +428,13 @@ def train(args):
         model = PPO(
             TransformerPolicy,
             env,
-            learning_rate=1e-4,
+            learning_rate=args.learning_rate,
             n_steps=2048,
             batch_size=64,
             n_epochs=args.n_epochs,
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
-            clip_range=0.1,
+            clip_range=args.clip_range,
             ent_coef=0.5,
             tensorboard_log=args.log_dir,
             verbose=1 if args.verbose else 0,
@@ -409,31 +450,27 @@ def train(args):
             reset_num_timesteps=False if args.resume and os.path.exists(model_file) else True
         )
         total_trained_steps = model.num_timesteps
-        model.total_trained_steps = total_trained_steps
         model.save(model_file)
         print(f"Training completed. Model saved to {model_file}")
         print(f"Overall training steps: {total_trained_steps}")
         
-        evaluate(args, model=model, baseline_file=args.baseline_file if hasattr(args, 'baseline_file') else None)
+        evaluate(args, model=model)
     except Exception as e:
         print(f"Error during training: {str(e)}")
         logging.error(f"Error during training: {str(e)}")
         total_trained_steps = model.num_timesteps
-        model.total_trained_steps = total_trained_steps
         model.save(model_file)
-        print(f"Model saved to {model_file} due to error")
+        print(f"Model saved due to error: {model_file}")
         print(f"Overall training steps: {total_trained_steps}")
     finally:
-        try:
-            env.close()
-        except Exception as e:
-            print(f"Error closing environment: {str(e)}")
+        env.close()
         if terminate_flag:
             print("Training terminated by signal.")
 
+# Play function
 def play(args):
     if args.enable_file_logging:
-        logging.getLogger().addHandler(logging.FileHandler('training.log'))
+        logging.getLogger().addHandler(logging.FileHandler('play.log'))
     
     env = make_kungfu_env(render=args.render, state_only=args.state_only, state_file=args.state_file)
     env = DummyVecEnv([lambda: env])
@@ -447,7 +484,7 @@ def play(args):
     
     print(f"Loading model from {model_file}")
     model = PPO.load(model_file, env=env)
-    total_trained_steps = model.total_trained_steps if hasattr(model, 'total_trained_steps') else 0
+    total_trained_steps = model.num_timesteps if hasattr(model, 'num_timesteps') else 0
     print(f"Overall training steps: {total_trained_steps}")
     
     episode_count = 0
@@ -463,11 +500,11 @@ def play(args):
             while not done and not terminate_flag:
                 action, _ = model.predict(obs, deterministic=args.deterministic)
                 obs, reward, done, info = env.step(action)
-                total_reward += reward
+                total_reward += reward[0] if isinstance(reward, np.ndarray) else reward
                 steps += 1
                 
-                action_name = env.envs[0].action_names[action[0]] if isinstance(action, np.ndarray) else env.envs[0].action_names[action]
-                print(f"Step {steps}: Action={action_name}, HP={info[0]['hp']}, Score={info[0]['score']}")
+                action_name = env.envs[0].action_names[action[0] if isinstance(action, np.ndarray) else action]
+                print(f"Step {steps}: Action={action_name}, Reward={reward}, HP={info[0]['hp']}, Score={info[0]['score']}")
                 
                 if args.render:
                     env.render()
@@ -485,11 +522,12 @@ def play(args):
     finally:
         env.close()
 
+# Capture function
 def capture(args):
     if args.enable_file_logging:
-        logging.getLogger().addHandler(logging.FileHandler('training.log'))
+        logging.getLogger().addHandler(logging.FileHandler('capture.log'))
     
-    env = make_kungfu_env(render=True)  # Always render for manual play
+    env = make_kungfu_env(render=True)
     env = DummyVecEnv([lambda: env])
     env = VecFrameStack(env, n_stack=4)
     env = VecTransposeImage(env)
@@ -497,7 +535,7 @@ def capture(args):
     obs = env.reset()
     done = False
     steps = 0
-    frame_time = 1 / 60  # 60 FPS for human play
+    frame_time = 1 / 60  # 60 FPS
     
     print("Controls: Left/Right Arrows, Z (Punch), X (Kick), Up (Jump), Down (Duck)")
     print(f"Press 'S' to save state to '{args.state_file}', 'Q' to quit.")
@@ -518,11 +556,11 @@ def capture(args):
             elif keyboard.is_pressed('x'):
                 action = 3
             elif keyboard.is_pressed('up'):
-                action = 10  # Jump
+                action = 10
             elif keyboard.is_pressed('down'):
-                action = 9   # Duck
+                action = 9
             
-            obs, reward, done, info = env.step([action])  # Wrap in list for VecEnv
+            obs, reward, done, info = env.step([action])
             logging.info(f"Step {steps}: Action={env.envs[0].action_names[action]}, Reward={reward[0]}, HP={info[0]['hp']}, Score={info[0]['score']}")
             
             if keyboard.is_pressed('s'):
@@ -544,9 +582,10 @@ def capture(args):
     finally:
         env.close()
 
+# Evaluation function
 def evaluate(args, model=None, baseline_file=None):
     if args.enable_file_logging:
-        logging.getLogger().addHandler(logging.FileHandler('training.log'))
+        logging.getLogger().addHandler(logging.FileHandler('evaluate.log'))
     
     env = make_kungfu_env(render=False, state_only=args.state_only, state_file=args.state_file)
     env = DummyVecEnv([lambda: env])
@@ -561,103 +600,65 @@ def evaluate(args, model=None, baseline_file=None):
         print(f"Loading model from {model_file}")
         model = PPO.load(model_file, env=env)
     
-    total_trained_steps = model.total_trained_steps if hasattr(model, 'total_trained_steps') else 0
+    total_trained_steps = model.num_timesteps if hasattr(model, 'num_timesteps') else 0
     
     action_counts = np.zeros(11)
     total_steps = 0
     episode_lengths = []
+    episode_rewards = []
     episode_scores = []
     max_positions = []
     max_stages = []
     hp_loss_rates = []
-    action_history_per_episode = []
+    knife_avoidances = []
     
     for episode in range(args.eval_episodes):
         obs = env.reset()
         done = False
         episode_steps = 0
+        episode_reward = 0
         episode_score = 0
         episode_max_pos_x = 0
         episode_max_stage = 0
         episode_hp_loss = 0
-        episode_actions = []
+        episode_knife_avoidances = 0
         
         while not done and not terminate_flag:
             action, _ = model.predict(obs, deterministic=args.deterministic)
-            action_counts[action] += 1
-            episode_actions.append(action)
+            action_counts[action[0] if isinstance(action, np.ndarray) else action] += 1
             obs, reward, done, info = env.step(action)
             episode_steps += 1
-            current_score = info[0].get('score', 0)
-            episode_score = current_score
+            episode_reward += reward[0] if isinstance(reward, np.ndarray) else reward
+            episode_score = info[0].get('score', 0)
             hero_pos_x = info[0].get('hero_pos_x', 0)
             current_stage = info[0].get('current_stage', 0)
             episode_hp_loss = info[0].get('total_hp_loss', 0)
+            if info[0].get('knife_detected', False):
+                episode_knife_avoidances += 1
             episode_max_pos_x = max(episode_max_pos_x, hero_pos_x)
             episode_max_stage = max(episode_max_stage, current_stage)
             total_steps += 1
         
         episode_lengths.append(episode_steps)
+        episode_rewards.append(episode_reward)
         episode_scores.append(episode_score)
         max_positions.append(episode_max_pos_x)
         max_stages.append(episode_max_stage)
         hp_loss_rate = episode_hp_loss / episode_steps if episode_steps > 0 else 0
         hp_loss_rates.append(hp_loss_rate)
-        action_history_per_episode.append(episode_actions)
+        knife_avoidances.append(episode_knife_avoidances)
 
     env.close()
     
     action_percentages = (action_counts / total_steps) * 100 if total_steps > 0 else np.zeros(11)
     avg_steps = np.mean(episode_lengths)
+    avg_reward = np.mean(episode_rewards)
     avg_score = np.mean(episode_scores)
     avg_max_pos_x = np.mean(max_positions)
     avg_max_stage = np.mean(max_stages)
     avg_hp_loss_rate = np.mean(hp_loss_rates)
+    avg_knife_avoidances = np.mean(knife_avoidances)
     action_entropy = -np.sum(action_percentages / 100 * np.log(action_percentages / 100 + 1e-10))
-    
-    baseline_stats = None
-    if baseline_file and os.path.exists(baseline_file):
-        baseline_env = make_kungfu_env(render=False, state_only=args.state_only, state_file=args.state_file)
-        baseline_env = DummyVecEnv([lambda: baseline_env])
-        baseline_env = VecFrameStack(baseline_env, n_stack=4)
-        baseline_env = VecTransposeImage(baseline_env)
-        baseline_model = PPO.load(baseline_file, env=baseline_env)
-        
-        baseline_steps = []
-        baseline_scores = []
-        baseline_max_positions = []
-        baseline_max_stages = []
-        baseline_hp_loss_rates = []
-        for _ in range(args.eval_episodes):
-            obs = baseline_env.reset()
-            done = False
-            steps = 0
-            score = 0
-            max_pos_x = 0
-            max_stage = 0
-            hp_loss = 0
-            while not done:
-                action, _ = baseline_model.predict(obs, deterministic=args.deterministic)
-                obs, reward, done, info = baseline_env.step(action)
-                steps += 1
-                score = info[0].get('score', 0)
-                max_pos_x = max(max_pos_x, info[0].get('hero_pos_x', 0))
-                max_stage = max(max_stage, info[0].get('current_stage', 0))
-                hp_loss = info[0].get('total_hp_loss', 0)
-            hp_loss_rate = hp_loss / steps if steps > 0 else 0
-            baseline_steps.append(steps)
-            baseline_scores.append(score)
-            baseline_max_positions.append(max_pos_x)
-            baseline_max_stages.append(max_stage)
-            baseline_hp_loss_rates.append(hp_loss_rate)
-        baseline_env.close()
-        baseline_stats = {
-            'avg_steps': np.mean(baseline_steps),
-            'avg_score': np.mean(baseline_scores),
-            'avg_max_pos_x': np.mean(baseline_max_positions),
-            'avg_max_stage': np.mean(baseline_max_stages),
-            'avg_hp_loss_rate': np.mean(baseline_hp_loss_rates)
-        }
     
     report = f"Evaluation Report for {model_file} ({args.eval_episodes} episodes)\n"
     report += f"Overall Training Steps: {total_trained_steps}\n"
@@ -666,35 +667,76 @@ def evaluate(args, model=None, baseline_file=None):
     for i, (name, percent) in enumerate(zip(env.envs[0].action_names, action_percentages)):
         report += f"  {name}: {percent:.2f}%\n"
     report += f"\nAction Distribution Entropy: {action_entropy:.3f} (higher = more diverse)\n"
-    report += f"\nAverage Survival Time: {avg_steps:.2f} steps\n"
+    report += f"Average Survival Time: {avg_steps:.2f} steps\n"
+    report += f"Average Reward per Episode: {avg_reward:.2f}\n"
     report += f"Average Score per Episode: {avg_score:.2f}\n"
-    report += f"Average Furthest Position (Hero Pos X): {avg_max_pos_x:.2f}\n"
-    report += f"Average Highest Stage Reached: {avg_max_stage:.2f} (out of 5)\n"
-    report += f"Average HP Loss Rate: {avg_hp_loss_rate:.3f} HP/step (lower = better survival)\n"
+    report += f"Average Furthest Position (X): {avg_max_pos_x:.2f}\n"
+    report += f"Average Highest Stage: {avg_max_stage:.2f} (out of 5)\n"
+    report += f"Average HP Loss Rate: {avg_hp_loss_rate:.3f} HP/step\n"
+    report += f"Average Knife Avoidances per Episode: {avg_knife_avoidances:.2f}\n"
     
-    if baseline_stats:
+    if baseline_file and os.path.exists(baseline_file):
+        baseline_env = make_kungfu_env(render=False, state_only=args.state_only, state_file=args.state_file)
+        baseline_env = DummyVecEnv([lambda: baseline_env])
+        baseline_env = VecFrameStack(baseline_env, n_stack=4)
+        baseline_env = VecTransposeImage(baseline_env)
+        baseline_model = PPO.load(baseline_file, env=baseline_env)
+        
+        baseline_steps = []
+        baseline_rewards = []
+        baseline_scores = []
+        baseline_max_positions = []
+        baseline_max_stages = []
+        baseline_hp_loss_rates = []
+        baseline_knife_avoidances = []
+        
+        for _ in range(args.eval_episodes):
+            obs = baseline_env.reset()
+            done = False
+            steps = 0
+            reward_total = 0
+            score = 0
+            max_pos_x = 0
+            max_stage = 0
+            hp_loss = 0
+            knife_avoidances_count = 0
+            while not done:
+                action, _ = baseline_model.predict(obs, deterministic=args.deterministic)
+                obs, reward, done, info = baseline_env.step(action)
+                steps += 1
+                reward_total += reward[0] if isinstance(reward, np.ndarray) else reward
+                score = info[0].get('score', 0)
+                max_pos_x = max(max_pos_x, info[0].get('hero_pos_x', 0))
+                max_stage = max(max_stage, info[0].get('current_stage', 0))
+                hp_loss = info[0].get('total_hp_loss', 0)
+                if info[0].get('knife_detected', False):
+                    knife_avoidances_count += 1
+            baseline_steps.append(steps)
+            baseline_rewards.append(reward_total)
+            baseline_scores.append(score)
+            baseline_max_positions.append(max_pos_x)
+            baseline_max_stages.append(max_stage)
+            hp_loss_rate = hp_loss / steps if steps > 0 else 0
+            baseline_hp_loss_rates.append(hp_loss_rate)
+            baseline_knife_avoidances.append(knife_avoidances_count)
+        
+        baseline_env.close()
+        
         report += "\nComparison with Baseline:\n"
-        report += f"  Baseline Avg Survival Time: {baseline_stats['avg_steps']:.2f} steps\n"
-        report += f"  Baseline Avg Score per Episode: {baseline_stats['avg_score']:.2f}\n"
-        report += f"  Baseline Avg Furthest Position: {baseline_stats['avg_max_pos_x']:.2f}\n"
-        report += f"  Baseline Avg Highest Stage: {baseline_stats['avg_max_stage']:.2f}\n"
-        report += f"  Baseline Avg HP Loss Rate: {baseline_stats['avg_hp_loss_rate']:.3f} HP/step\n"
-        report += f"  Plays Longer: {'Yes' if avg_steps > baseline_stats['avg_steps'] else 'No'} " \
-                  f"(+{avg_steps - baseline_stats['avg_steps']:.2f} steps)\n"
-        report += f"  Scores More: {'Yes' if avg_score > baseline_stats['avg_score'] else 'No'} " \
-                  f"(+{avg_score - baseline_stats['avg_score']:.2f})\n"
-        report += f"  Reaches Further: {'Yes' if avg_max_pos_x > baseline_stats['avg_max_pos_x'] else 'No'} " \
-                  f"(+{avg_max_pos_x - baseline_stats['avg_max_pos_x']:.2f})\n"
-        report += f"  Progresses Further (Stages): {'Yes' if avg_max_stage > baseline_stats['avg_max_stage'] else 'No'} " \
-                  f"(+{avg_max_stage - baseline_stats['avg_max_stage']:.2f})\n"
-        report += f"  Loses HP Slower: {'Yes' if avg_hp_loss_rate < baseline_stats['avg_hp_loss_rate'] else 'No'} " \
-                  f"(-{baseline_stats['avg_hp_loss_rate'] - avg_hp_loss_rate:.3f} HP/step)\n"
+        report += f"  Baseline Avg Survival Time: {np.mean(baseline_steps):.2f} steps\n"
+        report += f"  Baseline Avg Reward: {np.mean(baseline_rewards):.2f}\n"
+        report += f"  Baseline Avg Score: {np.mean(baseline_scores):.2f}\n"
+        report += f"  Baseline Avg Furthest Position: {np.mean(baseline_max_positions):.2f}\n"
+        report += f"  Baseline Avg Highest Stage: {np.mean(baseline_max_stages):.2f}\n"
+        report += f"  Baseline Avg HP Loss Rate: {np.mean(baseline_hp_loss_rates):.3f} HP/step\n"
+        report += f"  Baseline Avg Knife Avoidances: {np.mean(baseline_knife_avoidances):.2f}\n"
     
     print(report)
     if args.enable_file_logging:
         with open(os.path.join(args.log_dir, 'evaluation_report.txt'), 'w') as f:
             f.write(report)
 
+# Main execution
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train, play, capture, or evaluate KungFu Master using PPO with Vision Transformer")
     mode_group = parser.add_mutually_exclusive_group()
@@ -706,9 +748,9 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save/load kungfu_ppo.zip")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--render", action="store_true", help="Render the game (train/play)")
-    parser.add_argument("--resume", action="store_true", help="Resume training from kungfu_ppo.zip")
-    parser.add_argument("--timesteps", type=int, default=500_000, help="Total timesteps for training")
+    parser.add_argument("--render", action="store_true", help="Render the game")
+    parser.add_argument("--resume", action="store_true", help="Resume training from existing model")
+    parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps for training")
     parser.add_argument("--num_envs", type=int, default=8, help="Number of parallel environments")
     parser.add_argument("--progress_bar", action="store_true", help="Show training progress bar")
     parser.add_argument("--eval_episodes", type=int, default=10, help="Number of episodes for evaluation")
@@ -723,8 +765,8 @@ if __name__ == "__main__":
     parser.add_argument("--baseline_file", type=str, default=None, help="Path to baseline model for comparison")
     parser.add_argument("--enable_file_logging", action="store_true", help="Enable logging to file")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose PPO output")
-    parser.add_argument("--state_only", action="store_true", help="Train/play on custom state instead of full game")
-    parser.add_argument("--state_file", default="custom_state.state", help="File for saving/loading custom state")
+    parser.add_argument("--state_only", action="store_true", help="Train/play on custom state")
+    parser.add_argument("--state_file", default="custom_state.state", help="File for custom state")
     
     args = parser.parse_args()
     if not any([args.train, args.play, args.capture, args.evaluate]):
