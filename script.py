@@ -140,15 +140,22 @@ class KungFuRewardWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
         self.last_score = 0
-        # RAM addresses from https://datacrystal.tcrf.net/wiki/Kung_Fu_(NES)/RAM_map
+        self.last_scroll = 0
+        # RAM addresses from provided SystemID NES map
         self.ram_positions = {
-            'score': 0x0078,          # Score (low byte; adjust if multi-byte)
-            'enemy1_health': 0x0460,  # Enemy 1 health/status in sprite RAM
-            'enemy2_health': 0x0464   # Enemy 2 health/status in sprite RAM
+            'score_1': 0x0531,  # Score digit 5 (highest)
+            'score_2': 0x0532,  # Score digit 4
+            'score_3': 0x0533,  # Score digit 3
+            'score_4': 0x0534,  # Score digit 2
+            'score_5': 0x0535,  # Score digit 1 (lowest)
+            'scroll_1': 0x00E5, # Screen Scroll 1 (primary scroll value)
+            'scroll_2': 0x00D4, # Screen Scroll 2 (secondary, if needed)
+            'current_stage': 0x0058  # Current Stage
         }
 
     def reset(self):
         self.last_score = 0
+        self.last_scroll = 0
         return super().reset()
 
     def step(self, action):
@@ -156,27 +163,37 @@ class KungFuRewardWrapper(Wrapper):
         
         # Get current game state from RAM
         ram = self.env.get_ram()
-        current_score = int(ram[self.ram_positions['score']])  # Single byte; adjust for BCD if needed
+        # Score in BCD format across 5 bytes (assuming hex values represent digits)
+        current_score = (
+            ram[self.ram_positions['score_1']] * 100000 +
+            ram[self.ram_positions['score_2']] * 10000 +
+            ram[self.ram_positions['score_3']] * 1000 +
+            ram[self.ram_positions['score_4']] * 100 +
+            ram[self.ram_positions['score_5']] * 10
+        )
+        current_scroll = int(ram[self.ram_positions['scroll_1']])  # Primary scroll value
 
-        # Handle score overflow (assuming 8-bit score)
+        # Handle score overflow (assuming max score fits in 5 digits)
         if current_score < self.last_score:
-            score_delta = (255 - self.last_score) + current_score
+            score_delta = (999990 - self.last_score) + current_score  # Adjust for 5-digit max
         else:
             score_delta = current_score - self.last_score
 
-        # Reward calculation: Only for killing enemies (via score) and movement
+        # Calculate scroll progress (assume increasing scroll = progress)
+        scroll_delta = current_scroll - self.last_scroll
+        if scroll_delta < 0:  # Handle wrap-around (255 to 0)
+            scroll_delta += 256
+
+        # Reward calculation
         reward = 0
         if score_delta > 0:
-            reward += score_delta * 10  # Reward for score increase (proxy for enemy kills)
-
-        # Movement reward: Reward for moving left, penalty for moving right
-        if action in [1, 5, 7]:  # Left, Kick+Left, Punch+Left
-            reward += 50         # Reward for moving left
-        elif action in [2, 6, 8]:  # Right, Kick+Right, Punch+Right
-            reward -= 50         # Penalty for moving right
+            reward += score_delta * 10  # Reward for enemy kills via score increase
+        if scroll_delta > 0:
+            reward += scroll_delta * 50  # Reward for progressing further (50 per scroll unit)
 
         # Update trackers
         self.last_score = current_score
+        self.last_scroll = current_scroll
 
         return obs, reward, done, info
     
@@ -239,7 +256,7 @@ def train(args):
     else:
         env = DummyVecEnv([make_env(0, args.seed, args.render)])
     
-    env = VecFrameStack(env, n_stack=4)
+    env = VecFrameStack(env *}$, n_stack=4)
     env = VecTransposeImage(env)
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
@@ -551,7 +568,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=10_000)
+    parser.add_argument("--timesteps", type=int, default=500_000)
     parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--progress_bar", action="store_true")
     parser.add_argument("--eval_episodes", type=int, default=10)
