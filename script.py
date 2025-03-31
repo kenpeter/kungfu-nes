@@ -43,12 +43,12 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 class VisionTransformer(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):
+    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):  # Changed to 6 layers, patch_size=14
         super(VisionTransformer, self).__init__(observation_space, features_dim=embed_dim)
         self.img_size = observation_space.shape[1]  # 84
         self.in_channels = observation_space.shape[0]  # 4 (from frame stack)
         self.patch_size = patch_size
-        self.num_patches = (self.img_size // self.patch_size) ** 2  # (84 // 7) ^ 2 = 144
+        self.num_patches = (self.img_size // self.patch_size) ** 2  # (84 // 14) ^ 2 = 36
         self.embed_dim = embed_dim
 
         # Patch embedding: Conv2d to convert image patches to vectors
@@ -77,8 +77,8 @@ class VisionTransformer(BaseFeaturesExtractor):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch_size, channels=4, height=84, width=84]
-        x = self.patch_embed(x)  # [batch_size, embed_dim, 12, 12]
-        x = x.flatten(2).transpose(1, 2)  # [batch_size, num_patches=144, embed_dim]
+        x = self.patch_embed(x)  # [batch_size, embed_dim, 6, 6]
+        x = x.flatten(2).transpose(1, 2)  # [batch_size, num_patches=36, embed_dim]
         x = x + self.pos_embed  # Add positional encoding
         x = self.transformer(x)  # [batch_size, num_patches, embed_dim]
         x = self.norm(x)  # Normalize
@@ -92,7 +92,7 @@ class TransformerPolicy(ActorCriticPolicy):
             action_space,
             lr_schedule,
             features_extractor_class=VisionTransformer,
-            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=6, patch_size=14),
+            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=6, patch_size=14),  # Updated kwargs
             **kwargs
         )
 
@@ -652,7 +652,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=10_000)
+    parser.add_argument("--timesteps", type=int, default=20_000)
     parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--progress_bar", action="store_true")
     parser.add_argument("--eval_episodes", type=int, default=10)
