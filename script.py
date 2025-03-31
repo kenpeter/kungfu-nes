@@ -1,6 +1,5 @@
 import argparse
 import os
-import time
 import gym
 import retro
 import numpy as np
@@ -21,7 +20,7 @@ from gym import spaces, Wrapper
 from gym.wrappers import TimeLimit
 from stable_baselines3.common.utils import set_random_seed
 
-# Configure logging (terminal only by default)
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -44,7 +43,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 class TransformerFeatureExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, d_model=256, nhead=8, num_layers=2):
+    def __init__(self, observation_space: spaces.Box, d_model=256, nhead=8, num_layers=3):  # Increased num_layers
         super(TransformerFeatureExtractor, self).__init__(observation_space, features_dim=d_model)
         self.d_model = d_model
         self.nhead = nhead
@@ -52,7 +51,7 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         
         self.patch_size = 7
         self.num_patches = (84 // self.patch_size) ** 2
-        self.patch_dim = self.patch_size * self.patch_size * 4
+        self.patch_dim = self.patch_size * self.patch_size * 4  # 4 channels from frame stack
         
         self.patch_embedding = nn.Linear(self.patch_dim, d_model)
         self.positional_encoding = nn.Parameter(torch.zeros(1, self.num_patches, d_model))
@@ -83,47 +82,32 @@ class TransformerPolicy(ActorCriticPolicy):
             action_space,
             lr_schedule,
             features_extractor_class=TransformerFeatureExtractor,
-            features_extractor_kwargs=dict(d_model=256, nhead=8, num_layers=2),
+            features_extractor_kwargs=dict(d_model=256, nhead=8, num_layers=3),
             **kwargs
         )
 
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.action_space = spaces.Discrete(9)
+        self.action_space = spaces.Discrete(10)
         self._actions = [
-            [0,0,0,0,0,0,0,0,0,0,0,0],  # No action
-            [0,0,0,0,0,0,1,0,0,0,0,0],  # Left
-            [0,0,0,0,0,0,0,0,1,0,0,0],  # Right
-            [1,0,0,0,0,0,0,0,0,0,0,0],  # B (kick)
-            [0,1,0,0,0,0,0,0,0,0,0,0],  # A (punch)
-            [1,0,0,0,0,0,1,0,0,0,0,0],  # B+Left
-            [1,0,0,0,0,0,0,0,1,0,0,0],  # B+Right
-            [0,1,0,0,0,0,1,0,0,0,0,0],  # A+Left
-            [0,1,0,0,0,0,0,0,1,0,0,0]   # A+Right
+            [0,0,0,0,0,0,0,0,0,0,0,0],  # 0: No action
+            [0,0,0,0,0,0,1,0,0,0,0,0],  # 1: Left
+            [0,0,0,0,0,0,0,0,1,0,0,0],  # 2: Right
+            [1,0,0,0,0,0,0,0,0,0,0,0],  # 3: B (kick)
+            [0,1,0,0,0,0,0,0,0,0,0,0],  # 4: A (punch)
+            [1,0,0,0,0,0,1,0,0,0,0,0],  # 5: B+Left
+            [1,0,0,0,0,0,0,0,1,0,0,0],  # 6: B+Right
+            [0,1,0,0,0,0,1,0,0,0,0,0],  # 7: A+Left
+            [0,1,0,0,0,0,0,0,1,0,0,0],  # 8: A+Right
+            [0,0,0,0,0,1,0,0,0,0,0,0]   # 9: Down (duck/dodge)
         ]
-        self.action_names = ["No action", "Left", "Right", "Kick", "Punch", "Kick+Left", "Kick+Right", "Punch+Left", "Punch+Right"]
+        self.action_names = ["No action", "Left", "Right", "Kick", "Punch", "Kick+Left", "Kick+Right", "Punch+Left", "Punch+Right", "Down"]
 
     def action(self, action):
         if isinstance(action, (list, np.ndarray)):
             action = int(action.item() if isinstance(action, np.ndarray) else action[0])
         return self._actions[action]
-
-class FrameSkipWrapper(gym.Wrapper):
-    def __init__(self, env, skip=4):
-        super().__init__(env)
-        self._skip = skip
-    
-    def step(self, action):
-        total_reward = 0.0
-        done = False
-        info = {}
-        for _ in range(self._skip):
-            obs, reward, done, info = self.env.step(action)
-            total_reward += reward
-            if done:
-                break
-        return obs, total_reward, done, info
 
 class PreprocessFrame(gym.ObservationWrapper):
     def __init__(self, env):
@@ -145,16 +129,16 @@ class KungFuRewardWrapper(Wrapper):
         self.last_hp = None
         self.total_hp_loss = 0
         self.ram_positions = {
-            'score_1': 0x0531,  # Score digit 5 (highest)
-            'score_2': 0x0532,  # Score digit 4
-            'score_3': 0x0533,  # Score digit 3
-            'score_4': 0x0534,  # Score digit 2
-            'score_5': 0x0535,  # Score digit 1 (lowest, tens place)
+            'score_1': 0x0531,  # Score digit 5 (hundred-thousands place)
+            'score_2': 0x0532,  # Score digit 4 (ten-thousands place)
+            'score_3': 0x0533,  # Score digit 3 (thousands place)
+            'score_4': 0x0534,  # Score digit 2 (hundreds place)
+            'score_5': 0x0535,  # Score digit 1 (tens place)
             'scroll_1': 0x00E5, # Screen Scroll 1 (primary scroll value)
             'scroll_2': 0x00D4, # Screen Scroll 2 (secondary, if needed)
             'current_stage': 0x0058,  # Current Stage (1-5)
             'hero_pos_x': 0x0094,  # Hero Screen Pos X
-            'hero_hp': 0x04A6  # Hero HP
+            'hero_hp': 0x04A6      # Hero HP
         }
 
     def reset(self):
@@ -170,7 +154,6 @@ class KungFuRewardWrapper(Wrapper):
     def step(self, action):
         obs, _, done, info = super().step(action)
         
-        # Get current game state from RAM
         ram = self.env.get_ram()
         current_score = (
             ram[self.ram_positions['score_1']] * 100000 +
@@ -184,13 +167,14 @@ class KungFuRewardWrapper(Wrapper):
         hero_pos_x = ram[self.ram_positions['hero_pos_x']]
         current_hp = ram[self.ram_positions['hero_hp']]
 
-        # Calculate HP loss
+        # Detect HP loss
+        hp_loss = 0
         if self.last_hp is not None and current_hp < self.last_hp:
             hp_loss = self.last_hp - current_hp
             self.total_hp_loss += hp_loss
         self.last_hp = current_hp
 
-        # Handle score overflow (assuming 6-digit max: 999,990)
+        # Handle score overflow
         if current_score < self.last_score:
             score_delta = (999990 - self.last_score) + current_score
         else:
@@ -201,14 +185,18 @@ class KungFuRewardWrapper(Wrapper):
         if scroll_delta < 0:
             scroll_delta += 256
 
-        # Reward calculation
+        # General reward function
         reward = 0
         if score_delta > 0:
-            reward += score_delta * 100
+            reward += score_delta * 10  # Reward for killing enemies
         if scroll_delta > 0:
-            reward += scroll_delta * 50
+            reward += scroll_delta * 50  # Reward for progress
         if current_stage > self.last_stage:
-            reward += 1000
+            reward += 1000  # Reward for stage completion
+        if hp_loss > 0:
+            reward -= hp_loss * 50  # Penalty for losing HP (encourages dodging)
+        else:
+            reward += 10  # Small reward for surviving each step
 
         # Update trackers
         self.last_score = current_score
@@ -225,12 +213,13 @@ class KungFuRewardWrapper(Wrapper):
 def make_kungfu_env(render=False, seed=None):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
-    env = FrameSkipWrapper(env, skip=4)
     env = PreprocessFrame(env)
     env = KungFuRewardWrapper(env)
     env = TimeLimit(env, max_episode_steps=5000)
     if seed is not None:
         env.seed(seed)
+    if render:
+        env.render_mode = 'human'
     return env
 
 def make_env(rank, seed=0, render=False):
@@ -239,6 +228,15 @@ def make_env(rank, seed=0, render=False):
         return env
     set_random_seed(seed)
     return _init
+
+class RenderCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super(RenderCallback, self).__init__(verbose)
+
+    def _on_step(self):
+        if hasattr(self.training_env, 'envs') and len(self.training_env.envs) == 1:
+            self.training_env.render()
+        return not terminate_flag
 
 class TqdmCallback(BaseCallback):
     def __init__(self, total_timesteps, verbose=0):
@@ -276,6 +274,10 @@ def train(args):
     
     set_random_seed(args.seed)
     
+    if args.num_envs > 1 and args.render:
+        print("Warning: Rendering is only supported with num_envs=1. Setting num_envs to 1.")
+        args.num_envs = 1
+    
     if args.num_envs > 1:
         env = SubprocVecEnv([make_env(i, args.seed, args.render) for i in range(args.num_envs)])
     else:
@@ -293,7 +295,9 @@ def train(args):
     callbacks = []
     if args.progress_bar:
         callbacks.append(TqdmCallback(total_timesteps=args.timesteps))
-    
+    if args.render:
+        callbacks.append(RenderCallback())
+
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     total_trained_steps = 0
     
@@ -317,7 +321,7 @@ def train(args):
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
                     clip_range=0.1,
-                    ent_coef=0.1,
+                    ent_coef=0.2,  # Increased for more exploration
                     tensorboard_log=args.log_dir,
                     verbose=1 if args.verbose else 0,
                     device=device
@@ -344,7 +348,7 @@ def train(args):
                         "gamma": args.gamma,
                         "gae_lambda": args.gae_lambda,
                         "clip_range": 0.1,
-                        "ent_coef": 0.1,
+                        "ent_coef": 0.2,
                         "tensorboard_log": args.log_dir,
                         "total_trained_steps": total_trained_steps,
                         "policy": TransformerPolicy
@@ -365,7 +369,7 @@ def train(args):
                 gamma=args.gamma,
                 gae_lambda=args.gae_lambda,
                 clip_range=0.1,
-                ent_coef=0.1,
+                ent_coef=0.2,
                 tensorboard_log=args.log_dir,
                 verbose=1 if args.verbose else 0,
                 device=device
@@ -384,7 +388,7 @@ def train(args):
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
             clip_range=0.1,
-            ent_coef=0.1,
+            ent_coef=0.2,  # Increased for more exploration
             tensorboard_log=args.log_dir,
             verbose=1 if args.verbose else 0,
             device=device
@@ -456,14 +460,16 @@ def play(args):
                 total_reward += reward
                 steps += 1
                 
+                action_name = env.envs[0].action_names[action[0]] if isinstance(action, np.ndarray) else env.envs[0].action_names[action]
+                print(f"Step {steps}: Action={action_name}, HP={info[0]['hp']}, Score={info[0]['score']}")
+                
                 if args.render:
                     env.render()
-                    time.sleep(0.01)
                 
                 if terminate_flag:
                     break
             
-            print(f"Episode {episode_count} - Total reward: {total_reward}, Steps: {steps}")
+            print(f"Episode {episode_count} - Total reward: {total_reward}, Steps: {steps}, Final HP: {info[0]['hp']}")
             if args.episodes > 0 and episode_count >= args.episodes:
                 break
     
@@ -492,7 +498,7 @@ def evaluate(args, model=None, baseline_file=None):
     
     total_trained_steps = model.total_trained_steps if hasattr(model, 'total_trained_steps') else 0
     
-    action_counts = np.zeros(9)
+    action_counts = np.zeros(10)
     total_steps = 0
     episode_lengths = []
     episode_scores = []
@@ -518,7 +524,7 @@ def evaluate(args, model=None, baseline_file=None):
             obs, reward, done, info = env.step(action)
             episode_steps += 1
             current_score = info[0].get('score', 0)
-            episode_score = current_score  # Final score at episode end
+            episode_score = current_score
             hero_pos_x = info[0].get('hero_pos_x', 0)
             current_stage = info[0].get('current_stage', 0)
             episode_hp_loss = info[0].get('total_hp_loss', 0)
@@ -536,7 +542,7 @@ def evaluate(args, model=None, baseline_file=None):
 
     env.close()
     
-    action_percentages = (action_counts / total_steps) * 100 if total_steps > 0 else np.zeros(9)
+    action_percentages = (action_counts / total_steps) * 100 if total_steps > 0 else np.zeros(10)
     avg_steps = np.mean(episode_lengths)
     avg_score = np.mean(episode_scores)
     avg_max_pos_x = np.mean(max_positions)
@@ -636,17 +642,17 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=20_000)
+    parser.add_argument("--timesteps", type=int, default=200_000)  # Increased for vision-based learning
     parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--progress_bar", action="store_true")
     parser.add_argument("--eval_episodes", type=int, default=10)
     parser.add_argument("--episodes", type=int, default=0)
-    parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions in play/eval mode")
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--n_epochs", type=int, default=10)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
-    parser.add_argument("--clip_range", type=float, default=0.2)
+    parser.add_argument("--clip_range", type=float, default=0.1)
     parser.add_argument("--log_dir", default="logs")
     parser.add_argument("--baseline_file", type=str, default=None, help="Path to baseline model for comparison")
     parser.add_argument("--enable_file_logging", action="store_true", help="Enable logging to file")
