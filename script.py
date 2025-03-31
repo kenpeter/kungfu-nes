@@ -50,52 +50,30 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         self.nhead = nhead
         self.num_layers = num_layers
         
-        # Input shape: (84, 84, 4) -> Flatten to sequence of patches
-        self.patch_size = 7  # Divide 84x84 into 12x12 patches (84/7 = 12)
-        self.num_patches = (84 // self.patch_size) ** 2  # 144 patches
-        self.patch_dim = self.patch_size * self.patch_size * 4  # 7*7*4 = 196
+        self.patch_size = 7
+        self.num_patches = (84 // self.patch_size) ** 2
+        self.patch_dim = self.patch_size * self.patch_size * 4
         
-        # Linear layer to project patches to d_model
         self.patch_embedding = nn.Linear(self.patch_dim, d_model)
-        
-        # Positional encoding
         self.positional_encoding = nn.Parameter(torch.zeros(1, self.num_patches, d_model))
-        
-        # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Final layer to reduce to features_dim
         self.fc = nn.Linear(d_model * self.num_patches, d_model)
         
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         batch_size, channels, height, width = observations.shape
-        
-        # Extract patches
         x = observations.unfold(2, self.patch_size, self.patch_size)
         x = x.unfold(3, self.patch_size, self.patch_size)
-        
         num_patches_height = height // self.patch_size
         num_patches_width = width // self.patch_size
         num_patches = num_patches_height * num_patches_width
-        
-        # Reshape to (batch_size, num_patches, patch_dim)
         x = x.contiguous().view(batch_size, channels, num_patches, self.patch_size * self.patch_size)
         x = x.permute(0, 2, 1, 3).contiguous().view(batch_size, num_patches, channels * self.patch_size * self.patch_size)
-        
-        # Project patches to embedding dimension
         x = self.patch_embedding(x)
-        
-        # Add positional encoding
         x = x + self.positional_encoding
-        
-        # Transformer encoder
         x = self.transformer_encoder(x)
-        
-        # Flatten and project to feature dimension
         x = x.reshape(batch_size, -1)
         x = self.fc(x)
-        
         return x
 
 class TransformerPolicy(ActorCriticPolicy):
@@ -161,53 +139,44 @@ class PreprocessFrame(gym.ObservationWrapper):
 class KungFuRewardWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        # Track previous state for delta calculations
         self.last_score = 0
-        self.last_enemy_count = 2  # Kung-Fu Master always has 2 active enemies
+        # RAM addresses from https://datacrystal.tcrf.net/wiki/Kung_Fu_(NES)/RAM_map
         self.ram_positions = {
-            'score': 0x00C5,  # Score address (verify for your ROM)
-            'enemy1_active': 0x036E,
-            'enemy2_active': 0x0372
+            'score': 0x0078,          # Score (low byte; adjust if multi-byte)
+            'enemy1_health': 0x0460,  # Enemy 1 health/status in sprite RAM
+            'enemy2_health': 0x0464   # Enemy 2 health/status in sprite RAM
         }
 
     def reset(self):
         self.last_score = 0
-        self.last_enemy_count = 2
         return super().reset()
 
     def step(self, action):
-        obs, reward, done, info = super().step(action)
+        obs, _, done, info = super().step(action)
         
         # Get current game state from RAM
         ram = self.env.get_ram()
-        current_score = int(ram[self.ram_positions['score']])
-        current_enemies = sum(
-            ram[addr] > 0 for addr in 
-            [self.ram_positions['enemy1_active'], self.ram_positions['enemy2_active']]
-        )
+        current_score = int(ram[self.ram_positions['score']])  # Single byte; adjust for BCD if needed
 
-        # Handle score overflow (when score wraps around 255)
+        # Handle score overflow (assuming 8-bit score)
         if current_score < self.last_score:
             score_delta = (255 - self.last_score) + current_score
         else:
             score_delta = current_score - self.last_score
-            
-        enemies_defeated = self.last_enemy_count - current_enemies
 
-        # Primary reward sources
+        # Reward calculation: Only for killing enemies (via score) and movement
         reward = 0
         if score_delta > 0:
-            reward += score_delta * 10  # 10x score value
-        
-        if enemies_defeated > 0:
-            reward += enemies_defeated * 500  # Flat bonus per defeated enemy
+            reward += score_delta * 10  # Reward for score increase (proxy for enemy kills)
 
-        # Small survival penalty
-        reward -= 1  # Encourages fast combat
+        # Movement reward: Reward for moving left, penalty for moving right
+        if action in [1, 5, 7]:  # Left, Kick+Left, Punch+Left
+            reward += 50         # Reward for moving left
+        elif action in [2, 6, 8]:  # Right, Kick+Right, Punch+Right
+            reward -= 50         # Penalty for moving right
 
         # Update trackers
         self.last_score = current_score
-        self.last_enemy_count = current_enemies
 
         return obs, reward, done, info
     
