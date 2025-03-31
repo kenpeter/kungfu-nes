@@ -19,6 +19,8 @@ from tqdm import tqdm
 from gym import spaces, Wrapper
 from gym.wrappers import TimeLimit
 from stable_baselines3.common.utils import set_random_seed
+import keyboard  # Install with `pip install keyboard`
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -43,26 +45,21 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 class VisionTransformer(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):  # Changed to 6 layers, patch_size=14
+    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):
         super(VisionTransformer, self).__init__(observation_space, features_dim=embed_dim)
-        self.img_size = observation_space.shape[1]  # 84
-        self.in_channels = observation_space.shape[0]  # 4 (from frame stack)
+        self.img_size = observation_space.shape[1]
+        self.in_channels = observation_space.shape[0]
         self.patch_size = patch_size
-        self.num_patches = (self.img_size // self.patch_size) ** 2  # (84 // 14) ^ 2 = 36
+        self.num_patches = (self.img_size // self.patch_size) ** 2
         self.embed_dim = embed_dim
 
-        # Patch embedding: Conv2d to convert image patches to vectors
         self.patch_embed = nn.Conv2d(
             in_channels=self.in_channels,
             out_channels=embed_dim,
             kernel_size=patch_size,
             stride=patch_size
         )
-
-        # Positional encoding
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
-
-        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -71,18 +68,15 @@ class VisionTransformer(BaseFeaturesExtractor):
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # Layer norm
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch_size, channels=4, height=84, width=84]
-        x = self.patch_embed(x)  # [batch_size, embed_dim, 6, 6]
-        x = x.flatten(2).transpose(1, 2)  # [batch_size, num_patches=36, embed_dim]
-        x = x + self.pos_embed  # Add positional encoding
-        x = self.transformer(x)  # [batch_size, num_patches, embed_dim]
-        x = self.norm(x)  # Normalize
-        x = x.mean(dim=1)  # Global average pooling over patches: [batch_size, embed_dim]
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
+        x = x + self.pos_embed
+        x = self.transformer(x)
+        x = self.norm(x)
+        x = x.mean(dim=1)
         return x
 
 class TransformerPolicy(ActorCriticPolicy):
@@ -92,27 +86,28 @@ class TransformerPolicy(ActorCriticPolicy):
             action_space,
             lr_schedule,
             features_extractor_class=VisionTransformer,
-            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=6, patch_size=14),  # Updated kwargs
+            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=6, patch_size=14),
             **kwargs
         )
 
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.action_space = spaces.Discrete(10)
+        self.action_space = spaces.Discrete(11)
         self._actions = [
             [0,0,0,0,0,0,0,0,0,0,0,0],  # 0: No action
             [0,0,0,0,0,0,1,0,0,0,0,0],  # 1: Left
             [0,0,0,0,0,0,0,0,1,0,0,0],  # 2: Right
-            [1,0,0,0,0,0,0,0,0,0,0,0],  # 3: B (kick)
-            [0,1,0,0,0,0,0,0,0,0,0,0],  # 4: A (punch)
-            [1,0,0,0,0,0,1,0,0,0,0,0],  # 5: B+Left
-            [1,0,0,0,0,0,0,0,1,0,0,0],  # 6: B+Right
-            [0,1,0,0,0,0,1,0,0,0,0,0],  # 7: A+Left
-            [0,1,0,0,0,0,0,0,1,0,0,0],  # 8: A+Right
-            [0,0,0,0,0,1,0,0,0,0,0,0]   # 9: Down (duck/dodge)
+            [1,0,0,0,0,0,0,0,0,0,0,0],  # 3: B (Kick)
+            [0,1,0,0,0,0,0,0,0,0,0,0],  # 4: A (Punch)
+            [1,0,0,0,0,0,1,0,0,0,0,0],  # 5: Kick+Left
+            [1,0,0,0,0,0,0,0,1,0,0,0],  # 6: Kick+Right
+            [0,1,0,0,0,0,1,0,0,0,0,0],  # 7: Punch+Left
+            [0,1,0,0,0,0,0,0,1,0,0,0],  # 8: Punch+Right
+            [0,0,0,0,0,1,0,0,0,0,0,0],  # 9: Down (Duck)
+            [0,0,1,0,0,0,0,0,0,0,0,0]   # 10: Up (Jump)
         ]
-        self.action_names = ["No action", "Left", "Right", "Kick", "Punch", "Kick+Left", "Kick+Right", "Punch+Left", "Punch+Right", "Down"]
+        self.action_names = ["No action", "Left", "Right", "Kick", "Punch", "Kick+Left", "Kick+Right", "Punch+Left", "Punch+Right", "Duck", "Jump"]
 
     def action(self, action):
         if isinstance(action, (list, np.ndarray)):
@@ -139,16 +134,8 @@ class KungFuRewardWrapper(Wrapper):
         self.last_hp = None
         self.total_hp_loss = 0
         self.ram_positions = {
-            'score_1': 0x0531,  # Score digit 5 (hundred-thousands place)
-            'score_2': 0x0532,  # Score digit 4 (ten-thousands place)
-            'score_3': 0x0533,  # Score digit 3 (thousands place)
-            'score_4': 0x0534,  # Score digit 2 (hundreds place)
-            'score_5': 0x0535,  # Score digit 1 (tens place)
-            'scroll_1': 0x00E5, # Screen Scroll 1 (primary scroll value)
-            'scroll_2': 0x00D4, # Screen Scroll 2 (secondary, if needed)
-            'current_stage': 0x0058,  # Current Stage (1-5)
-            'hero_pos_x': 0x0094,  # Hero Screen Pos X
-            'hero_hp': 0x04A6      # Hero HP
+            'score_1': 0x0531, 'score_2': 0x0532, 'score_3': 0x0533, 'score_4': 0x0534, 'score_5': 0x0535,
+            'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 'hero_hp': 0x04A6
         }
 
     def reset(self):
@@ -166,10 +153,8 @@ class KungFuRewardWrapper(Wrapper):
         
         ram = self.env.get_ram()
         current_score = (
-            ram[self.ram_positions['score_1']] * 100000 +
-            ram[self.ram_positions['score_2']] * 10000 +
-            ram[self.ram_positions['score_3']] * 1000 +
-            ram[self.ram_positions['score_4']] * 100 +
+            ram[self.ram_positions['score_1']] * 100000 + ram[self.ram_positions['score_2']] * 10000 +
+            ram[self.ram_positions['score_3']] * 1000 + ram[self.ram_positions['score_4']] * 100 +
             ram[self.ram_positions['score_5']] * 10
         )
         current_scroll = int(ram[self.ram_positions['scroll_1']])
@@ -177,38 +162,31 @@ class KungFuRewardWrapper(Wrapper):
         hero_pos_x = ram[self.ram_positions['hero_pos_x']]
         current_hp = ram[self.ram_positions['hero_hp']]
 
-        # Detect HP loss
         hp_loss = 0
         if self.last_hp is not None and current_hp < self.last_hp:
             hp_loss = self.last_hp - current_hp
             self.total_hp_loss += hp_loss
         self.last_hp = current_hp
 
-        # Handle score overflow
         if current_score < self.last_score:
             score_delta = (999990 - self.last_score) + current_score
         else:
             score_delta = current_score - self.last_score
 
-        # Calculate scroll progress
-        scroll_delta = current_scroll - self.last_scroll
-        if scroll_delta < 0:
-            scroll_delta += 256
+        scroll_delta = current_scroll - self.last_scroll if current_scroll >= self.last_scroll else (current_scroll + 256 - self.last_scroll)
 
-        # General reward function
         reward = 0
         if score_delta > 0:
-            reward += score_delta * 10  # Reward for killing enemies
+            reward += score_delta * 10
         if scroll_delta > 0:
-            reward += scroll_delta * 50  # Reward for progress
+            reward += scroll_delta * 50
         if current_stage > self.last_stage:
-            reward += 1000  # Reward for stage completion
+            reward += 1000
         if hp_loss > 0:
-            reward -= hp_loss * 50  # Penalty for losing HP (encourages dodging)
+            reward -= hp_loss * 50
         else:
-            reward += 10  # Small reward for surviving each step
+            reward += 10
 
-        # Update trackers
         self.last_score = current_score
         self.last_scroll = current_scroll
         self.last_stage = current_stage
@@ -219,22 +197,40 @@ class KungFuRewardWrapper(Wrapper):
         info['total_hp_loss'] = self.total_hp_loss
 
         return obs, reward, done, info
-    
-def make_kungfu_env(render=False, seed=None):
+
+class StateLoaderWrapper(Wrapper):
+    def __init__(self, env, state_file="custom_state.state"):
+        super().__init__(env)
+        self.state_file = state_file
+        if not os.path.exists(state_file):
+            raise FileNotFoundError(f"State file {state_file} not found.")
+        with open(state_file, "rb") as f:
+            self.custom_state = f.read()
+        self.env = TimeLimit(env, max_episode_steps=100)
+
+    def reset(self):
+        obs = super().reset()
+        self.env.unwrapped.set_state(self.custom_state)
+        return self.env.unwrapped.get_observation()
+
+def make_kungfu_env(render=False, seed=None, state_only=False, state_file="custom_state.state"):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
     env = PreprocessFrame(env)
     env = KungFuRewardWrapper(env)
-    env = TimeLimit(env, max_episode_steps=5000)
+    if state_only:
+        env = StateLoaderWrapper(env, state_file=state_file)
+    else:
+        env = TimeLimit(env, max_episode_steps=5000)
     if seed is not None:
         env.seed(seed)
     if render:
         env.render_mode = 'human'
     return env
 
-def make_env(rank, seed=0, render=False):
+def make_env(rank, seed=0, render=False, state_only=False, state_file="custom_state.state"):
     def _init():
-        env = make_kungfu_env(render=(rank == 0 and render), seed=seed + rank)
+        env = make_kungfu_env(render=(rank == 0 and render), seed=seed + rank, state_only=state_only, state_file=state_file)
         return env
     set_random_seed(seed)
     return _init
@@ -289,15 +285,15 @@ def train(args):
         args.num_envs = 1
     
     if args.num_envs > 1:
-        env = SubprocVecEnv([make_env(i, args.seed, args.render) for i in range(args.num_envs)])
+        env = SubprocVecEnv([make_env(i, args.seed, args.render, args.state_only, args.state_file) for i in range(args.num_envs)])
     else:
-        env = DummyVecEnv([make_env(0, args.seed, args.render)])
+        env = DummyVecEnv([make_env(0, args.seed, args.render, args.state_only, args.state_file)])
     
     env = VecFrameStack(env, n_stack=4)
     env = VecTransposeImage(env)
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
-    expected_obs_space = spaces.Box(low=0, high=255, shape=(4, 84, 84), dtype=np.uint8)  # Channels-first
+    expected_obs_space = spaces.Box(low=0, high=255, shape=(4, 84, 84), dtype=np.uint8)
     print(f"Current environment observation space: {env.observation_space}")
     if env.observation_space != expected_obs_space:
         print(f"Warning: Observation space mismatch. Expected {expected_obs_space}, got {env.observation_space}")
@@ -311,7 +307,7 @@ def train(args):
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     total_trained_steps = 0
     
-    if args.resume and os.path.exists(model_file):
+    if os.path.exists(model_file) and args.resume:
         print(f"Resuming training from {model_file}")
         try:
             loaded_model = PPO.load(model_file, device=device, print_system_info=True)
@@ -331,7 +327,7 @@ def train(args):
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
                     clip_range=0.1,
-                    ent_coef=0.2,
+                    ent_coef=0.5,
                     tensorboard_log=args.log_dir,
                     verbose=1 if args.verbose else 0,
                     device=device
@@ -358,7 +354,7 @@ def train(args):
                         "gamma": args.gamma,
                         "gae_lambda": args.gae_lambda,
                         "clip_range": 0.1,
-                        "ent_coef": 0.2,
+                        "ent_coef": 0.5,
                         "tensorboard_log": args.log_dir,
                         "total_trained_steps": total_trained_steps,
                         "policy": TransformerPolicy
@@ -379,7 +375,7 @@ def train(args):
                 gamma=args.gamma,
                 gae_lambda=args.gae_lambda,
                 clip_range=0.1,
-                ent_coef=0.2,
+                ent_coef=0.5,
                 tensorboard_log=args.log_dir,
                 verbose=1 if args.verbose else 0,
                 device=device
@@ -398,7 +394,7 @@ def train(args):
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
             clip_range=0.1,
-            ent_coef=0.2,
+            ent_coef=0.5,
             tensorboard_log=args.log_dir,
             verbose=1 if args.verbose else 0,
             device=device
@@ -439,7 +435,7 @@ def play(args):
     if args.enable_file_logging:
         logging.getLogger().addHandler(logging.FileHandler('training.log'))
     
-    env = make_kungfu_env(render=args.render)
+    env = make_kungfu_env(render=args.render, state_only=args.state_only, state_file=args.state_file)
     env = DummyVecEnv([lambda: env])
     env = VecFrameStack(env, n_stack=4)
     env = VecTransposeImage(env)
@@ -489,11 +485,70 @@ def play(args):
     finally:
         env.close()
 
+def capture(args):
+    if args.enable_file_logging:
+        logging.getLogger().addHandler(logging.FileHandler('training.log'))
+    
+    env = make_kungfu_env(render=True)  # Always render for manual play
+    env = DummyVecEnv([lambda: env])
+    env = VecFrameStack(env, n_stack=4)
+    env = VecTransposeImage(env)
+    
+    obs = env.reset()
+    done = False
+    steps = 0
+    frame_time = 1 / 60  # 60 FPS for human play
+    
+    print("Controls: Left/Right Arrows, Z (Punch), X (Kick), Up (Jump), Down (Duck)")
+    print(f"Press 'S' to save state to '{args.state_file}', 'Q' to quit.")
+    
+    try:
+        while not done:
+            start_time = time.time()
+            env.render()
+            steps += 1
+            
+            action = 0  # Default: No action
+            if keyboard.is_pressed('left'):
+                action = 1
+            elif keyboard.is_pressed('right'):
+                action = 2
+            elif keyboard.is_pressed('z'):
+                action = 4
+            elif keyboard.is_pressed('x'):
+                action = 3
+            elif keyboard.is_pressed('up'):
+                action = 10  # Jump
+            elif keyboard.is_pressed('down'):
+                action = 9   # Duck
+            
+            obs, reward, done, info = env.step([action])  # Wrap in list for VecEnv
+            logging.info(f"Step {steps}: Action={env.envs[0].action_names[action]}, Reward={reward[0]}, HP={info[0]['hp']}, Score={info[0]['score']}")
+            
+            if keyboard.is_pressed('s'):
+                with open(args.state_file, "wb") as f:
+                    f.write(env.envs[0].unwrapped.get_state())
+                print(f"State saved to '{args.state_file}' at step {steps}")
+                logging.info(f"State saved to '{args.state_file}' at step {steps}")
+            
+            if keyboard.is_pressed('q'):
+                print("Quitting...")
+                break
+            
+            elapsed_time = time.time() - start_time
+            time.sleep(max(0, frame_time - elapsed_time))
+    
+    except Exception as e:
+        print(f"Error during capture: {str(e)}")
+        logging.error(f"Error during capture: {str(e)}")
+    finally:
+        env.close()
+
 def evaluate(args, model=None, baseline_file=None):
     if args.enable_file_logging:
         logging.getLogger().addHandler(logging.FileHandler('training.log'))
     
-    env = make_kungfu_env(render=False)
+    env = make_kungfu_env(render=False, state_only=args.state_only, state_file=args.state_file)
     env = DummyVecEnv([lambda: env])
     env = VecFrameStack(env, n_stack=4)
     env = VecTransposeImage(env)
@@ -508,7 +563,7 @@ def evaluate(args, model=None, baseline_file=None):
     
     total_trained_steps = model.total_trained_steps if hasattr(model, 'total_trained_steps') else 0
     
-    action_counts = np.zeros(10)
+    action_counts = np.zeros(11)
     total_steps = 0
     episode_lengths = []
     episode_scores = []
@@ -552,7 +607,7 @@ def evaluate(args, model=None, baseline_file=None):
 
     env.close()
     
-    action_percentages = (action_counts / total_steps) * 100 if total_steps > 0 else np.zeros(10)
+    action_percentages = (action_counts / total_steps) * 100 if total_steps > 0 else np.zeros(11)
     avg_steps = np.mean(episode_lengths)
     avg_score = np.mean(episode_scores)
     avg_max_pos_x = np.mean(max_positions)
@@ -562,7 +617,7 @@ def evaluate(args, model=None, baseline_file=None):
     
     baseline_stats = None
     if baseline_file and os.path.exists(baseline_file):
-        baseline_env = make_kungfu_env(render=False)
+        baseline_env = make_kungfu_env(render=False, state_only=args.state_only, state_file=args.state_file)
         baseline_env = DummyVecEnv([lambda: baseline_env])
         baseline_env = VecFrameStack(baseline_env, n_stack=4)
         baseline_env = VecTransposeImage(baseline_env)
@@ -641,40 +696,45 @@ def evaluate(args, model=None, baseline_file=None):
             f.write(report)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train or play KungFu Master using PPO with Vision Transformer")
+    parser = argparse.ArgumentParser(description="Train, play, capture, or evaluate KungFu Master using PPO with Vision Transformer")
     mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument("--train", action="store_true")
-    mode_group.add_argument("--play", action="store_true")
-    mode_group.add_argument("--evaluate", action="store_true")
+    mode_group.add_argument("--train", action="store_true", help="Train the model")
+    mode_group.add_argument("--play", action="store_true", help="Play with the trained model")
+    mode_group.add_argument("--capture", action="store_true", help="Manually play and capture a state")
+    mode_group.add_argument("--evaluate", action="store_true", help="Evaluate the trained model")
     
-    parser.add_argument("--model_path", default="models/kungfu_ppo")
-    parser.add_argument("--cuda", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--render", action="store_true")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=20_000)
-    parser.add_argument("--num_envs", type=int, default=8)
-    parser.add_argument("--progress_bar", action="store_true")
-    parser.add_argument("--eval_episodes", type=int, default=10)
-    parser.add_argument("--episodes", type=int, default=0)
-    parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions in play/eval mode")
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--n_epochs", type=int, default=10)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--gae_lambda", type=float, default=0.95)
-    parser.add_argument("--clip_range", type=float, default=0.1)
-    parser.add_argument("--log_dir", default="logs")
+    parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save/load kungfu_ppo.zip")
+    parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--render", action="store_true", help="Render the game (train/play)")
+    parser.add_argument("--resume", action="store_true", help="Resume training from kungfu_ppo.zip")
+    parser.add_argument("--timesteps", type=int, default=500_000, help="Total timesteps for training")
+    parser.add_argument("--num_envs", type=int, default=8, help="Number of parallel environments")
+    parser.add_argument("--progress_bar", action="store_true", help="Show training progress bar")
+    parser.add_argument("--eval_episodes", type=int, default=10, help="Number of episodes for evaluation")
+    parser.add_argument("--episodes", type=int, default=0, help="Number of episodes to play (0 = infinite)")
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions in play/eval")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for PPO")
+    parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs per update")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda")
+    parser.add_argument("--clip_range", type=float, default=0.1, help="PPO clip range")
+    parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--baseline_file", type=str, default=None, help="Path to baseline model for comparison")
     parser.add_argument("--enable_file_logging", action="store_true", help="Enable logging to file")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output from PPO")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose PPO output")
+    parser.add_argument("--state_only", action="store_true", help="Train/play on custom state instead of full game")
+    parser.add_argument("--state_file", default="custom_state.state", help="File for saving/loading custom state")
     
     args = parser.parse_args()
-    if not any([args.train, args.play, args.evaluate]):
+    if not any([args.train, args.play, args.capture, args.evaluate]):
         args.train = True
     
     if args.train:
         train(args)
     elif args.play:
         play(args)
+    elif args.capture:
+        capture(args)
     else:
         evaluate(args)
