@@ -43,7 +43,6 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# --- Custom Transformer Feature Extractor ---
 class TransformerFeatureExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: spaces.Box, d_model=256, nhead=8, num_layers=2):
         super(TransformerFeatureExtractor, self).__init__(observation_space, features_dim=d_model)
@@ -99,7 +98,6 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         
         return x
 
-# --- Custom Transformer Policy ---
 class TransformerPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super(TransformerPolicy, self).__init__(
@@ -111,7 +109,6 @@ class TransformerPolicy(ActorCriticPolicy):
             **kwargs
         )
 
-# --- Existing Wrappers ---
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -164,166 +161,56 @@ class PreprocessFrame(gym.ObservationWrapper):
 class KungFuRewardWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        if not hasattr(self.env, 'get_ram'):
-            raise ValueError("Environment must support get_ram() method")
-        self.enemy_positions = {
-            'player_x': 0x0050, 'player_y': 0x0053,
-            'enemy1_x': 0x036E, 'enemy1_y': 0x0371,
-            'enemy2_x': 0x0372, 'enemy2_y': 0x0375
-        }
-        self.screen_position = 0x004D
-        self.enemy_proximity_threshold = 50
-        self.action_history = []
-        self.action_window = 20
-        self.repetition_penalty = -10
-        self.reset_state()
-
-    def reset_state(self):
+        # Track previous state for delta calculations
         self.last_score = 0
-        self.last_x = 0
-        self.last_health = 46
-        self.time_without_progress = 0
-        self.death_penalty_applied = False
-        self.frames_since_last_attack = 0
-        self.enemy_nearby_frames = 0
-        self.consecutive_attacks = 0
-        self.frames_since_last_enemy_hit = 0
-        self.enemy_health_previous = {}
-        self.successful_hits = 0
-        self.max_x = 0
-        self.last_screen = 0
+        self.last_enemy_count = 2  # Kung-Fu Master always has 2 active enemies
+        self.ram_positions = {
+            'score': 0x00C5,  # Score address (verify for your ROM)
+            'enemy1_active': 0x036E,
+            'enemy2_active': 0x0372
+        }
 
     def reset(self):
-        self.reset_state()
-        self.action_history = []
-        return self.env.reset()
-
-    def is_enemy_nearby(self, ram):
-        try:
-            player_x = ram[self.enemy_positions['player_x']]
-            player_y = ram[self.enemy_positions['player_y']]
-            for i in range(1, 3):
-                enemy_x = ram[self.enemy_positions[f'enemy{i}_x']]
-                enemy_y = ram[self.enemy_positions[f'enemy{i}_y']]
-                if enemy_x > 0 and enemy_y > 0:
-                    x_dist = abs(player_x - enemy_x)
-                    y_dist = abs(player_y - enemy_y)
-                    if x_dist < self.enemy_proximity_threshold and y_dist < 25:
-                        return True
-            return False
-        except (IndexError, KeyError):
-            logging.warning("Failed to read RAM for enemy proximity check")
-            return False
-
-    def detect_enemy_hit(self, ram, info):
-        if info.get('score', 0) > self.last_score:
-            self.successful_hits += 1
-            return True
-        for i in range(1, 3):
-            enemy_x_addr = self.enemy_positions[f'enemy{i}_x']
-            if (enemy_x_addr in self.enemy_health_previous and 
-                self.enemy_health_previous[enemy_x_addr] > 0 and
-                ram[enemy_x_addr] == 0):
-                self.successful_hits += 1
-                return True
-        return False
+        self.last_score = 0
+        self.last_enemy_count = 2
+        return super().reset()
 
     def step(self, action):
-        if isinstance(action, (list, np.ndarray)):
-            action = int(action.item() if isinstance(action, np.ndarray) else action[0])
-            
-        obs, reward, done, info = self.env.step(action)
-        try:
-            ram = self.env.get_ram()
-        except Exception as e:
-            logging.error(f"Failed to get RAM: {e}")
-            return obs, reward, done, info
+        obs, reward, done, info = super().step(action)
+        
+        # Get current game state from RAM
+        ram = self.env.get_ram()
+        current_score = int(ram[self.ram_positions['score']])
+        current_enemies = sum(
+            ram[addr] > 0 for addr in 
+            [self.ram_positions['enemy1_active'], self.ram_positions['enemy2_active']]
+        )
 
-        current_score = info.get('score', 0)
-        current_x = info.get('x_pos', 0)
-        health = info.get('health', 46)
-        current_screen = ram[self.screen_position]
-        enemy_nearby = self.is_enemy_nearby(ram)
-        enemy_hit = self.detect_enemy_hit(ram, info)
-        
-        for i in range(1, 3):
-            self.enemy_health_previous[self.enemy_positions[f'enemy{i}_x']] = ram[self.enemy_positions[f'enemy{i}_x']]
-        
-        if enemy_nearby:
-            self.enemy_nearby_frames += 1
+        # Handle score overflow (when score wraps around 255)
+        if current_score < self.last_score:
+            score_delta = (255 - self.last_score) + current_score
         else:
-            self.enemy_nearby_frames = 0
-        
-        score_delta = current_score - self.last_score
-        x_delta = current_x - self.last_x
-        health_delta = health - self.last_health
-        screen_delta = current_screen - self.last_screen
-        
-        self.max_x = max(self.max_x, current_x)
+            score_delta = current_score - self.last_score
+            
+        enemies_defeated = self.last_enemy_count - current_enemies
 
+        # Primary reward sources
         reward = 0
         if score_delta > 0:
-            reward += score_delta * 1000.0 + 500.0
+            reward += score_delta * 10  # 10x score value
         
-        if x_delta > 0:
-            reward += x_delta * 0.5
-        if x_delta < 0:
-            reward += x_delta * -20.0
-        
-        if health_delta < 0:
-            reward += health_delta * 20.0
-        
-        reward -= 0.5
-        
-        if health <= 0 and not self.death_penalty_applied:
-            reward -= 500
-            self.death_penalty_applied = True
-        
-        if abs(x_delta) < 1:
-            self.time_without_progress += 1
-            if self.time_without_progress > 30:
-                reward -= 20
-        else:
-            self.time_without_progress = 0
-        
-        if enemy_nearby:
-            self.frames_since_last_attack += 1
-            if self.frames_since_last_attack > 10:
-                reward -= 20
-            if action >= 3:
-                reward += 75
-                self.frames_since_last_attack = 0
-        
-        if enemy_hit:
-            reward += 200
-            self.frames_since_last_enemy_hit = 0
-        else:
-            self.frames_since_last_enemy_hit += 1
-            if self.frames_since_last_enemy_hit > 30 and enemy_nearby:
-                reward -= 10
-        
-        if screen_delta > 0:
-            reward += 1000
-        
-        if action in [1, 5, 7]:
-            reward += 50
-        
-        self.action_history.append(action)
-        if len(self.action_history) > self.action_window:
-            self.action_history.pop(0)
-        if len(self.action_history) == self.action_window:
-            action_counts = np.bincount(self.action_history, minlength=9)
-            most_used_action_count = np.max(action_counts)
-            if most_used_action_count > self.action_window * 0.7:
-                reward += self.repetition_penalty
+        if enemies_defeated > 0:
+            reward += enemies_defeated * 500  # Flat bonus per defeated enemy
 
+        # Small survival penalty
+        reward -= 1  # Encourages fast combat
+
+        # Update trackers
         self.last_score = current_score
-        self.last_x = current_x
-        self.last_health = health
-        self.last_screen = current_screen
-        
-        return obs, reward, done, info
+        self.last_enemy_count = current_enemies
 
+        return obs, reward, done, info
+    
 def make_kungfu_env(render=False, seed=None):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
