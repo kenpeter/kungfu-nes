@@ -163,7 +163,7 @@ class KungFuRewardWrapper(Wrapper):
         
         # Get current game state from RAM
         ram = self.env.get_ram()
-        # Score in BCD format across 5 bytes (assuming hex values represent digits)
+        # Score in BCD-like format across 5 bytes
         current_score = (
             ram[self.ram_positions['score_1']] * 100000 +
             ram[self.ram_positions['score_2']] * 10000 +
@@ -256,7 +256,7 @@ def train(args):
     else:
         env = DummyVecEnv([make_env(0, args.seed, args.render)])
     
-    env = VecFrameStack(env *}$, n_stack=4)
+    env = VecFrameStack(env, n_stack=4)  # Corrected: Removed erroneous '*'
     env = VecTransposeImage(env)
     env = VecMonitor(env, os.path.join(args.log_dir, 'monitor.csv'))
     
@@ -568,7 +568,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=500_000)
+    parser.add_argument("--timesteps", type=int, default=50_000)
     parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--progress_bar", action="store_true")
     parser.add_argument("--eval_episodes", type=int, default=10)
