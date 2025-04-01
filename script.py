@@ -139,6 +139,9 @@ class KungFuRewardWrapper(Wrapper):
         self.prev_frame = None
         self.threats_history = []
         self.last_hero_pos_x = 0
+        # Counters for flying knife detection and actions
+        self.knife_detections = 0  # Total detections of flying knives per episode
+        self.knife_action_counts = np.zeros(11)  # Count of each action when a knife is detected
         self.ram_positions = {
             'score_1': 0x0531, 'score_2': 0x0532, 'score_3': 0x0533, 'score_4': 0x0534, 'score_5': 0x0535,
             'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 
@@ -156,6 +159,9 @@ class KungFuRewardWrapper(Wrapper):
         self.total_hp_loss = 0
         self.threats_history = []
         self.last_hero_pos_x = 0
+        # Reset counters
+        self.knife_detections = 0
+        self.knife_action_counts = np.zeros(11)
         return obs
 
     def _preprocess_frame(self, frame):
@@ -171,9 +177,10 @@ class KungFuRewardWrapper(Wrapper):
             return []
 
         diff = np.abs(current_frame - self.prev_frame)
-        threshold = 50
-        speed_threshold = 5
-        
+        threshold = 50  # Intensity threshold for movement
+        speed_threshold = 5  # Minimum pixel movement for "fast"
+        SMALL_THREAT_SIZE = 20  # Max width/height for a "small" object (e.g., knife)
+
         moving_pixels = diff > threshold
         if not np.any(moving_pixels):
             return []
@@ -190,6 +197,7 @@ class KungFuRewardWrapper(Wrapper):
         center_x = (min_x + max_x) // 2
         center_y = (min_y + max_y) // 2
 
+        # Only consider small, fast-moving objects (flying knives)
         is_fast_moving = False
         for prev_x, prev_y, _, _ in self.threats_history[-5:]:
             distance = np.sqrt((center_x - prev_x)**2 + (center_y - prev_y)**2)
@@ -197,7 +205,9 @@ class KungFuRewardWrapper(Wrapper):
                 is_fast_moving = True
                 break
 
-        if is_fast_moving and width > 0 and height > 0:
+        # Check if it's a small object (e.g., knife)
+        is_small = width < SMALL_THREAT_SIZE and height < SMALL_THREAT_SIZE
+        if is_fast_moving and is_small:
             threats.append((center_x, center_y, width, height))
 
         self.prev_frame = current_frame
@@ -219,7 +229,6 @@ class KungFuRewardWrapper(Wrapper):
         current_stage = ram[self.ram_positions['current_stage']]
         hero_pos_x = ram[self.ram_positions['hero_pos_x']]
         current_hp = ram[self.ram_positions['hero_hp']]
-        hero_air = ram[self.ram_positions['hero_air_mode']] == 1
 
         # Health loss
         hp_loss = 0
@@ -245,39 +254,32 @@ class KungFuRewardWrapper(Wrapper):
         else:
             reward += 10
 
-        # Vision-based threat detection and response
+        # Detect flying knives and track actions
         threats = self._detect_threats(current_frame)
         DISTANCE_THRESHOLD = 20
-        SMALL_THREAT_SIZE = 20
         AVOIDANCE_REWARD = 100
-        COMBAT_REWARD = 50
-        GAP_CLOSING_BONUS = 10
         threat_detected = bool(threats)
 
-        for threat_x, threat_y, width, height in threats:
-            threat_x_game = threat_x * 256 // 84
-            distance = abs(hero_pos_x - threat_x_game)
+        if threat_detected:
+            self.knife_detections += 1
+            # Record the action taken when a knife is detected
+            self.knife_action_counts[action] += 1
 
-            if distance < DISTANCE_THRESHOLD:
-                is_small_threat = width < SMALL_THREAT_SIZE and height < SMALL_THREAT_SIZE
+            for threat_x, threat_y, width, height in threats:
+                threat_x_game = threat_x * 256 // 84
+                distance = abs(hero_pos_x - threat_x_game)
 
-                # Use the action parameter instead of hero_action
-                if is_small_threat:  # Small threats (e.g., knives)
-                    if action == 10 and threat_y < 42:  # Jump (action 10)
+                if distance < DISTANCE_THRESHOLD:
+                    # Reward avoidance actions for flying knives
+                    if action == 10 and threat_y < 42:  # Jump over low knife
                         reward += AVOIDANCE_REWARD
-                    elif action == 9 and threat_y > 42:  # Duck (action 9)
-                        reward += AVOIDANCE_REWARD
-                else:  # Larger threats (e.g., enemies)
-                    if action in (3, 4, 5, 6, 7, 8):  # Kick (3), Punch (4), or combinations
-                        reward += COMBAT_REWARD
-                    elif action == 10 and threat_y < 42:  # Jump (action 10)
-                        reward += AVOIDANCE_REWARD
-                    elif action == 9 and threat_y > 42:  # Duck (action 9)
+                    elif action == 9 and threat_y > 42:  # Duck under high knife
                         reward += AVOIDANCE_REWARD
 
-            last_distance = abs(self.last_hero_pos_x - threat_x_game)
-            if distance < last_distance:
-                reward += GAP_CLOSING_BONUS
+                # Gap-closing bonus (optional, kept for consistency)
+                last_distance = abs(self.last_hero_pos_x - threat_x_game)
+                if distance < last_distance:
+                    reward += 10  # GAP_CLOSING_BONUS
 
         self.last_hero_pos_x = hero_pos_x
         self.last_score = current_score
@@ -289,9 +291,12 @@ class KungFuRewardWrapper(Wrapper):
         info['hp'] = current_hp
         info['total_hp_loss'] = self.total_hp_loss
         info['threat_detected'] = threat_detected
+        # Add knife detection info to the info dict for evaluation
+        info['knife_detections'] = self.knife_detections
+        info['knife_action_counts'] = self.knife_action_counts.copy()
 
         return obs, reward, done, info
-    
+      
 # State loader wrapper
 class StateLoaderWrapper(Wrapper):
     def __init__(self, env, state_file="custom_state.state"):
@@ -580,7 +585,6 @@ def capture(args):
     finally:
         env.close()
 
-# Evaluation function
 def evaluate(args, model=None, baseline_file=None):
     if args.enable_file_logging:
         logging.getLogger().addHandler(logging.FileHandler('evaluate.log'))
@@ -608,7 +612,8 @@ def evaluate(args, model=None, baseline_file=None):
     max_positions = []
     max_stages = []
     hp_loss_rates = []
-    threat_avoidances = []
+    knife_detections_per_episode = []
+    knife_action_totals = np.zeros(11)  # Total counts of actions across all episodes when knives detected
     
     for episode in range(args.eval_episodes):
         obs = env.reset()
@@ -619,20 +624,23 @@ def evaluate(args, model=None, baseline_file=None):
         episode_max_pos_x = 0
         episode_max_stage = 0
         episode_hp_loss = 0
-        episode_threat_avoidances = 0
+        episode_knife_detections = 0
+        episode_knife_action_counts = np.zeros(11)
         
         while not done and not terminate_flag:
             action, _ = model.predict(obs, deterministic=args.deterministic)
-            action_counts[action[0] if isinstance(action, np.ndarray) else action] += 1
-            obs, reward, done, info = env.step(action)
+            action = action[0] if isinstance(action, np.ndarray) else action
+            action_counts[action] += 1
+            obs, reward, done, info = env.step([action])
             episode_steps += 1
             episode_reward += reward[0] if isinstance(reward, np.ndarray) else reward
             episode_score = info[0].get('score', 0)
             hero_pos_x = info[0].get('hero_pos_x', 0)
             current_stage = info[0].get('current_stage', 0)
             episode_hp_loss = info[0].get('total_hp_loss', 0)
-            if info[0].get('threat_detected', False):
-                episode_threat_avoidances += 1
+            # Update knife detection stats
+            episode_knife_detections = info[0].get('knife_detections', 0)
+            episode_knife_action_counts = info[0].get('knife_action_counts', np.zeros(11))
             episode_max_pos_x = max(episode_max_pos_x, hero_pos_x)
             episode_max_stage = max(episode_max_stage, current_stage)
             total_steps += 1
@@ -644,7 +652,8 @@ def evaluate(args, model=None, baseline_file=None):
         max_stages.append(episode_max_stage)
         hp_loss_rate = episode_hp_loss / episode_steps if episode_steps > 0 else 0
         hp_loss_rates.append(hp_loss_rate)
-        threat_avoidances.append(episode_threat_avoidances)
+        knife_detections_per_episode.append(episode_knife_detections)
+        knife_action_totals += episode_knife_action_counts
 
     env.close()
     
@@ -655,13 +664,15 @@ def evaluate(args, model=None, baseline_file=None):
     avg_max_pos_x = np.mean(max_positions)
     avg_max_stage = np.mean(max_stages)
     avg_hp_loss_rate = np.mean(hp_loss_rates)
-    avg_threat_avoidances = np.mean(threat_avoidances)
+    avg_knife_detections = np.mean(knife_detections_per_episode)
+    total_knife_detections = np.sum(knife_detections_per_episode)
+    knife_action_percentages = (knife_action_totals / total_knife_detections * 100) if total_knife_detections > 0 else np.zeros(11)
     action_entropy = -np.sum(action_percentages / 100 * np.log(action_percentages / 100 + 1e-10))
     
     report = f"Evaluation Report for {model_file} ({args.eval_episodes} episodes)\n"
     report += f"Overall Training Steps: {total_trained_steps}\n"
     report += "-" * 50 + "\n"
-    report += "Action Percentages:\n"
+    report += "Action Percentages (Overall):\n"
     for i, (name, percent) in enumerate(zip(env.envs[0].action_names, action_percentages)):
         report += f"  {name}: {percent:.2f}%\n"
     report += f"\nAction Distribution Entropy: {action_entropy:.3f} (higher = more diverse)\n"
@@ -671,69 +682,18 @@ def evaluate(args, model=None, baseline_file=None):
     report += f"Average Furthest Position (X): {avg_max_pos_x:.2f}\n"
     report += f"Average Highest Stage: {avg_max_stage:.2f} (out of 5)\n"
     report += f"Average HP Loss Rate: {avg_hp_loss_rate:.3f} HP/step\n"
-    report += f"Average Threat Avoidances per Episode: {avg_threat_avoidances:.2f}\n"
-    
-    if baseline_file and os.path.exists(baseline_file):
-        baseline_env = make_kungfu_env(render=False, state_only=args.state_only, state_file=args.state_file)
-        baseline_env = DummyVecEnv([lambda: baseline_env])
-        baseline_env = VecFrameStack(baseline_env, n_stack=4)
-        baseline_env = VecTransposeImage(baseline_env)
-        baseline_model = PPO.load(baseline_file, env=baseline_env)
-        
-        baseline_steps = []
-        baseline_rewards = []
-        baseline_scores = []
-        baseline_max_positions = []
-        baseline_max_stages = []
-        baseline_hp_loss_rates = []
-        baseline_threat_avoidances = []
-        
-        for _ in range(args.eval_episodes):
-            obs = baseline_env.reset()
-            done = False
-            steps = 0
-            reward_total = 0
-            score = 0
-            max_pos_x = 0
-            max_stage = 0
-            hp_loss = 0
-            threat_avoidances_count = 0
-            while not done:
-                action, _ = baseline_model.predict(obs, deterministic=args.deterministic)
-                obs, reward, done, info = baseline_env.step(action)
-                steps += 1
-                reward_total += reward[0] if isinstance(reward, np.ndarray) else reward
-                score = info[0].get('score', 0)
-                max_pos_x = max(max_pos_x, info[0].get('hero_pos_x', 0))
-                max_stage = max(max_stage, info[0].get('current_stage', 0))
-                hp_loss = info[0].get('total_hp_loss', 0)
-                if info[0].get('threat_detected', False):
-                    threat_avoidances_count += 1
-            baseline_steps.append(steps)
-            baseline_rewards.append(reward_total)
-            baseline_scores.append(score)
-            baseline_max_positions.append(max_pos_x)
-            baseline_max_stages.append(max_stage)
-            hp_loss_rate = hp_loss / steps if steps > 0 else 0
-            baseline_hp_loss_rates.append(hp_loss_rate)
-            baseline_threat_avoidances.append(threat_avoidances_count)
-        
-        baseline_env.close()
-        
-        report += "\nComparison with Baseline:\n"
-        report += f"  Baseline Avg Survival Time: {np.mean(baseline_steps):.2f} steps\n"
-        report += f"  Baseline Avg Reward: {np.mean(baseline_rewards):.2f}\n"
-        report += f"  Baseline Avg Score: {np.mean(baseline_scores):.2f}\n"
-        report += f"  Baseline Avg Furthest Position: {np.mean(baseline_max_positions):.2f}\n"
-        report += f"  Baseline Avg Highest Stage: {np.mean(baseline_max_stages):.2f}\n"
-        report += f"  Baseline Avg HP Loss Rate: {np.mean(baseline_hp_loss_rates):.3f} HP/step\n"
-        report += f"  Baseline Avg Threat Avoidances: {np.mean(baseline_threat_avoidances):.2f}\n"
+    report += f"\nFlying Knife Detection Stats:\n"
+    report += f"  Average Knife Detections per Episode: {avg_knife_detections:.2f}\n"
+    report += f"  Total Knife Detections: {int(total_knife_detections)}\n"
+    report += "  Action Percentages When Knives Detected:\n"
+    for i, (name, percent) in enumerate(zip(env.envs[0].action_names, knife_action_percentages)):
+        report += f"    {name}: {percent:.2f}%\n"
     
     print(report)
     if args.enable_file_logging:
         with open(os.path.join(args.log_dir, 'evaluation_report.txt'), 'w') as f:
             f.write(report)
-
+            
 # Main execution
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train, play, capture, or evaluate KungFu Master using PPO with Vision Transformer")
