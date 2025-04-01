@@ -12,7 +12,7 @@ from PIL import Image
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor, SubprocVecEnv, VecTransposeImage
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.policies import ActorCriticPolicy  # Corrected import
+from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from tqdm import tqdm
 from gym import spaces, Wrapper
@@ -75,7 +75,7 @@ class VisionTransformer(BaseFeaturesExtractor):
         x = x.mean(dim=1)
         return x
 
-class TransformerPolicy(ActorCriticPolicy):  # Corrected inheritance
+class TransformerPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super(TransformerPolicy, self).__init__(
             observation_space,
@@ -133,15 +133,29 @@ class KungFuRewardWrapper(Wrapper):
         self.threat_object_detections = 0
         self.threat_object_action_counts = np.zeros(11)
         self.detection_count = 0
+        self.ranged_enemy_detections = 0
+        self.last_ranged_detection_time = 0
+        self.projectile_dodge_count = 0
+        self.projectile_hit_count = 0
+        
         # Load cropped threat_object template
         self.threat_object_template = cv2.imread(threat_object_template_path, cv2.IMREAD_GRAYSCALE)
         if self.threat_object_template is None:
             raise FileNotFoundError(f"Threat object template not found at {threat_object_template_path}")
-        self.template_h, self.template_w = self.threat_object_template.shape  # e.g., 16x32
+        self.template_h, self.template_w = self.threat_object_template.shape
+        
+        # Ranged enemy template
+        self.ranged_enemy_template = cv2.imread("ranged_enemy_template.png", cv2.IMREAD_GRAYSCALE)
+        if self.ranged_enemy_template is None:
+            logging.warning("Ranged enemy template not found, ranged enemy detection will be disabled")
+            self.ranged_enemy_template = np.zeros((16, 16), dtype=np.uint8)
+        self.ranged_template_h, self.ranged_template_w = self.ranged_enemy_template.shape
+        
         self.ram_positions = {
             'score_1': 0x0531, 'score_2': 0x0532, 'score_3': 0x0533, 'score_4': 0x0534, 'score_5': 0x0535,
             'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 
             'hero_hp': 0x04A6, 'hero_air_mode': 0x036A,
+            'enemy_type': 0x00E0, 'enemy_pos_x': 0x00E1, 'enemy_pos_y': 0x00E2
         }
 
     def reset(self, **kwargs):
@@ -156,31 +170,49 @@ class KungFuRewardWrapper(Wrapper):
         self.threat_object_detections = 0
         self.threat_object_action_counts = np.zeros(11)
         self.detection_count = 0
+        self.ranged_enemy_detections = 0
+        self.last_ranged_detection_time = 0
+        self.projectile_dodge_count = 0
+        self.projectile_hit_count = 0
         return obs
 
     def _detect_threats(self, frame):
-        # Convert frame to grayscale
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        threats = []
         
-        # Template matching with cropped threat_object
+        # Detect threat objects (projectiles)
         result = cv2.matchTemplate(gray_frame, self.threat_object_template, cv2.TM_CCOEFF_NORMED)
-        threshold = 0.8  # Higher threshold for precision
+        threshold = 0.8
         locations = np.where(result >= threshold)
         
-        threats = []
-        for pt in zip(*locations[::-1]):  # pt is (x, y)
+        for pt in zip(*locations[::-1]):
             x, y = pt[0], pt[1]
             width, height = self.template_w, self.template_h
             center_x = x + width // 2
             center_y = y + height // 2
             
-            # Save detected threat_object region
             threat_object_region = frame[y:y+height, x:x+width]
-            #cv2.imwrite(f"detected_threat_objects/threat_object_{self.detection_count}.png", cv2.cvtColor(threat_object_region, cv2.COLOR_RGB2BGR))
-            self.detection_count += 1
-            
-            threats.append((center_x, center_y, width, height))
+            threats.append(('projectile', center_x, center_y, width, height))
             break  # Limit to one detection per frame for simplicity
+        
+        # Detect ranged enemies (the throwers)
+        if np.max(self.ranged_enemy_template) > 0:  # Only if template is valid
+            enemy_result = cv2.matchTemplate(gray_frame, self.ranged_enemy_template, cv2.TM_CCOEFF_NORMED)
+            enemy_threshold = 0.7
+            enemy_locations = np.where(enemy_result >= enemy_threshold)
+            
+            for pt in zip(*enemy_locations[::-1]):
+                x, y = pt[0], pt[1]
+                width, height = self.ranged_template_w, self.ranged_template_h
+                center_x = x + width // 2
+                center_y = y + height // 2
+                
+                # Only consider enemies on the right side (approaching)
+                if center_x > 112:  # Center of screen is ~112
+                    threats.append(('ranged_enemy', center_x, center_y, width, height))
+                    self.ranged_enemy_detections += 1
+                    self.last_ranged_detection_time = time.time()
+                    break  # Limit to one detection per frame
         
         return threats
 
@@ -198,6 +230,7 @@ class KungFuRewardWrapper(Wrapper):
         current_stage = ram[self.ram_positions['current_stage']]
         hero_pos_x = ram[self.ram_positions['hero_pos_x']]
         current_hp = ram[self.ram_positions['hero_hp']]
+        hero_air_mode = ram[self.ram_positions['hero_air_mode']]  # 0=ground, 1=air
 
         hp_loss = 0
         if self.last_hp is not None and current_hp < self.last_hp:
@@ -221,42 +254,80 @@ class KungFuRewardWrapper(Wrapper):
             reward += 10
 
         threats = self._detect_threats(raw_frame)
-        DISTANCE_THRESHOLD = 20
+        PROJECTILE_DISTANCE_THRESHOLD = 30
+        RANGED_ENEMY_DISTANCE_THRESHOLD = 50
         AVOIDANCE_REWARD = 5000
+        APPROACH_REWARD = 2000
+        RANGED_ENEMY_KILL_REWARD = 10000
         NON_AVOIDANCE_PENALTY = -1000
+        PROJECTILE_HIT_PENALTY = -2000
+        
         threat_detected = bool(threats)
+        ranged_enemy_detected = any(t[0] == 'ranged_enemy' for t in threats)
+        projectile_detected = any(t[0] == 'projectile' for t in threats)
 
         if threat_detected:
             self.threat_object_detections += 1
             self.threat_object_action_counts[action] += 1
 
-            for threat_x, threat_y, width, height in threats:
+            for threat_type, threat_x, threat_y, width, height in threats:
                 threat_x_game = threat_x
                 distance = abs(hero_pos_x - threat_x_game)
-
-                if distance < DISTANCE_THRESHOLD:
-                    if action == 10 and threat_y < 112:  # Jump over low threat_object
-                        reward += AVOIDANCE_REWARD
-                    elif action == 9 and threat_y > 112:  # Duck under high threat_object
-                        reward += AVOIDANCE_REWARD
-                    else:
-                        reward += NON_AVOIDANCE_PENALTY
+                
+                if threat_type == 'projectile':
+                    # Reward for dodging projectiles
+                    if distance < PROJECTILE_DISTANCE_THRESHOLD:
+                        if action == 10 and threat_y < 112:  # Jump over low projectile
+                            reward += AVOIDANCE_REWARD
+                            self.projectile_dodge_count += 1
+                        elif action == 9 and threat_y > 112:  # Duck under high projectile
+                            reward += AVOIDANCE_REWARD
+                            self.projectile_dodge_count += 1
+                        else:
+                            reward += PROJECTILE_HIT_PENALTY
+                            self.projectile_hit_count += 1
+                    
+                    # Additional reward for moving forward after dodging
+                    if action in [2, 6, 8] and distance < PROJECTILE_DISTANCE_THRESHOLD * 2:
+                        reward += APPROACH_REWARD / 2
+                
+                elif threat_type == 'ranged_enemy':
+                    # Reward for approaching ranged enemies
+                    if distance < RANGED_ENEMY_DISTANCE_THRESHOLD:
+                        if action in [2, 6, 8]:  # Right movements
+                            reward += APPROACH_REWARD
+                        elif action in [3, 4, 5, 6, 7, 8]:  # Attack actions
+                            reward += RANGED_ENEMY_KILL_REWARD
+                    
+                    # Penalty for staying still or moving away
+                    if distance < RANGED_ENEMY_DISTANCE_THRESHOLD * 1.5 and action in [0, 1]:
+                        reward += NON_AVOIDANCE_PENALTY / 2
 
                 last_distance = abs(self.last_hero_pos_x - threat_x_game)
-                if distance < last_distance:
-                    reward += 10
+                if distance < last_distance and threat_type == 'ranged_enemy':
+                    reward += 20  # Small reward for closing distance to ranged enemy
+
+        # Additional reward for attacking when ranged enemy was recently detected
+        if time.time() - self.last_ranged_detection_time < 2.0 and action in [3, 4, 5, 6, 7, 8]:
+            reward += APPROACH_REWARD / 2
 
         self.last_hero_pos_x = hero_pos_x
         self.last_score = current_score
         self.last_scroll = current_scroll
         self.last_stage = current_stage
+        
         info['score'] = current_score
         info['hero_pos_x'] = hero_pos_x
         info['current_stage'] = current_stage
         info['hp'] = current_hp
         info['total_hp_loss'] = self.total_hp_loss
         info['threat_detected'] = threat_detected
+        info['projectile_detected'] = projectile_detected
+        info['ranged_enemy_detected'] = ranged_enemy_detected
         info['threat_object_detections'] = self.threat_object_detections
+        info['ranged_enemy_detections'] = self.ranged_enemy_detections
+        info['projectile_dodge_count'] = self.projectile_dodge_count
+        info['projectile_hit_count'] = self.projectile_hit_count
         info['threat_object_action_counts'] = self.threat_object_action_counts.copy()
 
         return obs, reward, done, info
@@ -452,6 +523,11 @@ def play(args):
                 action_name = env.envs[0].action_names[action[0] if isinstance(action, np.ndarray) else action]
                 print(f"Step {steps}: Action={action_name}, Reward={reward}, HP={info[0]['hp']}, Score={info[0]['score']}")
                 
+                if info[0]['projectile_detected']:
+                    print(f"PROJECTILE DETECTED! Action taken: {action_name}")
+                if info[0]['ranged_enemy_detected']:
+                    print(f"RANGED ENEMY DETECTED! Action taken: {action_name}")
+                
                 if args.render:
                     env.render()
                 
@@ -459,6 +535,7 @@ def play(args):
                     break
             
             print(f"Episode {episode_count} - Total reward: {total_reward}, Steps: {steps}, Final HP: {info[0]['hp']}")
+            print(f"Projectile dodges: {info[0]['projectile_dodge_count']}, Projectile hits: {info[0]['projectile_hit_count']}")
             if args.episodes > 0 and episode_count >= args.episodes:
                 break
     
@@ -483,7 +560,7 @@ def capture(args):
     frame_time = 1 / 60
     
     print("Controls: Left/Right Arrows, Z (Punch), X (Kick), Up (Jump), Down (Duck)")
-    print("Press 'S' to save state, 'K' to save cropped threat_object template, 'Q' to quit.")
+    print("Press 'S' to save state, 'K' to save threat_object template, 'E' to save ranged enemy template, 'Q' to quit.")
     
     try:
         while not done:
@@ -520,8 +597,18 @@ def capture(args):
                 threat_object_w, threat_object_h = 32, 16    # Adjust based on threat_object size
                 threat_object_region = frame[threat_object_y-threat_object_h//2:threat_object_y+threat_object_h//2, threat_object_x-threat_object_w//2:threat_object_x+threat_object_w//2]
                 cv2.imwrite("threat_object_template.png", cv2.cvtColor(threat_object_region, cv2.COLOR_RGB2BGR))
-                print(f"Cropped threat_object template saved to 'threat_object_template.png' at step {steps}")
-                logging.info(f"Cropped threat_object template saved at step {steps}")
+                print(f"Threat object template saved to 'threat_object_template.png' at step {steps}")
+                logging.info(f"Threat object template saved at step {steps}")
+            
+            if keyboard.is_pressed('e'):
+                frame = env.envs[0].unwrapped.get_screen()
+                # Capture the ranged enemy (usually on the right side)
+                enemy_x, enemy_y = 180, 128  # Adjust based on enemy position
+                enemy_w, enemy_h = 16, 16
+                enemy_region = frame[enemy_y-enemy_h//2:enemy_y+enemy_h//2, enemy_x-enemy_w//2:enemy_x+enemy_w//2]
+                cv2.imwrite("ranged_enemy_template.png", cv2.cvtColor(enemy_region, cv2.COLOR_RGB2BGR))
+                print(f"Ranged enemy template saved to 'ranged_enemy_template.png' at step {steps}")
+                logging.info(f"Ranged enemy template saved at step {steps}")
             
             if keyboard.is_pressed('q'):
                 print("Quitting...")
@@ -565,6 +652,9 @@ def evaluate(args, model=None, baseline_file=None):
     hp_loss_rates = []
     threat_object_detections_per_episode = []
     threat_object_action_totals = np.zeros(11)
+    projectile_dodge_counts = []
+    projectile_hit_counts = []
+    ranged_enemy_detections_per_episode = []
     
     for episode in range(args.eval_episodes):
         obs = env.reset()
@@ -577,6 +667,9 @@ def evaluate(args, model=None, baseline_file=None):
         episode_hp_loss = 0
         episode_threat_object_detections = 0
         episode_threat_object_action_counts = np.zeros(11)
+        episode_projectile_dodge_count = 0
+        episode_projectile_hit_count = 0
+        episode_ranged_enemy_detections = 0
         
         while not done and not terminate_flag:
             action, _ = model.predict(obs, deterministic=args.deterministic)
@@ -591,6 +684,9 @@ def evaluate(args, model=None, baseline_file=None):
             episode_hp_loss = info[0].get('total_hp_loss', 0)
             episode_threat_object_detections = info[0].get('threat_object_detections', 0)
             episode_threat_object_action_counts = info[0].get('threat_object_action_counts', np.zeros(11))
+            episode_projectile_dodge_count = info[0].get('projectile_dodge_count', 0)
+            episode_projectile_hit_count = info[0].get('projectile_hit_count', 0)
+            episode_ranged_enemy_detections = info[0].get('ranged_enemy_detections', 0)
             episode_max_pos_x = max(episode_max_pos_x, hero_pos_x)
             episode_max_stage = max(episode_max_stage, current_stage)
             total_steps += 1
@@ -604,6 +700,9 @@ def evaluate(args, model=None, baseline_file=None):
         hp_loss_rates.append(hp_loss_rate)
         threat_object_detections_per_episode.append(episode_threat_object_detections)
         threat_object_action_totals += episode_threat_object_action_counts
+        projectile_dodge_counts.append(episode_projectile_dodge_count)
+        projectile_hit_counts.append(episode_projectile_hit_count)
+        ranged_enemy_detections_per_episode.append(episode_ranged_enemy_detections)
 
     env.close()
     
@@ -618,6 +717,10 @@ def evaluate(args, model=None, baseline_file=None):
     total_threat_object_detections = np.sum(threat_object_detections_per_episode)
     threat_object_action_percentages = (threat_object_action_totals / total_threat_object_detections * 100) if total_threat_object_detections > 0 else np.zeros(11)
     action_entropy = -np.sum(action_percentages / 100 * np.log(action_percentages / 100 + 1e-10))
+    avg_projectile_dodges = np.mean(projectile_dodge_counts)
+    avg_projectile_hits = np.mean(projectile_hit_counts)
+    avg_ranged_enemy_detections = np.mean(ranged_enemy_detections_per_episode)
+    projectile_dodge_ratio = avg_projectile_dodges / (avg_projectile_dodges + avg_projectile_hits + 1e-10)
     
     report = f"Evaluation Report for {model_file} ({args.eval_episodes} episodes)\n"
     report += f"Overall Training Steps: {total_trained_steps}\n"
@@ -632,9 +735,13 @@ def evaluate(args, model=None, baseline_file=None):
     report += f"Average Furthest Position (X): {avg_max_pos_x:.2f}\n"
     report += f"Average Highest Stage: {avg_max_stage:.2f} (out of 5)\n"
     report += f"Average HP Loss Rate: {avg_hp_loss_rate:.3f} HP/step\n"
-    report += f"\nThreat Object Detection Stats:\n"
+    report += f"\nThreat Object Stats:\n"
     report += f"  Average Threat Object Detections per Episode: {avg_threat_object_detections:.2f}\n"
     report += f"  Total Threat Object Detections: {int(total_threat_object_detections)}\n"
+    report += f"  Average Ranged Enemy Detections per Episode: {avg_ranged_enemy_detections:.2f}\n"
+    report += f"  Average Projectile Dodges per Episode: {avg_projectile_dodges:.2f}\n"
+    report += f"  Average Projectile Hits per Episode: {avg_projectile_hits:.2f}\n"
+    report += f"  Projectile Dodge Ratio: {projectile_dodge_ratio:.2%}\n"
     report += "  Action Percentages When Threat Objects Detected:\n"
     for i, (name, percent) in enumerate(zip(env.envs[0].action_names, threat_object_action_percentages)):
         report += f"    {name}: {percent:.2f}%\n"
