@@ -139,9 +139,8 @@ class KungFuRewardWrapper(Wrapper):
         self.prev_frame = None
         self.threats_history = []
         self.last_hero_pos_x = 0
-        # Counters for flying knife detection and actions
-        self.knife_detections = 0  # Total detections of flying knives per episode
-        self.knife_action_counts = np.zeros(11)  # Count of each action when a knife is detected
+        self.knife_detections = 0
+        self.knife_action_counts = np.zeros(11)
         self.ram_positions = {
             'score_1': 0x0531, 'score_2': 0x0532, 'score_3': 0x0533, 'score_4': 0x0534, 'score_5': 0x0535,
             'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 
@@ -159,7 +158,6 @@ class KungFuRewardWrapper(Wrapper):
         self.total_hp_loss = 0
         self.threats_history = []
         self.last_hero_pos_x = 0
-        # Reset counters
         self.knife_detections = 0
         self.knife_action_counts = np.zeros(11)
         return obs
@@ -177,9 +175,9 @@ class KungFuRewardWrapper(Wrapper):
             return []
 
         diff = np.abs(current_frame - self.prev_frame)
-        threshold = 50  # Intensity threshold for movement
-        speed_threshold = 5  # Minimum pixel movement for "fast"
-        SMALL_THREAT_SIZE = 20  # Max width/height for a "small" object (e.g., knife)
+        threshold = 50
+        speed_threshold = 15  # Increased from 10 to detect only very fast objects
+        SMALL_THREAT_SIZE = 10  # Reduced from 15 to stricter define knives
 
         moving_pixels = diff > threshold
         if not np.any(moving_pixels):
@@ -197,7 +195,6 @@ class KungFuRewardWrapper(Wrapper):
         center_x = (min_x + max_x) // 2
         center_y = (min_y + max_y) // 2
 
-        # Only consider small, fast-moving objects (flying knives)
         is_fast_moving = False
         for prev_x, prev_y, _, _ in self.threats_history[-5:]:
             distance = np.sqrt((center_x - prev_x)**2 + (center_y - prev_y)**2)
@@ -205,7 +202,6 @@ class KungFuRewardWrapper(Wrapper):
                 is_fast_moving = True
                 break
 
-        # Check if it's a small object (e.g., knife)
         is_small = width < SMALL_THREAT_SIZE and height < SMALL_THREAT_SIZE
         if is_fast_moving and is_small:
             threats.append((center_x, center_y, width, height))
@@ -230,18 +226,15 @@ class KungFuRewardWrapper(Wrapper):
         hero_pos_x = ram[self.ram_positions['hero_pos_x']]
         current_hp = ram[self.ram_positions['hero_hp']]
 
-        # Health loss
         hp_loss = 0
         if self.last_hp is not None and current_hp < self.last_hp:
             hp_loss = self.last_hp - current_hp
             self.total_hp_loss += hp_loss
         self.last_hp = current_hp
 
-        # Score and scroll deltas
         score_delta = current_score - self.last_score if current_score >= self.last_score else (999990 - self.last_score) + current_score
         scroll_delta = current_scroll - self.last_scroll if current_scroll >= self.last_scroll else (current_scroll + 256 - self.last_scroll)
 
-        # Base rewards
         reward = 0
         if score_delta > 0:
             reward += score_delta * 10
@@ -254,15 +247,14 @@ class KungFuRewardWrapper(Wrapper):
         else:
             reward += 10
 
-        # Detect flying knives and track actions
         threats = self._detect_threats(current_frame)
         DISTANCE_THRESHOLD = 20
-        AVOIDANCE_REWARD = 100
+        AVOIDANCE_REWARD = 2000  # Increased from 500 to strongly favor avoidance
+        NON_AVOIDANCE_PENALTY = -200  # Increased from -50 to deter other actions
         threat_detected = bool(threats)
 
         if threat_detected:
             self.knife_detections += 1
-            # Record the action taken when a knife is detected
             self.knife_action_counts[action] += 1
 
             for threat_x, threat_y, width, height in threats:
@@ -270,16 +262,16 @@ class KungFuRewardWrapper(Wrapper):
                 distance = abs(hero_pos_x - threat_x_game)
 
                 if distance < DISTANCE_THRESHOLD:
-                    # Reward avoidance actions for flying knives
                     if action == 10 and threat_y < 42:  # Jump over low knife
                         reward += AVOIDANCE_REWARD
                     elif action == 9 and threat_y > 42:  # Duck under high knife
                         reward += AVOIDANCE_REWARD
+                    else:
+                        reward += NON_AVOIDANCE_PENALTY
 
-                # Gap-closing bonus (optional, kept for consistency)
                 last_distance = abs(self.last_hero_pos_x - threat_x_game)
                 if distance < last_distance:
-                    reward += 10  # GAP_CLOSING_BONUS
+                    reward += 10
 
         self.last_hero_pos_x = hero_pos_x
         self.last_score = current_score
@@ -291,12 +283,11 @@ class KungFuRewardWrapper(Wrapper):
         info['hp'] = current_hp
         info['total_hp_loss'] = self.total_hp_loss
         info['threat_detected'] = threat_detected
-        # Add knife detection info to the info dict for evaluation
         info['knife_detections'] = self.knife_detections
         info['knife_action_counts'] = self.knife_action_counts.copy()
 
         return obs, reward, done, info
-      
+        
 # State loader wrapper
 class StateLoaderWrapper(Wrapper):
     def __init__(self, env, state_file="custom_state.state"):
@@ -693,7 +684,7 @@ def evaluate(args, model=None, baseline_file=None):
     if args.enable_file_logging:
         with open(os.path.join(args.log_dir, 'evaluation_report.txt'), 'w') as f:
             f.write(report)
-            
+
 # Main execution
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train, play, capture, or evaluate KungFu Master using PPO with Vision Transformer")
