@@ -12,7 +12,7 @@ from PIL import Image
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor, SubprocVecEnv, VecTransposeImage
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.policies import ActorCriticPolicy  # Corrected import
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from tqdm import tqdm
 from gym import spaces, Wrapper
@@ -20,12 +20,9 @@ from gym.wrappers import TimeLimit
 from stable_baselines3.common.utils import set_random_seed
 import keyboard
 import time
+import cv2
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 global_model = None
 global_model_path = None
@@ -43,7 +40,6 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# Vision Transformer for feature extraction
 class VisionTransformer(BaseFeaturesExtractor):
     def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):
         super(VisionTransformer, self).__init__(observation_space, features_dim=embed_dim)
@@ -79,8 +75,7 @@ class VisionTransformer(BaseFeaturesExtractor):
         x = x.mean(dim=1)
         return x
 
-# Custom policy using Vision Transformer
-class TransformerPolicy(ActorCriticPolicy):
+class TransformerPolicy(ActorCriticPolicy):  # Corrected inheritance
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super(TransformerPolicy, self).__init__(
             observation_space,
@@ -91,7 +86,6 @@ class TransformerPolicy(ActorCriticPolicy):
             **kwargs
         )
 
-# Discrete action space wrapper
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -100,8 +94,8 @@ class KungFuDiscreteWrapper(gym.ActionWrapper):
             [0,0,0,0,0,0,0,0,0,0,0,0],  # 0: No action
             [0,0,0,0,0,0,1,0,0,0,0,0],  # 1: Left
             [0,0,0,0,0,0,0,0,1,0,0,0],  # 2: Right
-            [1,0,0,0,0,0,0,0,0,0,0,0],  # 3: B (Kick)
-            [0,1,0,0,0,0,0,0,0,0,0,0],  # 4: A (Punch)
+            [1,0,0,0,0,0,0,0,0,0,0,0],  # 3: Kick
+            [0,1,0,0,0,0,0,0,0,0,0,0],  # 4: Punch
             [1,0,0,0,0,0,1,0,0,0,0,0],  # 5: Kick+Left
             [1,0,0,0,0,0,0,0,1,0,0,0],  # 6: Kick+Right
             [0,1,0,0,0,0,1,0,0,0,0,0],  # 7: Punch+Left
@@ -116,31 +110,34 @@ class KungFuDiscreteWrapper(gym.ActionWrapper):
             action = int(action.item() if isinstance(action, np.ndarray) else action[0])
         return self._actions[action]
 
-# Frame preprocessing wrapper
 class PreprocessFrame(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.observation_space = spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8)
         
     def observation(self, obs):
-        obs = np.dot(obs[...,:3], [0.299, 0.587, 0.114])  # Grayscale
+        obs = np.dot(obs[...,:3], [0.299, 0.587, 0.114])
         obs = np.array(Image.fromarray(obs).resize((84, 84), Image.BILINEAR))
         obs = np.expand_dims(obs, axis=-1)
         return obs.astype(np.uint8)
 
 class KungFuRewardWrapper(Wrapper):
-    def __init__(self, env):
+    def __init__(self, env, threat_object_template_path="threat_object_template.png"):
         super().__init__(env)
         self.last_score = 0
         self.last_scroll = 0
         self.last_stage = 0
         self.last_hp = None
         self.total_hp_loss = 0
-        self.prev_frame = None
-        self.threats_history = []
         self.last_hero_pos_x = 0
-        self.knife_detections = 0
-        self.knife_action_counts = np.zeros(11)
+        self.threat_object_detections = 0
+        self.threat_object_action_counts = np.zeros(11)
+        self.detection_count = 0
+        # Load cropped threat_object template
+        self.threat_object_template = cv2.imread(threat_object_template_path, cv2.IMREAD_GRAYSCALE)
+        if self.threat_object_template is None:
+            raise FileNotFoundError(f"Threat object template not found at {threat_object_template_path}")
+        self.template_h, self.template_w = self.threat_object_template.shape  # e.g., 16x32
         self.ram_positions = {
             'score_1': 0x0531, 'score_2': 0x0532, 'score_3': 0x0533, 'score_4': 0x0534, 'score_5': 0x0535,
             'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 
@@ -151,69 +148,45 @@ class KungFuRewardWrapper(Wrapper):
         obs = super().reset(**kwargs)
         ram = self.env.get_ram()
         self.last_hp = ram[self.ram_positions['hero_hp']]
-        self.prev_frame = self._preprocess_frame(obs)
         self.last_score = 0
         self.last_scroll = 0
         self.last_stage = 0
         self.total_hp_loss = 0
-        self.threats_history = []
         self.last_hero_pos_x = 0
-        self.knife_detections = 0
-        self.knife_action_counts = np.zeros(11)
+        self.threat_object_detections = 0
+        self.threat_object_action_counts = np.zeros(11)
+        self.detection_count = 0
         return obs
 
-    def _preprocess_frame(self, frame):
-        if frame.shape[-1] == 1:
-            return frame.squeeze(-1)
-        else:
-            frame = np.dot(frame[..., :3], [0.299, 0.587, 0.114])
-            frame = np.array(Image.fromarray(frame).resize((84, 84), Image.BILINEAR))
-            return frame.astype(np.uint8)
-
-    def _detect_threats(self, current_frame):
-        if self.prev_frame is None:
-            return []
-
-        diff = np.abs(current_frame - self.prev_frame)
-        threshold = 50
-        speed_threshold = 15  # Increased from 10 to detect only very fast objects
-        SMALL_THREAT_SIZE = 10  # Reduced from 15 to stricter define knives
-
-        moving_pixels = diff > threshold
-        if not np.any(moving_pixels):
-            return []
-
-        y_coords, x_coords = np.where(moving_pixels)
-        if len(x_coords) == 0 or len(y_coords) == 0:
-            return []
-
+    def _detect_threats(self, frame):
+        # Convert frame to grayscale
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        
+        # Template matching with cropped threat_object
+        result = cv2.matchTemplate(gray_frame, self.threat_object_template, cv2.TM_CCOEFF_NORMED)
+        threshold = 0.8  # Higher threshold for precision
+        locations = np.where(result >= threshold)
+        
         threats = []
-        min_x, max_x = np.min(x_coords), np.max(x_coords)
-        min_y, max_y = np.min(y_coords), np.max(y_coords)
-        width = max_x - min_x
-        height = max_y - min_y
-        center_x = (min_x + max_x) // 2
-        center_y = (min_y + max_y) // 2
-
-        is_fast_moving = False
-        for prev_x, prev_y, _, _ in self.threats_history[-5:]:
-            distance = np.sqrt((center_x - prev_x)**2 + (center_y - prev_y)**2)
-            if distance > speed_threshold:
-                is_fast_moving = True
-                break
-
-        is_small = width < SMALL_THREAT_SIZE and height < SMALL_THREAT_SIZE
-        if is_fast_moving and is_small:
+        for pt in zip(*locations[::-1]):  # pt is (x, y)
+            x, y = pt[0], pt[1]
+            width, height = self.template_w, self.template_h
+            center_x = x + width // 2
+            center_y = y + height // 2
+            
+            # Save detected threat_object region
+            threat_object_region = frame[y:y+height, x:x+width]
+            #cv2.imwrite(f"detected_threat_objects/threat_object_{self.detection_count}.png", cv2.cvtColor(threat_object_region, cv2.COLOR_RGB2BGR))
+            self.detection_count += 1
+            
             threats.append((center_x, center_y, width, height))
-
-        self.prev_frame = current_frame
-        self.threats_history.append((center_x, center_y, width, height))
-        self.threats_history = self.threats_history[-10:]
+            break  # Limit to one detection per frame for simplicity
+        
         return threats
 
     def step(self, action):
         obs, _, done, info = super().step(action)
-        current_frame = self._preprocess_frame(obs)
+        raw_frame = self.env.unwrapped.get_screen()  # RGB frame (224x256)
         
         ram = self.env.get_ram()
         current_score = (
@@ -237,34 +210,34 @@ class KungFuRewardWrapper(Wrapper):
 
         reward = 0
         if score_delta > 0:
-            reward += score_delta * 10
+            reward += score_delta * 5
         if scroll_delta > 0:
-            reward += scroll_delta * 50
+            reward += scroll_delta * 25
         if current_stage > self.last_stage:
-            reward += 1000
+            reward += 500
         if hp_loss > 0:
             reward -= hp_loss * 50
         else:
             reward += 10
 
-        threats = self._detect_threats(current_frame)
+        threats = self._detect_threats(raw_frame)
         DISTANCE_THRESHOLD = 20
-        AVOIDANCE_REWARD = 2000  # Increased from 500 to strongly favor avoidance
-        NON_AVOIDANCE_PENALTY = -200  # Increased from -50 to deter other actions
+        AVOIDANCE_REWARD = 5000
+        NON_AVOIDANCE_PENALTY = -1000
         threat_detected = bool(threats)
 
         if threat_detected:
-            self.knife_detections += 1
-            self.knife_action_counts[action] += 1
+            self.threat_object_detections += 1
+            self.threat_object_action_counts[action] += 1
 
             for threat_x, threat_y, width, height in threats:
-                threat_x_game = threat_x * 256 // 84
+                threat_x_game = threat_x
                 distance = abs(hero_pos_x - threat_x_game)
 
                 if distance < DISTANCE_THRESHOLD:
-                    if action == 10 and threat_y < 42:  # Jump over low knife
+                    if action == 10 and threat_y < 112:  # Jump over low threat_object
                         reward += AVOIDANCE_REWARD
-                    elif action == 9 and threat_y > 42:  # Duck under high knife
+                    elif action == 9 and threat_y > 112:  # Duck under high threat_object
                         reward += AVOIDANCE_REWARD
                     else:
                         reward += NON_AVOIDANCE_PENALTY
@@ -283,28 +256,11 @@ class KungFuRewardWrapper(Wrapper):
         info['hp'] = current_hp
         info['total_hp_loss'] = self.total_hp_loss
         info['threat_detected'] = threat_detected
-        info['knife_detections'] = self.knife_detections
-        info['knife_action_counts'] = self.knife_action_counts.copy()
+        info['threat_object_detections'] = self.threat_object_detections
+        info['threat_object_action_counts'] = self.threat_object_action_counts.copy()
 
         return obs, reward, done, info
-        
-# State loader wrapper
-class StateLoaderWrapper(Wrapper):
-    def __init__(self, env, state_file="custom_state.state"):
-        super().__init__(env)
-        self.state_file = state_file
-        if not os.path.exists(state_file):
-            raise FileNotFoundError(f"State file {state_file} not found.")
-        with open(state_file, "rb") as f:
-            self.custom_state = f.read()
-        self.env = TimeLimit(env, max_episode_steps=100)
 
-    def reset(self):
-        obs = super().reset()
-        self.env.unwrapped.set_state(self.custom_state)
-        return self.env.unwrapped.get_observation()
-
-# Environment creation functions
 def make_kungfu_env(render=False, seed=None, state_only=False, state_file="custom_state.state"):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
@@ -327,7 +283,6 @@ def make_env(rank, seed=0, render=False, state_only=False, state_file="custom_st
     set_random_seed(seed)
     return _init
 
-# Callbacks
 class RenderCallback(BaseCallback):
     def __init__(self, verbose=0):
         super(RenderCallback, self).__init__(verbose)
@@ -358,7 +313,6 @@ class TqdmCallback(BaseCallback):
         self.pbar.n = self.total_timesteps
         self.pbar.close()
 
-# Training function
 def train(args):
     global global_model, global_model_path
     global_model_path = args.model_path
@@ -368,6 +322,7 @@ def train(args):
     
     os.makedirs(args.model_path, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs("detected_threat_objects", exist_ok=True)
     
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -401,18 +356,17 @@ def train(args):
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     total_trained_steps = 0
     
-    # Define PPO hyperparameters
     ppo_kwargs = dict(
         policy=TransformerPolicy,
         env=env,
-        learning_rate=args.learning_rate,  # Fixed the typo here
+        learning_rate=args.learning_rate,
         n_steps=2048,
         batch_size=64,
         n_epochs=args.n_epochs,
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
         clip_range=args.clip_range,
-        ent_coef=0.5,
+        ent_coef=0.01,
         tensorboard_log=args.log_dir,
         verbose=1 if args.verbose else 0,
         device=device
@@ -424,7 +378,6 @@ def train(args):
             model = PPO.load(model_file, env=env, device=device, print_system_info=True)
             total_trained_steps = model.num_timesteps if hasattr(model, 'num_timesteps') else 0
             print(f"Total trained steps so far: {total_trained_steps}")
-            print(f"Loaded model num_timesteps: {model.num_timesteps}")
         except Exception as e:
             print(f"Error loading model: {e}")
             print("Starting new training.")
@@ -461,7 +414,6 @@ def train(args):
         if terminate_flag:
             print("Training terminated by signal.")
 
-# Play function
 def play(args):
     if args.enable_file_logging:
         logging.getLogger().addHandler(logging.FileHandler('play.log'))
@@ -516,7 +468,6 @@ def play(args):
     finally:
         env.close()
 
-# Capture function
 def capture(args):
     if args.enable_file_logging:
         logging.getLogger().addHandler(logging.FileHandler('capture.log'))
@@ -529,10 +480,10 @@ def capture(args):
     obs = env.reset()
     done = False
     steps = 0
-    frame_time = 1 / 60  # 60 FPS
+    frame_time = 1 / 60
     
     print("Controls: Left/Right Arrows, Z (Punch), X (Kick), Up (Jump), Down (Duck)")
-    print(f"Press 'S' to save state to '{args.state_file}', 'Q' to quit.")
+    print("Press 'S' to save state, 'K' to save cropped threat_object template, 'Q' to quit.")
     
     try:
         while not done:
@@ -540,7 +491,7 @@ def capture(args):
             env.render()
             steps += 1
             
-            action = 0  # Default: No action
+            action = 0
             if keyboard.is_pressed('left'):
                 action = 1
             elif keyboard.is_pressed('right'):
@@ -562,6 +513,15 @@ def capture(args):
                     f.write(env.envs[0].unwrapped.get_state())
                 print(f"State saved to '{args.state_file}' at step {steps}")
                 logging.info(f"State saved to '{args.state_file}' at step {steps}")
+            
+            if keyboard.is_pressed('k'):
+                frame = env.envs[0].unwrapped.get_screen()
+                threat_object_x, threat_object_y = 112, 128  # Center of screen
+                threat_object_w, threat_object_h = 32, 16    # Adjust based on threat_object size
+                threat_object_region = frame[threat_object_y-threat_object_h//2:threat_object_y+threat_object_h//2, threat_object_x-threat_object_w//2:threat_object_x+threat_object_w//2]
+                cv2.imwrite("threat_object_template.png", cv2.cvtColor(threat_object_region, cv2.COLOR_RGB2BGR))
+                print(f"Cropped threat_object template saved to 'threat_object_template.png' at step {steps}")
+                logging.info(f"Cropped threat_object template saved at step {steps}")
             
             if keyboard.is_pressed('q'):
                 print("Quitting...")
@@ -603,8 +563,8 @@ def evaluate(args, model=None, baseline_file=None):
     max_positions = []
     max_stages = []
     hp_loss_rates = []
-    knife_detections_per_episode = []
-    knife_action_totals = np.zeros(11)  # Total counts of actions across all episodes when knives detected
+    threat_object_detections_per_episode = []
+    threat_object_action_totals = np.zeros(11)
     
     for episode in range(args.eval_episodes):
         obs = env.reset()
@@ -615,8 +575,8 @@ def evaluate(args, model=None, baseline_file=None):
         episode_max_pos_x = 0
         episode_max_stage = 0
         episode_hp_loss = 0
-        episode_knife_detections = 0
-        episode_knife_action_counts = np.zeros(11)
+        episode_threat_object_detections = 0
+        episode_threat_object_action_counts = np.zeros(11)
         
         while not done and not terminate_flag:
             action, _ = model.predict(obs, deterministic=args.deterministic)
@@ -629,9 +589,8 @@ def evaluate(args, model=None, baseline_file=None):
             hero_pos_x = info[0].get('hero_pos_x', 0)
             current_stage = info[0].get('current_stage', 0)
             episode_hp_loss = info[0].get('total_hp_loss', 0)
-            # Update knife detection stats
-            episode_knife_detections = info[0].get('knife_detections', 0)
-            episode_knife_action_counts = info[0].get('knife_action_counts', np.zeros(11))
+            episode_threat_object_detections = info[0].get('threat_object_detections', 0)
+            episode_threat_object_action_counts = info[0].get('threat_object_action_counts', np.zeros(11))
             episode_max_pos_x = max(episode_max_pos_x, hero_pos_x)
             episode_max_stage = max(episode_max_stage, current_stage)
             total_steps += 1
@@ -643,8 +602,8 @@ def evaluate(args, model=None, baseline_file=None):
         max_stages.append(episode_max_stage)
         hp_loss_rate = episode_hp_loss / episode_steps if episode_steps > 0 else 0
         hp_loss_rates.append(hp_loss_rate)
-        knife_detections_per_episode.append(episode_knife_detections)
-        knife_action_totals += episode_knife_action_counts
+        threat_object_detections_per_episode.append(episode_threat_object_detections)
+        threat_object_action_totals += episode_threat_object_action_counts
 
     env.close()
     
@@ -655,9 +614,9 @@ def evaluate(args, model=None, baseline_file=None):
     avg_max_pos_x = np.mean(max_positions)
     avg_max_stage = np.mean(max_stages)
     avg_hp_loss_rate = np.mean(hp_loss_rates)
-    avg_knife_detections = np.mean(knife_detections_per_episode)
-    total_knife_detections = np.sum(knife_detections_per_episode)
-    knife_action_percentages = (knife_action_totals / total_knife_detections * 100) if total_knife_detections > 0 else np.zeros(11)
+    avg_threat_object_detections = np.mean(threat_object_detections_per_episode)
+    total_threat_object_detections = np.sum(threat_object_detections_per_episode)
+    threat_object_action_percentages = (threat_object_action_totals / total_threat_object_detections * 100) if total_threat_object_detections > 0 else np.zeros(11)
     action_entropy = -np.sum(action_percentages / 100 * np.log(action_percentages / 100 + 1e-10))
     
     report = f"Evaluation Report for {model_file} ({args.eval_episodes} episodes)\n"
@@ -673,11 +632,11 @@ def evaluate(args, model=None, baseline_file=None):
     report += f"Average Furthest Position (X): {avg_max_pos_x:.2f}\n"
     report += f"Average Highest Stage: {avg_max_stage:.2f} (out of 5)\n"
     report += f"Average HP Loss Rate: {avg_hp_loss_rate:.3f} HP/step\n"
-    report += f"\nFlying Knife Detection Stats:\n"
-    report += f"  Average Knife Detections per Episode: {avg_knife_detections:.2f}\n"
-    report += f"  Total Knife Detections: {int(total_knife_detections)}\n"
-    report += "  Action Percentages When Knives Detected:\n"
-    for i, (name, percent) in enumerate(zip(env.envs[0].action_names, knife_action_percentages)):
+    report += f"\nThreat Object Detection Stats:\n"
+    report += f"  Average Threat Object Detections per Episode: {avg_threat_object_detections:.2f}\n"
+    report += f"  Total Threat Object Detections: {int(total_threat_object_detections)}\n"
+    report += "  Action Percentages When Threat Objects Detected:\n"
+    for i, (name, percent) in enumerate(zip(env.envs[0].action_names, threat_object_action_percentages)):
         report += f"    {name}: {percent:.2f}%\n"
     
     print(report)
@@ -685,7 +644,6 @@ def evaluate(args, model=None, baseline_file=None):
         with open(os.path.join(args.log_dir, 'evaluation_report.txt'), 'w') as f:
             f.write(report)
 
-# Main execution
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train, play, capture, or evaluate KungFu Master using PPO with Vision Transformer")
     mode_group = parser.add_mutually_exclusive_group()
@@ -711,7 +669,6 @@ if __name__ == "__main__":
     parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda")
     parser.add_argument("--clip_range", type=float, default=0.1, help="PPO clip range")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
-    parser.add_argument("--baseline_file", type=str, default=None, help="Path to baseline model for comparison")
     parser.add_argument("--enable_file_logging", action="store_true", help="Enable logging to file")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose PPO output")
     parser.add_argument("--state_only", action="store_true", help="Train/play on custom state")
