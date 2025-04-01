@@ -142,15 +142,13 @@ class KungFuRewardWrapper(Wrapper):
         self.ram_positions = {
             'score_1': 0x0531, 'score_2': 0x0532, 'score_3': 0x0533, 'score_4': 0x0534, 'score_5': 0x0535,
             'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 
-            'hero_hp': 0x04A6, 'hero_action': 0x0069, 'hero_air_mode': 0x036A,
+            'hero_hp': 0x04A6, 'hero_air_mode': 0x036A,
         }
 
     def reset(self, **kwargs):
-        # Reset the environment and get the initial observation
         obs = super().reset(**kwargs)
         ram = self.env.get_ram()
         self.last_hp = ram[self.ram_positions['hero_hp']]
-        # Use the observation returned by reset instead of get_observation()
         self.prev_frame = self._preprocess_frame(obs)
         self.last_score = 0
         self.last_scroll = 0
@@ -161,11 +159,9 @@ class KungFuRewardWrapper(Wrapper):
         return obs
 
     def _preprocess_frame(self, frame):
-        # Ensure frame is in the expected format (84x84x1 from PreprocessFrame)
-        if frame.shape[-1] == 1:  # Already preprocessed to grayscale
-            return frame.squeeze(-1)  # Remove channel dim for processing
+        if frame.shape[-1] == 1:
+            return frame.squeeze(-1)
         else:
-            # If raw frame is passed (unlikely due to PreprocessFrame wrapper), convert to grayscale
             frame = np.dot(frame[..., :3], [0.299, 0.587, 0.114])
             frame = np.array(Image.fromarray(frame).resize((84, 84), Image.BILINEAR))
             return frame.astype(np.uint8)
@@ -211,7 +207,6 @@ class KungFuRewardWrapper(Wrapper):
 
     def step(self, action):
         obs, _, done, info = super().step(action)
-        # Use the observation returned by step instead of get_observation()
         current_frame = self._preprocess_frame(obs)
         
         ram = self.env.get_ram()
@@ -224,6 +219,7 @@ class KungFuRewardWrapper(Wrapper):
         current_stage = ram[self.ram_positions['current_stage']]
         hero_pos_x = ram[self.ram_positions['hero_pos_x']]
         current_hp = ram[self.ram_positions['hero_hp']]
+        hero_air = ram[self.ram_positions['hero_air_mode']] == 1
 
         # Health loss
         hp_loss = 0
@@ -264,20 +260,19 @@ class KungFuRewardWrapper(Wrapper):
 
             if distance < DISTANCE_THRESHOLD:
                 is_small_threat = width < SMALL_THREAT_SIZE and height < SMALL_THREAT_SIZE
-                hero_action = ram[self.ram_positions['hero_action']]
-                hero_air = ram[self.ram_positions['hero_air_mode']] == 1
 
-                if is_small_threat:
-                    if hero_air and threat_y < 42:
+                # Use the action parameter instead of hero_action
+                if is_small_threat:  # Small threats (e.g., knives)
+                    if action == 10 and threat_y < 42:  # Jump (action 10)
                         reward += AVOIDANCE_REWARD
-                    elif hero_action == 0x05 and threat_y > 42:
+                    elif action == 9 and threat_y > 42:  # Duck (action 9)
                         reward += AVOIDANCE_REWARD
-                else:
-                    if hero_action in (0x01, 0x02):
+                else:  # Larger threats (e.g., enemies)
+                    if action in (3, 4, 5, 6, 7, 8):  # Kick (3), Punch (4), or combinations
                         reward += COMBAT_REWARD
-                    elif hero_air and threat_y < 42:
+                    elif action == 10 and threat_y < 42:  # Jump (action 10)
                         reward += AVOIDANCE_REWARD
-                    elif hero_action == 0x05 and threat_y > 42:
+                    elif action == 9 and threat_y > 42:  # Duck (action 9)
                         reward += AVOIDANCE_REWARD
 
             last_distance = abs(self.last_hero_pos_x - threat_x_game)
