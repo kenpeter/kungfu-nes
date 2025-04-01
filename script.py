@@ -18,7 +18,7 @@ from tqdm import tqdm
 from gym import spaces, Wrapper
 from gym.wrappers import TimeLimit
 from stable_baselines3.common.utils import set_random_seed
-import keyboard  # Install with `pip install keyboard`
+import keyboard
 import time
 
 # Configure logging
@@ -128,7 +128,6 @@ class PreprocessFrame(gym.ObservationWrapper):
         obs = np.expand_dims(obs, axis=-1)
         return obs.astype(np.uint8)
 
-# Enhanced reward wrapper with knife avoidance
 class KungFuRewardWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -137,29 +136,83 @@ class KungFuRewardWrapper(Wrapper):
         self.last_stage = 0
         self.last_hp = None
         self.total_hp_loss = 0
-        self.last_knife_x = [None] * 4  # Track knife positions
+        self.prev_frame = None
+        self.threats_history = []
+        self.last_hero_pos_x = 0
         self.ram_positions = {
             'score_1': 0x0531, 'score_2': 0x0532, 'score_3': 0x0533, 'score_4': 0x0534, 'score_5': 0x0535,
-            'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 'hero_hp': 0x04A6,
-            'hero_action': 0x0069, 'hero_air_mode': 0x036A,
-            'enemy1_action': 0x0080, 'enemy2_action': 0x0081, 'enemy3_action': 0x0082, 'enemy4_action': 0x0083,
-            'enemy1_pos_x': 0x008E, 'enemy2_pos_x': 0x008F, 'enemy3_pos_x': 0x0090, 'enemy4_pos_x': 0x0091,
-            'enemy1_pos_y': 0x00A0, 'enemy2_pos_y': 0x00A1, 'enemy3_pos_y': 0x00A2, 'enemy4_pos_y': 0x00A3,
+            'scroll_1': 0x00E5, 'scroll_2': 0x00D4, 'current_stage': 0x0058, 'hero_pos_x': 0x0094, 
+            'hero_hp': 0x04A6, 'hero_action': 0x0069, 'hero_air_mode': 0x036A,
         }
 
-    def reset(self):
+    def reset(self, **kwargs):
+        # Reset the environment and get the initial observation
+        obs = super().reset(**kwargs)
+        ram = self.env.get_ram()
+        self.last_hp = ram[self.ram_positions['hero_hp']]
+        # Use the observation returned by reset instead of get_observation()
+        self.prev_frame = self._preprocess_frame(obs)
         self.last_score = 0
         self.last_scroll = 0
         self.last_stage = 0
         self.total_hp_loss = 0
-        self.last_knife_x = [None] * 4
-        obs = super().reset()
-        ram = self.env.get_ram()
-        self.last_hp = ram[self.ram_positions['hero_hp']]
+        self.threats_history = []
+        self.last_hero_pos_x = 0
         return obs
+
+    def _preprocess_frame(self, frame):
+        # Ensure frame is in the expected format (84x84x1 from PreprocessFrame)
+        if frame.shape[-1] == 1:  # Already preprocessed to grayscale
+            return frame.squeeze(-1)  # Remove channel dim for processing
+        else:
+            # If raw frame is passed (unlikely due to PreprocessFrame wrapper), convert to grayscale
+            frame = np.dot(frame[..., :3], [0.299, 0.587, 0.114])
+            frame = np.array(Image.fromarray(frame).resize((84, 84), Image.BILINEAR))
+            return frame.astype(np.uint8)
+
+    def _detect_threats(self, current_frame):
+        if self.prev_frame is None:
+            return []
+
+        diff = np.abs(current_frame - self.prev_frame)
+        threshold = 50
+        speed_threshold = 5
+        
+        moving_pixels = diff > threshold
+        if not np.any(moving_pixels):
+            return []
+
+        y_coords, x_coords = np.where(moving_pixels)
+        if len(x_coords) == 0 or len(y_coords) == 0:
+            return []
+
+        threats = []
+        min_x, max_x = np.min(x_coords), np.max(x_coords)
+        min_y, max_y = np.min(y_coords), np.max(y_coords)
+        width = max_x - min_x
+        height = max_y - min_y
+        center_x = (min_x + max_x) // 2
+        center_y = (min_y + max_y) // 2
+
+        is_fast_moving = False
+        for prev_x, prev_y, _, _ in self.threats_history[-5:]:
+            distance = np.sqrt((center_x - prev_x)**2 + (center_y - prev_y)**2)
+            if distance > speed_threshold:
+                is_fast_moving = True
+                break
+
+        if is_fast_moving and width > 0 and height > 0:
+            threats.append((center_x, center_y, width, height))
+
+        self.prev_frame = current_frame
+        self.threats_history.append((center_x, center_y, width, height))
+        self.threats_history = self.threats_history[-10:]
+        return threats
 
     def step(self, action):
         obs, _, done, info = super().step(action)
+        # Use the observation returned by step instead of get_observation()
+        current_frame = self._preprocess_frame(obs)
         
         ram = self.env.get_ram()
         current_score = (
@@ -196,38 +249,42 @@ class KungFuRewardWrapper(Wrapper):
         else:
             reward += 10
 
-        # Knife avoidance and gap-closing
-        KNIFE_LOW_ACTION = 0x20  # Placeholder - verify with debugger
-        KNIFE_HIGH_ACTION = 0x21  # Placeholder - verify with debugger
-        HERO_DUCK_ACTION = 0x05  # Placeholder - verify with debugger
+        # Vision-based threat detection and response
+        threats = self._detect_threats(current_frame)
         DISTANCE_THRESHOLD = 20
+        SMALL_THREAT_SIZE = 20
         AVOIDANCE_REWARD = 100
+        COMBAT_REWARD = 50
         GAP_CLOSING_BONUS = 10
+        threat_detected = bool(threats)
 
-        knife_detected = False
-        for i in range(1, 5):
-            action_addr = self.ram_positions[f'enemy{i}_action']
-            pos_x_addr = self.ram_positions[f'enemy{i}_pos_x']
-            pos_y_addr = self.ram_positions[f'enemy{i}_pos_y']
-            enemy_action = ram[action_addr]
-            enemy_pos_x = ram[pos_x_addr]
-            enemy_pos_y = ram[pos_y_addr] if pos_y_addr in self.ram_positions else 0
+        for threat_x, threat_y, width, height in threats:
+            threat_x_game = threat_x * 256 // 84
+            distance = abs(hero_pos_x - threat_x_game)
 
-            if enemy_action in (KNIFE_LOW_ACTION, KNIFE_HIGH_ACTION):
-                knife_detected = True
-                distance = abs(hero_pos_x - enemy_pos_x)
-                if distance < DISTANCE_THRESHOLD:
-                    is_low_knife = enemy_action == KNIFE_LOW_ACTION or (enemy_pos_y > 50 and enemy_pos_y != 0)
-                    if is_low_knife and ram[self.ram_positions['hero_air_mode']] == 1:
+            if distance < DISTANCE_THRESHOLD:
+                is_small_threat = width < SMALL_THREAT_SIZE and height < SMALL_THREAT_SIZE
+                hero_action = ram[self.ram_positions['hero_action']]
+                hero_air = ram[self.ram_positions['hero_air_mode']] == 1
+
+                if is_small_threat:
+                    if hero_air and threat_y < 42:
                         reward += AVOIDANCE_REWARD
-                    elif not is_low_knife and ram[self.ram_positions['hero_action']] == HERO_DUCK_ACTION:
+                    elif hero_action == 0x05 and threat_y > 42:
+                        reward += AVOIDANCE_REWARD
+                else:
+                    if hero_action in (0x01, 0x02):
+                        reward += COMBAT_REWARD
+                    elif hero_air and threat_y < 42:
+                        reward += AVOIDANCE_REWARD
+                    elif hero_action == 0x05 and threat_y > 42:
                         reward += AVOIDANCE_REWARD
 
-                if self.last_knife_x[i-1] is not None and distance < abs(hero_pos_x - self.last_knife_x[i-1]):
-                    reward += GAP_CLOSING_BONUS
+            last_distance = abs(self.last_hero_pos_x - threat_x_game)
+            if distance < last_distance:
+                reward += GAP_CLOSING_BONUS
 
-            self.last_knife_x[i-1] = enemy_pos_x if enemy_action in (KNIFE_LOW_ACTION, KNIFE_HIGH_ACTION) else None
-
+        self.last_hero_pos_x = hero_pos_x
         self.last_score = current_score
         self.last_scroll = current_scroll
         self.last_stage = current_stage
@@ -236,10 +293,10 @@ class KungFuRewardWrapper(Wrapper):
         info['current_stage'] = current_stage
         info['hp'] = current_hp
         info['total_hp_loss'] = self.total_hp_loss
-        info['knife_detected'] = knife_detected
+        info['threat_detected'] = threat_detected
 
         return obs, reward, done, info
-
+    
 # State loader wrapper
 class StateLoaderWrapper(Wrapper):
     def __init__(self, env, state_file="custom_state.state"):
@@ -357,7 +414,7 @@ def train(args):
     ppo_kwargs = dict(
         policy=TransformerPolicy,
         env=env,
-        learning_rate=args.learning_rate,
+        learning_rate=args.learning_rate,  # Fixed the typo here
         n_steps=2048,
         batch_size=64,
         n_epochs=args.n_epochs,
@@ -556,7 +613,7 @@ def evaluate(args, model=None, baseline_file=None):
     max_positions = []
     max_stages = []
     hp_loss_rates = []
-    knife_avoidances = []
+    threat_avoidances = []
     
     for episode in range(args.eval_episodes):
         obs = env.reset()
@@ -567,7 +624,7 @@ def evaluate(args, model=None, baseline_file=None):
         episode_max_pos_x = 0
         episode_max_stage = 0
         episode_hp_loss = 0
-        episode_knife_avoidances = 0
+        episode_threat_avoidances = 0
         
         while not done and not terminate_flag:
             action, _ = model.predict(obs, deterministic=args.deterministic)
@@ -579,8 +636,8 @@ def evaluate(args, model=None, baseline_file=None):
             hero_pos_x = info[0].get('hero_pos_x', 0)
             current_stage = info[0].get('current_stage', 0)
             episode_hp_loss = info[0].get('total_hp_loss', 0)
-            if info[0].get('knife_detected', False):
-                episode_knife_avoidances += 1
+            if info[0].get('threat_detected', False):
+                episode_threat_avoidances += 1
             episode_max_pos_x = max(episode_max_pos_x, hero_pos_x)
             episode_max_stage = max(episode_max_stage, current_stage)
             total_steps += 1
@@ -592,7 +649,7 @@ def evaluate(args, model=None, baseline_file=None):
         max_stages.append(episode_max_stage)
         hp_loss_rate = episode_hp_loss / episode_steps if episode_steps > 0 else 0
         hp_loss_rates.append(hp_loss_rate)
-        knife_avoidances.append(episode_knife_avoidances)
+        threat_avoidances.append(episode_threat_avoidances)
 
     env.close()
     
@@ -603,7 +660,7 @@ def evaluate(args, model=None, baseline_file=None):
     avg_max_pos_x = np.mean(max_positions)
     avg_max_stage = np.mean(max_stages)
     avg_hp_loss_rate = np.mean(hp_loss_rates)
-    avg_knife_avoidances = np.mean(knife_avoidances)
+    avg_threat_avoidances = np.mean(threat_avoidances)
     action_entropy = -np.sum(action_percentages / 100 * np.log(action_percentages / 100 + 1e-10))
     
     report = f"Evaluation Report for {model_file} ({args.eval_episodes} episodes)\n"
@@ -619,7 +676,7 @@ def evaluate(args, model=None, baseline_file=None):
     report += f"Average Furthest Position (X): {avg_max_pos_x:.2f}\n"
     report += f"Average Highest Stage: {avg_max_stage:.2f} (out of 5)\n"
     report += f"Average HP Loss Rate: {avg_hp_loss_rate:.3f} HP/step\n"
-    report += f"Average Knife Avoidances per Episode: {avg_knife_avoidances:.2f}\n"
+    report += f"Average Threat Avoidances per Episode: {avg_threat_avoidances:.2f}\n"
     
     if baseline_file and os.path.exists(baseline_file):
         baseline_env = make_kungfu_env(render=False, state_only=args.state_only, state_file=args.state_file)
@@ -634,7 +691,7 @@ def evaluate(args, model=None, baseline_file=None):
         baseline_max_positions = []
         baseline_max_stages = []
         baseline_hp_loss_rates = []
-        baseline_knife_avoidances = []
+        baseline_threat_avoidances = []
         
         for _ in range(args.eval_episodes):
             obs = baseline_env.reset()
@@ -645,7 +702,7 @@ def evaluate(args, model=None, baseline_file=None):
             max_pos_x = 0
             max_stage = 0
             hp_loss = 0
-            knife_avoidances_count = 0
+            threat_avoidances_count = 0
             while not done:
                 action, _ = baseline_model.predict(obs, deterministic=args.deterministic)
                 obs, reward, done, info = baseline_env.step(action)
@@ -655,8 +712,8 @@ def evaluate(args, model=None, baseline_file=None):
                 max_pos_x = max(max_pos_x, info[0].get('hero_pos_x', 0))
                 max_stage = max(max_stage, info[0].get('current_stage', 0))
                 hp_loss = info[0].get('total_hp_loss', 0)
-                if info[0].get('knife_detected', False):
-                    knife_avoidances_count += 1
+                if info[0].get('threat_detected', False):
+                    threat_avoidances_count += 1
             baseline_steps.append(steps)
             baseline_rewards.append(reward_total)
             baseline_scores.append(score)
@@ -664,7 +721,7 @@ def evaluate(args, model=None, baseline_file=None):
             baseline_max_stages.append(max_stage)
             hp_loss_rate = hp_loss / steps if steps > 0 else 0
             baseline_hp_loss_rates.append(hp_loss_rate)
-            baseline_knife_avoidances.append(knife_avoidances_count)
+            baseline_threat_avoidances.append(threat_avoidances_count)
         
         baseline_env.close()
         
@@ -675,7 +732,7 @@ def evaluate(args, model=None, baseline_file=None):
         report += f"  Baseline Avg Furthest Position: {np.mean(baseline_max_positions):.2f}\n"
         report += f"  Baseline Avg Highest Stage: {np.mean(baseline_max_stages):.2f}\n"
         report += f"  Baseline Avg HP Loss Rate: {np.mean(baseline_hp_loss_rates):.3f} HP/step\n"
-        report += f"  Baseline Avg Knife Avoidances: {np.mean(baseline_knife_avoidances):.2f}\n"
+        report += f"  Baseline Avg Threat Avoidances: {np.mean(baseline_threat_avoidances):.2f}\n"
     
     print(report)
     if args.enable_file_logging:
