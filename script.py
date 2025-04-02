@@ -160,7 +160,8 @@ class KungFuRewardWrapper(Wrapper):
         self.pattern_steps = 0
         self.last_projectile_distance = None
         self.projectile_approach_time = 0
-        self.approach_step_count = 0
+        self.steps_since_last_dodge = 0
+        self.successful_dodge_count = 0
         
         # Load projectile template
         self.threat_object_template = cv2.imread(threat_object_template_path, cv2.IMREAD_GRAYSCALE)
@@ -186,9 +187,10 @@ class KungFuRewardWrapper(Wrapper):
         # Enhanced tracking for enemy behavior
         self.last_ranged_enemy_x = 0
         self.ranged_enemy_seen_time = 0
-        self.ranged_enemy_projectile_pattern = []
-        self.safe_approach_attempts = 0
-        self.successful_approaches = 0
+        self.distance_to_enemy = float('inf')
+        self.dodge_success_streak = 0
+        self.small_moves_after_dodge = 0
+        self.attack_only_when_close = 0
 
     def reset(self, **kwargs):
         obs = super().reset(**kwargs)
@@ -211,12 +213,14 @@ class KungFuRewardWrapper(Wrapper):
         self.pattern_steps = 0
         self.last_projectile_distance = None
         self.projectile_approach_time = 0
-        self.approach_step_count = 0
+        self.steps_since_last_dodge = 0
+        self.successful_dodge_count = 0
         self.last_ranged_enemy_x = 0
         self.ranged_enemy_seen_time = 0
-        self.ranged_enemy_projectile_pattern = []
-        self.safe_approach_attempts = 0
-        self.successful_approaches = 0
+        self.distance_to_enemy = float('inf')
+        self.dodge_success_streak = 0
+        self.small_moves_after_dodge = 0
+        self.attack_only_when_close = 0
         return obs
 
     def _detect_threats(self, frame):
@@ -253,11 +257,6 @@ class KungFuRewardWrapper(Wrapper):
             center_x = x + width // 2
             center_y = y + height // 2
             threats.append(('projectile', center_x, center_y, width, height))
-            # Track projectile patterns related to ranged enemies
-            if any(t[0] == 'ranged_enemy' for t in threats):
-                self.ranged_enemy_projectile_pattern.append((center_x, center_y))
-                if len(self.ranged_enemy_projectile_pattern) > 10:
-                    self.ranged_enemy_projectile_pattern.pop(0)
             break
         
         return threats
@@ -300,141 +299,82 @@ class KungFuRewardWrapper(Wrapper):
         else:
             reward += 10
 
+        # Update step counters
+        self.steps_since_last_dodge += 1
+        
         threats = self._detect_threats(raw_frame)
         
         # Distance thresholds
         PROJECTILE_DISTANCE_THRESHOLD = 30
         RANGED_ENEMY_DISTANCE_THRESHOLD = 50
-        SAFE_APPROACH_DISTANCE = 35
+        VERY_CLOSE_ATTACK_THRESHOLD = 20  # Only attack when very close
         
-        # Enhanced reward values for better defense and approach strategy
-        DODGE_REWARD = 15000
-        STAND_REWARD = 1000
-        MOVE_REWARD = 1500
-        APPROACH_REWARD = 3000
-        ATTACK_REWARD = 2000
-        SUCCESSFUL_KILL_REWARD = 5000
-        NON_DODGE_PENALTY = -2000
-        PROJECTILE_HIT_PENALTY = -3000
-        DUCK_ATTEMPT_REWARD = 200
-        JUMP_ATTEMPT_REWARD = 200
-        WRONG_ACTION_PENALTY = -1500
-        CAUTIOUS_APPROACH_REWARD = 2500
+        # Enhanced reward values with extreme focus on defensive actions
+        DODGE_REWARD = 20000           # Increased dodge reward
+        SMALL_MOVE_REWARD = 2000       # Reward for small movements after dodge
+        PATIENT_WAITING_REWARD = 500   # Reward for patient waiting
+        ATTACK_REWARD = 3000           # Keep attack reward high but only allow when very close
+        CONSECUTIVE_DODGE_BONUS = 5000 # Bonus for consecutive successful dodges
+        NON_DODGE_PENALTY = -3000      # Severe penalty for wrong actions
+        ATTACK_TOO_SOON_PENALTY = -2500 # Penalty for attacking before getting close enough
+        PROJECTILE_HIT_PENALTY = -5000 # Severe penalty for getting hit
         
         threat_detected = bool(threats)
         ranged_enemy_detected = any(t[0] == 'ranged_enemy' for t in threats)
         projectile_detected = any(t[0] == 'projectile' for t in threats)
-
-        if not ranged_enemy_detected:
-            self.ranged_enemy_seen_time = max(0, self.ranged_enemy_seen_time - 1)
+        
+        # Remember previous state for transition logic
+        previous_state = self.pattern_state
 
         if threat_detected:
             self.threat_object_detections += 1
             self.threat_object_action_counts[action] += 1
 
-            # Process threats with priority on ranged enemies first
+            # Extract threat positions
             ranged_enemy_x, ranged_enemy_y = 0, 0
             projectile_x, projectile_y = 0, 0
             
-            # Extract threat positions
             for threat_type, threat_x, threat_y, width, height in threats:
                 if threat_type == 'ranged_enemy':
                     ranged_enemy_x, ranged_enemy_y = threat_x, threat_y
                 elif threat_type == 'projectile':
                     projectile_x, projectile_y = threat_x, threat_y
             
-            # Handle ranged enemy detection first - this is our primary target
+            # Update enemy distance tracking when detected
             if ranged_enemy_detected:
-                distance_to_enemy = abs(hero_pos_x - ranged_enemy_x)
+                self.distance_to_enemy = abs(hero_pos_x - ranged_enemy_x)
+            else:
+                self.distance_to_enemy = float('inf')
+            
+            # CRITICAL CHANGE: As soon as a ranged enemy is detected, go into defensive mode
+            if ranged_enemy_detected and self.pattern_state == "IDLE":
+                self.pattern_state = "DEFENSIVE_WAITING"
+                self.pattern_steps = 0
+            
+            # DEFENSIVE_WAITING: Primary state when ranged enemy is present but no projectile yet
+            if self.pattern_state == "DEFENSIVE_WAITING":
+                self.pattern_steps += 1
                 
-                # If we're not in a dodging state and ranged enemy is detected
-                if self.pattern_state != "DODGING" and self.pattern_state != "APPROACHING":
-                    if distance_to_enemy > RANGED_ENEMY_DISTANCE_THRESHOLD:
-                        # Enter defense mode when seeing ranged enemy at a distance
-                        self.pattern_state = "DEFENSE_MODE"
-                        self.pattern_steps = 0
-                    else:
-                        # When close enough, move to attack mode
-                        self.pattern_state = "ATTACKING"
-                        self.pattern_steps = 0
-                
-                # Handle defense mode - watchful waiting for projectiles while preparing for approach
-                if self.pattern_state == "DEFENSE_MODE":
-                    self.pattern_steps += 1
+                # If projectile appears, switch to dodging immediately
+                if projectile_detected:
+                    self.pattern_state = "DODGING"
+                    self.pattern_steps = 0
+                else:
+                    # Reward for patient waiting in defensive stance
+                    if action in [0, 9, 10]:  # Stand, duck, or jump (defensive postures)
+                        reward += PATIENT_WAITING_REWARD
+                    # Heavily penalize attack actions during defensive waiting
+                    elif action in [3, 4, 5, 6, 7, 8]:  # Attack actions
+                        reward += ATTACK_TOO_SOON_PENALTY
                     
-                    # If projectile detected, switch to dodging
-                    if projectile_detected:
-                        self.pattern_state = "DODGING"
-                        self.pattern_steps = 0
-                    # Otherwise, prepare for approach
-                    elif self.pattern_steps > 20 and not projectile_detected:
-                        self.pattern_state = "APPROACHING"
-                        self.pattern_steps = 0
-                        self.approach_step_count = 0
-                    # Reward defensive posture during defense mode
-                    elif action in [0, 9, 10]:  # Standing, ducking, jumping
-                        reward += STAND_REWARD * 0.5
-                
-                # Handle approaching the ranged enemy
-                elif self.pattern_state == "APPROACHING":
-                    self.pattern_steps += 1
-                    self.approach_step_count += 1
-                    
-                    # If projectile appears while approaching, dodge first
-                    if projectile_detected:
-                        self.pattern_state = "DODGING"
-                        self.pattern_steps = 0
-                    else:
-                        # Cautious approach - move toward enemy
+                    # Only move very slightly toward enemy if we've been waiting patiently
+                    if self.pattern_steps > 20 and not projectile_detected:
                         hero_direction = 1 if hero_pos_x < ranged_enemy_x else 2
                         if action == hero_direction:  # Moving toward enemy
-                            reward += APPROACH_REWARD
-                            
-                            # If close enough, switch to attack mode
-                            if distance_to_enemy <= SAFE_APPROACH_DISTANCE:
-                                self.pattern_state = "ATTACKING"
-                                self.pattern_steps = 0
-                                self.successful_approaches += 1
-                                reward += CAUTIOUS_APPROACH_REWARD
-                        
-                        # Special handling for cautious approach
-                        if self.approach_step_count % 3 == 0:
-                            if action in [9, 10]:  # Occasional defensive moves during approach
-                                reward += DUCK_ATTEMPT_REWARD
-                        
-                        # Reset approach if taking too long
-                        if self.pattern_steps > 30:
-                            self.pattern_state = "DEFENSE_MODE"
-                            self.pattern_steps = 0
-                
-                # Handle attacking the ranged enemy
-                elif self.pattern_state == "ATTACKING":
-                    self.pattern_steps += 1
-                    
-                    # If projectile appears while attacking, dodge first
-                    if projectile_detected:
-                        self.pattern_state = "DODGING"
-                        self.pattern_steps = 0
-                    elif distance_to_enemy <= RANGED_ENEMY_DISTANCE_THRESHOLD * 0.7:
-                        # Reward attack actions when close to enemy
-                        if action in [3, 4, 5, 6, 7, 8]:  # Attack actions
-                            reward += ATTACK_REWARD
-                            
-                            # Higher reward for defeating enemy
-                            if score_delta > 100:
-                                reward += SUCCESSFUL_KILL_REWARD
-                                self.pattern_state = "IDLE"
-                        
-                        # Reset if taking too long to attack
-                        if self.pattern_steps > 20:
-                            self.pattern_state = "DEFENSE_MODE"
-                            self.pattern_steps = 0
-                    else:
-                        # If enemy moved away, approach again
-                        self.pattern_state = "APPROACHING"
-                        self.pattern_steps = 0
+                            reward += SMALL_MOVE_REWARD * 0.5
+                            self.pattern_steps = 10  # Reset but not fully
             
-            # Handle projectile detection and dodging
+            # Handle projectile detection - highest priority state
             if projectile_detected:
                 distance_to_projectile = abs(hero_pos_x - projectile_x)
                 
@@ -444,82 +384,128 @@ class KungFuRewardWrapper(Wrapper):
                     self.projectile_approach_time = 0
                 self.last_projectile_distance = distance_to_projectile
 
-                # When projectile detected, prioritize dodging
+                # When projectile detected, immediately prioritize dodging
                 if distance_to_projectile < PROJECTILE_DISTANCE_THRESHOLD * 1.5 and self.pattern_state != "DODGING":
                     self.pattern_state = "DODGING"
                     self.pattern_steps = 0
 
                 if self.pattern_state == "DODGING":
                     self.pattern_steps += 1
+                    
                     if distance_to_projectile < PROJECTILE_DISTANCE_THRESHOLD:
-                        # Reward ducking for low projectiles
+                        # Successful dodge with appropriate action
+                        dodge_successful = False
+                        
+                        # Duck for low projectiles
                         if action == 9 and projectile_y > 112 and 2 <= self.projectile_approach_time <= 25:
-                            reward += DODGE_REWARD
-                            self.projectile_dodge_count += 1
-                            self.pattern_state = "STANDING"
-                            self.pattern_steps = 0
-                        # Reward jumping for high projectiles
+                            dodge_successful = True
+                        # Jump for high projectiles
                         elif action == 10 and projectile_y < 112 and 2 <= self.projectile_approach_time <= 25:
+                            dodge_successful = True
+                            
+                        if dodge_successful:
                             reward += DODGE_REWARD
                             self.projectile_dodge_count += 1
-                            self.pattern_state = "STANDING"
+                            self.steps_since_last_dodge = 0
+                            self.successful_dodge_count += 1
+                            self.dodge_success_streak += 1
+                            
+                            # Extra reward for consecutive successful dodges
+                            if self.dodge_success_streak > 1:
+                                reward += CONSECUTIVE_DODGE_BONUS * min(self.dodge_success_streak, 5)
+                                
+                            # After successful dodge, move to small movement phase
+                            self.pattern_state = "SMALL_MOVEMENT"
                             self.pattern_steps = 0
-                        # Penalize attack actions during dodging
-                        elif action in [3, 4, 5, 6, 7, 8]:
-                            reward += WRONG_ACTION_PENALTY
-                            if hp_loss > 0:
-                                reward += PROJECTILE_HIT_PENALTY * 2
-                                self.projectile_hit_count += 1
+                            self.small_moves_after_dodge = 0
                         else:
-                            reward += NON_DODGE_PENALTY
+                            # Severe penalties for wrong actions during dodge
+                            if action in [3, 4, 5, 6, 7, 8]:  # Attack actions are absolutely wrong when dodging
+                                reward += NON_DODGE_PENALTY * 2
+                                self.dodge_success_streak = 0
+                            else:
+                                reward += NON_DODGE_PENALTY
+                                self.dodge_success_streak = 0
+                            
                             if hp_loss > 0:
                                 reward += PROJECTILE_HIT_PENALTY
                                 self.projectile_hit_count += 1
-                                
-                        # Small rewards for defensive attempts
-                        if action == 9:  # Duck attempt
-                            reward += DUCK_ATTEMPT_REWARD
-                        elif action == 10:  # Jump attempt
-                            reward += JUMP_ATTEMPT_REWARD
-                            
+                                self.dodge_success_streak = 0
+                    
+                    # If projectile is gone or we've been in dodge state too long
                     elif self.pattern_steps > 25 or not projectile_detected:
-                        # Return to previous state or defense mode if enemy is still present
+                        # Return to defensive waiting if enemy still present
                         if ranged_enemy_detected:
-                            self.pattern_state = "DEFENSE_MODE"
+                            self.pattern_state = "DEFENSIVE_WAITING"
                         else:
                             self.pattern_state = "IDLE"
                         self.pattern_steps = 0
-
-                elif self.pattern_state == "STANDING":
-                    self.pattern_steps += 1
-                    if action == 0:  # Stand still briefly after dodge
-                        reward += STAND_REWARD
-                        # After standing, determine next state based on enemy presence
-                        if ranged_enemy_detected:
-                            self.pattern_state = "DEFENSE_MODE"
-                        else:
-                            self.pattern_state = "MOVING"
+            
+            # SMALL_MOVEMENT: State after successful dodge to move slightly toward enemy
+            elif self.pattern_state == "SMALL_MOVEMENT":
+                self.pattern_steps += 1
+                self.small_moves_after_dodge += 1
+                
+                # If projectile appears during movement, dodge takes priority
+                if projectile_detected:
+                    self.pattern_state = "DODGING"
+                    self.pattern_steps = 0
+                else:
+                    # Reward small movements toward enemy
+                    hero_direction = 1 if hero_pos_x < ranged_enemy_x else 2
+                    if action == hero_direction:  # Moving toward enemy
+                        reward += SMALL_MOVE_REWARD
+                        
+                        # If we've moved close enough, consider attacking
+                        if self.distance_to_enemy <= VERY_CLOSE_ATTACK_THRESHOLD:
+                            self.pattern_state = "ATTACK_OPPORTUNITY"
+                            self.pattern_steps = 0
+                    
+                    # Only allow a few steps of movement
+                    if self.small_moves_after_dodge >= 3 or self.pattern_steps > 10:
+                        # Return to defensive waiting
+                        self.pattern_state = "DEFENSIVE_WAITING"
                         self.pattern_steps = 0
-                    elif self.pattern_steps > 10:
-                        if ranged_enemy_detected:
-                            self.pattern_state = "DEFENSE_MODE"
-                        else:
-                            self.pattern_state = "IDLE"
+            
+            # ATTACK_OPPORTUNITY: Only when very close to enemy after successful approaches
+            elif self.pattern_state == "ATTACK_OPPORTUNITY":
+                self.pattern_steps += 1
+                
+                # If projectile appears, dodge takes priority over attacking
+                if projectile_detected:
+                    self.pattern_state = "DODGING"
+                    self.pattern_steps = 0
+                else:
+                    # Only reward attacks when very close
+                    if self.distance_to_enemy <= VERY_CLOSE_ATTACK_THRESHOLD:
+                        if action in [3, 4, 5, 6, 7, 8]:  # Attack actions
+                            reward += ATTACK_REWARD
+                            self.attack_only_when_close += 1
+                            
+                            # If score increased, we probably defeated the enemy
+                            if score_delta > 100:
+                                reward += ATTACK_REWARD * 3
+                                self.pattern_state = "IDLE"
+                                self.pattern_steps = 0
+                    else:
+                        # If enemy moved away, go back to defensive waiting
+                        self.pattern_state = "DEFENSIVE_WAITING"
                         self.pattern_steps = 0
-
-        # Reset to IDLE if no threats and not in an active state
-        if not threat_detected and self.pattern_state not in ["IDLE", "MOVING"] and self.pattern_steps > 20:
+                        
+                    # Only brief attack opportunity
+                    if self.pattern_steps > 8:
+                        self.pattern_state = "DEFENSIVE_WAITING"
+                        self.pattern_steps = 0
+        
+        # If no threats and we've been in a state for too long, return to IDLE
+        if not threat_detected and self.pattern_state != "IDLE" and self.pattern_steps > 20:
             self.pattern_state = "IDLE"
             self.pattern_steps = 0
         
-        # Handle general movement when no threats
-        if self.pattern_state == "MOVING":
-            self.pattern_steps += 1
-            if action in [1, 2]:  # Moving left or right
-                reward += MOVE_REWARD
-            if self.pattern_steps > 15:
-                self.pattern_state = "IDLE"
-                self.pattern_steps = 0
+        # Dramatically discourage attacks when not extremely close to enemy
+        if ranged_enemy_detected and self.distance_to_enemy > VERY_CLOSE_ATTACK_THRESHOLD:
+            if action in [3, 4, 5, 6, 7, 8]:  # Attack actions
+                reward += ATTACK_TOO_SOON_PENALTY
 
         self.last_hero_pos_x = hero_pos_x
         self.last_score = current_score
@@ -533,20 +519,22 @@ class KungFuRewardWrapper(Wrapper):
         info['current_stage'] = current_stage
         info['hp'] = current_hp
         info['total_hp_loss'] = self.total_hp_loss
+        info['pattern_state'] = self.pattern_state
+        info['previous_state'] = previous_state
         info['threat_detected'] = threat_detected
         info['projectile_detected'] = projectile_detected
         info['ranged_enemy_detected'] = ranged_enemy_detected
+        info['distance_to_enemy'] = self.distance_to_enemy
         info['threat_object_detections'] = self.threat_object_detections
         info['ranged_enemy_detections'] = self.ranged_enemy_detections
         info['projectile_dodge_count'] = self.projectile_dodge_count
         info['projectile_hit_count'] = self.projectile_hit_count
-        info['threat_object_action_counts'] = self.threat_object_action_counts.copy()
-        info['pattern_state'] = self.pattern_state
-        info['successful_approaches'] = self.successful_approaches
-        info['ranged_enemy_seen_time'] = self.ranged_enemy_seen_time
+        info['dodge_success_streak'] = self.dodge_success_streak
+        info['steps_since_last_dodge'] = self.steps_since_last_dodge
+        info['attack_only_when_close'] = self.attack_only_when_close
 
         return obs, reward, done, info
-     
+      
 def make_kungfu_env(render=False, seed=None, state_only=False, state_file="custom_state.state"):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
