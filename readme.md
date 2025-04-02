@@ -1,4 +1,4 @@
-python script.py --train --num_envs 4 --cuda --progress_bar --resume --timesteps 10000
+python script.py --train --num_envs 8 --cuda --progress_bar --resume --timesteps 10000
 
 
 python script.py --train --render --enable_file_logging --num_envs 1 --resume
