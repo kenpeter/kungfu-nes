@@ -239,14 +239,15 @@ def train(args):
         policy=TransformerPolicy,
         env=env,
         learning_rate=args.learning_rate,
-        n_steps=2048,
+        n_steps=8192,
         batch_size=64,
         n_epochs=args.n_epochs,
         gamma=args.gamma,
         clip_range=args.clip_range,
         ent_coef=0.01,
         verbose=1,
-        device=device
+        device=device,
+        tensorboard_log=args.log_dir
     )
 
     if os.path.exists(model_file) and args.resume:
@@ -348,10 +349,10 @@ if __name__ == "__main__":
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
     parser.add_argument("--eval_episodes", type=int, default=5, help="Number of eval episodes")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--clip_range", type=float, default=0.2, help="PPO clip range")
+    parser.add_argument("--clip_range", type=float, default=0.1, help="PPO clip range")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
 
     args = parser.parse_args()
