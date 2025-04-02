@@ -1,35 +1,34 @@
 import argparse
 import retro
 import numpy as np
-import keyboard  # Install with `pip install keyboard`
+from pynput import keyboard
 import time
 import logging
-from gym import ActionWrapper  # For wrapping the environment
-import gym.spaces  # For defining action spaces
+from gym import ActionWrapper
+import gym.spaces
 
-# Configure basic logging to console
+# Configure basic logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# Custom action wrapper to map discrete actions to Kung Fu Master controls
 class KungFuDiscreteWrapper(ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.action_space = gym.spaces.Discrete(11)  # Define discrete action space with 11 actions
+        self.action_space = gym.spaces.Discrete(11)
         self._actions = [
             [0,0,0,0,0,0,0,0,0,0,0,0],  # 0: No action
             [0,0,0,0,0,0,1,0,0,0,0,0],  # 1: Left
             [0,0,0,0,0,0,0,0,1,0,0,0],  # 2: Right
-            [1,0,0,0,0,0,0,0,0,0,0,0],  # 3: Kick (B)
-            [0,1,0,0,0,0,0,0,0,0,0,0],  # 4: Punch (A)
+            [1,0,0,0,0,0,0,0,0,0,0,0],  # 3: Kick
+            [0,1,0,0,0,0,0,0,0,0,0,0],  # 4: Punch
             [1,0,0,0,0,0,1,0,0,0,0,0],  # 5: Kick+Left
             [1,0,0,0,0,0,0,0,1,0,0,0],  # 6: Kick+Right
             [0,1,0,0,0,0,1,0,0,0,0,0],  # 7: Punch+Left
             [0,1,0,0,0,0,0,0,1,0,0,0],  # 8: Punch+Right
-            [0,0,0,0,0,1,0,0,0,0,0,0],  # 9: Down (Duck)
-            [0,0,1,0,0,0,0,0,0,0,0,0]   # 10: Up (Jump)
+            [0,0,0,0,0,1,0,0,0,0,0,0],  # 9: Duck
+            [0,0,1,0,0,0,0,0,0,0,0,0]   # 10: Jump
         ]
         self.action_names = [
             "No action", "Left", "Right", "Kick", "Punch",
@@ -42,7 +41,6 @@ class KungFuDiscreteWrapper(ActionWrapper):
             action = int(action.item() if isinstance(action, np.ndarray) else action[0])
         return self._actions[action]
 
-# Function to set up the Retro environment with the action wrapper
 def make_kungfu_env(render=True):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
@@ -50,20 +48,58 @@ def make_kungfu_env(render=True):
         env.render_mode = 'human'
     return env
 
-# Main function to capture the game state
 def capture_state(args):
-    # Enable file logging if requested
     if args.enable_file_logging:
         logging.getLogger().addHandler(logging.FileHandler('capture.log'))
     
-    # Set up the environment
     env = make_kungfu_env(render=True)
     obs = env.reset()
     done = False
     steps = 0
-    frame_time = 1 / 60  # Target 60 FPS
+    frame_time = 1/60
 
-    # Display controls to the user
+    # Key tracking variables
+    current_keys = set()
+    save_requested = False
+    quit_requested = False
+
+    def on_press(key):
+        nonlocal save_requested, quit_requested
+        try:
+            k = key.char.lower()
+            if k == 's':
+                save_requested = True
+            elif k == 'q':
+                quit_requested = True
+            else:
+                current_keys.add(k)
+        except AttributeError:
+            if key == keyboard.Key.left:
+                current_keys.add('left')
+            elif key == keyboard.Key.right:
+                current_keys.add('right')
+            elif key == keyboard.Key.up:
+                current_keys.add('up')
+            elif key == keyboard.Key.down:
+                current_keys.add('down')
+
+    def on_release(key):
+        try:
+            k = key.char.lower()
+            current_keys.discard(k)
+        except AttributeError:
+            if key == keyboard.Key.left:
+                current_keys.discard('left')
+            elif key == keyboard.Key.right:
+                current_keys.discard('right')
+            elif key == keyboard.Key.up:
+                current_keys.discard('up')
+            elif key == keyboard.Key.down:
+                current_keys.discard('down')
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+
     print("Controls: Left/Right Arrows, Z (Punch), X (Kick), Up (Jump), Down (Duck)")
     print(f"Press 'S' to save state to '{args.state_file}', 'Q' to quit.")
 
@@ -73,68 +109,49 @@ def capture_state(args):
             env.render()
             steps += 1
 
-            # Default action is "No action"
+            # Determine action
             action = 0
-
-            # Map keyboard inputs to actions
-            if keyboard.is_pressed('left'):
+            if 'left' in current_keys or 'a' in current_keys:
                 action = 1
-                print("Left pressed!")
-            elif keyboard.is_pressed('right'):
+            elif 'right' in current_keys or 'd' in current_keys:
                 action = 2
-                print("Right pressed!")
-            elif keyboard.is_pressed('z'):
-                action = 4
-                print("Z pressed!")
-            elif keyboard.is_pressed('x'):
-                action = 3
-                print("X pressed!")
-            elif keyboard.is_pressed('up'):
+            if 'x' in current_keys:
+                action = 3 if action == 0 else action + 2
+            elif 'z' in current_keys:
+                action = 4 if action == 0 else action + 4
+            if 'up' in current_keys:
                 action = 10
-                print("Up pressed!")
-            elif keyboard.is_pressed('down'):
+            elif 'down' in current_keys:
                 action = 9
-                print("Down pressed!")
 
-            # Step the environment with the selected action
             obs, reward, done, info = env.step(action)
             logging.info(f"Step {steps}: Action={env.action_names[action]}")
 
-            # Save state when 'S' is pressed
-            if keyboard.is_pressed('s'):
+            # Handle save/quit requests
+            if save_requested:
                 with open(args.state_file, "wb") as f:
                     f.write(env.unwrapped.get_state())
                 print(f"State saved to '{args.state_file}' at step {steps}")
-                logging.info(f"State saved to '{args.state_file}' at step {steps}")
-
-            # Quit when 'Q' is pressed
-            if keyboard.is_pressed('q'):
+                save_requested = False
+                
+            if quit_requested:
                 print("Quitting...")
                 break
 
             # Maintain frame rate
-            elapsed_time = time.time() - start_time
-            time.sleep(max(0, frame_time - elapsed_time))
+            elapsed = time.time() - start_time
+            time.sleep(max(0, frame_time - elapsed))
 
     except Exception as e:
-        print(f"Error during capture: {str(e)}")
-        logging.error(f"Error during capture: {str(e)}")
+        print(f"Error: {str(e)}")
+        logging.error(f"Error: {str(e)}")
     finally:
+        listener.stop()
         env.close()
 
 if __name__ == "__main__":
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Manually play KungFu Master and capture a state")
-    parser.add_argument(
-        "--state_file",
-        default="custom_state.state",
-        help="File to save the captured state"
-    )
-    parser.add_argument(
-        "--enable_file_logging",
-        action="store_true",
-        help="Enable logging to file 'capture.log'"
-    )
-
+    parser = argparse.ArgumentParser(description="KungFu Master State Capture")
+    parser.add_argument("--state_file", default="custom_state.state", help="Save file path")
+    parser.add_argument("--enable_file_logging", action="store_true", help="Enable file logging")
     args = parser.parse_args()
     capture_state(args)

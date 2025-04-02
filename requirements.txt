@@ -1,10 +1,16 @@
+# Your existing versions
 gym==0.21.0
 stable-baselines3==1.8.0
 gym-retro==0.7.1
-pyglet==1.5.27
+pyglet==1.5.27  # Used by gym for rendering
 numpy==1.21.6
-opencv-python==4.5.5.64
+opencv-python==4.5.5.64  # cv2
 tensorboard==2.8.0
 torch==1.13.1
 tqdm==4.66.2
 protobuf==3.20.0
+
+# Additional required dependencies (based on your script)
+pillow==9.5.0  # For PIL, compatible with your setup
+keyboard==0.13.5  # For keyboard input in capture mode
+psutil==5.9.4  # Optional, for system monitoring in stable-baselines3

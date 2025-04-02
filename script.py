@@ -56,7 +56,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 class VisionTransformer(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):
+    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=8, patch_size=7):
         super(VisionTransformer, self).__init__(observation_space, features_dim=embed_dim)
         self.img_size = observation_space.shape[1]
         self.in_channels = observation_space.shape[0]
@@ -97,7 +97,7 @@ class TransformerPolicy(ActorCriticPolicy):
             action_space,
             lr_schedule,
             features_extractor_class=VisionTransformer,
-            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=6, patch_size=14),
+            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=8, patch_size=7),
             **kwargs
         )
 
@@ -305,17 +305,18 @@ class KungFuRewardWrapper(Wrapper):
         # Constants
         PROJECTILE_DISTANCE_THRESHOLD = 30
         RANGED_ENEMY_DISTANCE_THRESHOLD = 50
-        VERY_CLOSE_ATTACK_THRESHOLD = 20
+        VERY_CLOSE_ATTACK_THRESHOLD = 15  # Reduced from 20
         
         # Enhanced reward values
-        DODGE_REWARD = 25000           # High reward for dodging
-        SMALL_MOVE_REWARD = 3000       # Reward for small movements after dodge
-        PATIENT_WAITING_REWARD = 1000  # Reward for waiting patiently
-        ATTACK_REWARD = 5000           # High reward for attack when very close
-        CONSECUTIVE_DODGE_BONUS = 10000 # Bonus for consecutive dodges
-        NON_DODGE_PENALTY = -5000      # Severe penalty for wrong actions during dodge
-        ATTACK_TOO_SOON_PENALTY = -10000 # Severe penalty for attacking too soon
-        PROJECTILE_HIT_PENALTY = -15000 # Severe penalty for getting hit
+        DODGE_REWARD = 50000           # Increased from 25000
+        SMALL_MOVE_REWARD = 3000
+        PATIENT_WAITING_REWARD = 1000
+        ATTACK_REWARD = 5000
+        CONSECUTIVE_DODGE_BONUS = 10000
+        NON_DODGE_PENALTY = -10000
+        ATTACK_TOO_SOON_PENALTY = -20000  # Increased from -10000
+        PROJECTILE_HIT_PENALTY = -30000   # Increased from -15000
+        DEFENSIVE_ACTION_BONUS = 1000     # New bonus for using Duck/Jump
         
         threat_detected = bool(threats)
         ranged_enemy_detected = any(t[0] == 'ranged_enemy' for t in threats)
@@ -395,23 +396,23 @@ class KungFuRewardWrapper(Wrapper):
                             self.successful_dodge_count += 1
                             self.dodge_success_streak += 1
                             if self.dodge_success_streak > 1:
-                                reward += CONSECUTIVE_DODGE_BONUS * min(self.dodge_success_streak, 5)
+                                reward += CONSECUTIVE_DODGE_BONUS * min(self.dodge_success_streak, 10)  # Increased cap to 10
                             self.pattern_state = "SMALL_MOVEMENT"
                             self.pattern_steps = 0
                             self.small_moves_after_dodge = 0
                         else:
                             if action in [3, 4, 5, 6, 7, 8]:
-                                reward += NON_DODGE_PENALTY * 2
+                                reward += NON_DODGE_PENALTY * 2  # -20000
                                 logging.info(f"Penalty: Attacking during DODGING")
                             else:
-                                reward += NON_DODGE_PENALTY
+                                reward += NON_DODGE_PENALTY * 2.5  # -25000 for any non-dodge action
                             self.dodge_success_streak = 0
                             if hp_loss > 0:
                                 reward += PROJECTILE_HIT_PENALTY
                                 self.projectile_hit_count += 1
                                 self.dodge_success_streak = 0
                     
-                    elif self.pattern_steps > 25 or not projectile_detected:
+                    elif self.pattern_steps > 50 or not projectile_detected:  # Increased from 25 to 50
                         if ranged_enemy_detected:
                             self.pattern_state = "DEFENSIVE_WAITING"
                         else:
@@ -480,6 +481,10 @@ class KungFuRewardWrapper(Wrapper):
             if action in [3, 4, 5, 6, 7, 8]:
                 reward += ATTACK_TOO_SOON_PENALTY
                 logging.info(f"Global Penalty: Attacking too far, distance={self.distance_to_enemy}")
+
+        # Add bonus for using defensive actions when projectile is detected
+        if projectile_detected and action in [9, 10]:
+            reward += DEFENSIVE_ACTION_BONUS
 
         self.last_hero_pos_x = hero_pos_x
         self.last_score = current_score
@@ -614,14 +619,14 @@ def train(args):
     ppo_kwargs = dict(
         policy=TransformerPolicy,
         env=env,
-        learning_rate=args.learning_rate,
+        learning_rate=lambda f: 1e-3 * (1 - f) + 1e-5 * f,  # Linear schedule
         n_steps=8192,
         batch_size=64,
-        n_epochs=args.n_epochs,
+        n_epochs=5,  # Reduced from 10
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
-        clip_range=args.clip_range,
-        ent_coef=0.01,
+        clip_range=0.2,  # Increased from 0.1
+        ent_coef=0.05,  # Increased from 0.01
         tensorboard_log=args.log_dir,
         verbose=1 if args.verbose else 0,
         device=device
@@ -894,17 +899,17 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--render", action="store_true", help="Render the game")
     parser.add_argument("--resume", action="store_true", help="Resume training")
-    parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps")
+    parser.add_argument("--timesteps", type=int, default=1000000, help="Total timesteps")  # Increased from 500000
     parser.add_argument("--num_envs", type=int, default=8, help="Number of parallel envs")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
     parser.add_argument("--eval_episodes", type=int, default=1, help="Number of eval episodes")
     parser.add_argument("--episodes", type=int, default=0, help="Number of play episodes (0 = infinite)")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs")
+    parser.add_argument("--n_epochs", type=int, default=5, help="Number of epochs")  # Reduced from 10
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda")
-    parser.add_argument("--clip_range", type=float, default=0.1, help="PPO clip range")
+    parser.add_argument("--clip_range", type=float, default=0.2, help="PPO clip range")  # Increased from 0.1
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--enable_file_logging", action="store_true", help="Enable file logging")
     parser.add_argument("--verbose", action="store_true", help="Verbose PPO output")
