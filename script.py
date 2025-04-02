@@ -138,6 +138,13 @@ class KungFuRewardWrapper(Wrapper):
         self.projectile_dodge_count = 0
         self.projectile_hit_count = 0
         
+        # Pattern state tracking
+        self.pattern_state = "IDLE"  # IDLE, DODGING, STANDING, MOVING, ATTACKING
+        self.last_action = 0
+        self.pattern_steps = 0  # Steps in current pattern state
+        self.last_projectile_distance = None
+        self.projectile_approach_time = 0  # Time since projectile started approaching
+        
         # Load cropped threat_object template
         self.threat_object_template = cv2.imread(threat_object_template_path, cv2.IMREAD_GRAYSCALE)
         if self.threat_object_template is None:
@@ -174,6 +181,11 @@ class KungFuRewardWrapper(Wrapper):
         self.last_ranged_detection_time = 0
         self.projectile_dodge_count = 0
         self.projectile_hit_count = 0
+        self.pattern_state = "IDLE"
+        self.last_action = 0
+        self.pattern_steps = 0
+        self.last_projectile_distance = None
+        self.projectile_approach_time = 0
         return obs
 
     def _detect_threats(self, frame):
@@ -207,7 +219,6 @@ class KungFuRewardWrapper(Wrapper):
                 center_x = x + width // 2
                 center_y = y + height // 2
                 
-                # Only consider enemies on the right side (approaching)
                 if center_x > 112:  # Center of screen is ~112
                     threats.append(('ranged_enemy', center_x, center_y, width, height))
                     self.ranged_enemy_detections += 1
@@ -241,6 +252,7 @@ class KungFuRewardWrapper(Wrapper):
         score_delta = current_score - self.last_score if current_score >= self.last_score else (999990 - self.last_score) + current_score
         scroll_delta = current_scroll - self.last_scroll if current_scroll >= self.last_scroll else (current_scroll + 256 - self.last_scroll)
 
+        # Base rewards
         reward = 0
         if score_delta > 0:
             reward += score_delta * 5
@@ -253,14 +265,17 @@ class KungFuRewardWrapper(Wrapper):
         else:
             reward += 10
 
+        # Threat detection and pattern-based rewards
         threats = self._detect_threats(raw_frame)
-        PROJECTILE_DISTANCE_THRESHOLD = 30
+        PROJECTILE_DISTANCE_THRESHOLD = 30  # Distance where dodge is critical
         RANGED_ENEMY_DISTANCE_THRESHOLD = 50
-        AVOIDANCE_REWARD = 5000
-        APPROACH_REWARD = 2000
-        RANGED_ENEMY_KILL_REWARD = 10000
-        NON_AVOIDANCE_PENALTY = -1000
-        PROJECTILE_HIT_PENALTY = -2000
+        DODGE_REWARD = 10000  # Increased reward for well-timed dodge
+        STAND_REWARD = 1000   # Reward for standing up after dodge
+        MOVE_REWARD = 1500    # Reward for moving forward after standing
+        ATTACK_REWARD = 2000  # Reward for attacking when close
+        NON_DODGE_PENALTY = -500  # Reduced penalty for not dodging when needed
+        PROJECTILE_HIT_PENALTY = -1000  # Reduced penalty for getting hit
+        DUCK_ATTEMPT_REWARD = 100  # Small reward for attempting to duck
         
         threat_detected = bool(threats)
         ranged_enemy_detected = any(t[0] == 'ranged_enemy' for t in threats)
@@ -275,46 +290,87 @@ class KungFuRewardWrapper(Wrapper):
                 distance = abs(hero_pos_x - threat_x_game)
                 
                 if threat_type == 'projectile':
-                    # Reward for dodging projectiles
-                    if distance < PROJECTILE_DISTANCE_THRESHOLD:
-                        if action == 10 and threat_y < 112:  # Jump over low projectile
-                            reward += AVOIDANCE_REWARD
-                            self.projectile_dodge_count += 1
-                        elif action == 9 and threat_y > 112:  # Duck under high projectile
-                            reward += AVOIDANCE_REWARD
-                            self.projectile_dodge_count += 1
-                        else:
-                            reward += PROJECTILE_HIT_PENALTY
-                            self.projectile_hit_count += 1
-                    
-                    # Additional reward for moving forward after dodging
-                    if action in [2, 6, 8] and distance < PROJECTILE_DISTANCE_THRESHOLD * 2:
-                        reward += APPROACH_REWARD / 2
-                
+                    # Track projectile approach
+                    if self.last_projectile_distance is not None and distance < self.last_projectile_distance:
+                        self.projectile_approach_time += 1
+                    else:
+                        self.projectile_approach_time = 0
+                    self.last_projectile_distance = distance
+
+                    # Dodge timing logic with wider window
+                    if distance < PROJECTILE_DISTANCE_THRESHOLD and self.pattern_state != "DODGING":
+                        self.pattern_state = "DODGING"
+                        self.pattern_steps = 0
+
+                    if self.pattern_state == "DODGING":
+                        self.pattern_steps += 1
+                        if distance < PROJECTILE_DISTANCE_THRESHOLD:
+                            if action == 9 and threat_y > 112 and 3 <= self.projectile_approach_time <= 20:  # Duck under high projectile
+                                reward += DODGE_REWARD
+                                self.projectile_dodge_count += 1
+                                self.pattern_state = "STANDING"
+                                self.pattern_steps = 0
+                            elif action == 10 and threat_y < 112 and 3 <= self.projectile_approach_time <= 20:  # Jump over low projectile
+                                reward += DODGE_REWARD
+                                self.projectile_dodge_count += 1
+                                self.pattern_state = "STANDING"
+                                self.pattern_steps = 0
+                            else:
+                                reward += NON_DODGE_PENALTY
+                                if hp_loss > 0:
+                                    reward += PROJECTILE_HIT_PENALTY
+                                    self.projectile_hit_count += 1
+                            # Shaping reward for attempting to duck
+                            if action == 9 and distance < PROJECTILE_DISTANCE_THRESHOLD:
+                                reward += DUCK_ATTEMPT_REWARD
+                        elif self.pattern_steps > 20 or not projectile_detected:  # Exit DODGING if projectile gone
+                            self.pattern_state = "IDLE"
+                            self.pattern_steps = 0
+
+                    elif self.pattern_state == "STANDING":
+                        self.pattern_steps += 1
+                        if action == 0:  # Stand up (no action)
+                            reward += STAND_REWARD
+                            self.pattern_state = "MOVING"
+                            self.pattern_steps = 0
+                        elif self.pattern_steps > 10:  # Reset if too long
+                            self.pattern_state = "IDLE"
+                            self.pattern_steps = 0
+
+                    elif self.pattern_state == "MOVING":
+                        self.pattern_steps += 1
+                        if action in [2, 6, 8]:  # Move right
+                            reward += MOVE_REWARD
+                            self.pattern_state = "IDLE" if not ranged_enemy_detected else "ATTACKING"
+                            self.pattern_steps = 0
+                        elif self.pattern_steps > 10:  # Reset if too long
+                            self.pattern_state = "IDLE"
+                            self.pattern_steps = 0
+
                 elif threat_type == 'ranged_enemy':
-                    # Reward for approaching ranged enemies
-                    if distance < RANGED_ENEMY_DISTANCE_THRESHOLD:
-                        if action in [2, 6, 8]:  # Right movements
-                            reward += APPROACH_REWARD
-                        elif action in [3, 4, 5, 6, 7, 8]:  # Attack actions
-                            reward += RANGED_ENEMY_KILL_REWARD
-                    
-                    # Penalty for staying still or moving away
-                    if distance < RANGED_ENEMY_DISTANCE_THRESHOLD * 1.5 and action in [0, 1]:
-                        reward += NON_AVOIDANCE_PENALTY / 2
+                    if self.pattern_state == "ATTACKING" and distance < RANGED_ENEMY_DISTANCE_THRESHOLD:
+                        self.pattern_steps += 1
+                        if action in [3, 4, 5, 6, 7, 8]:  # Attack actions
+                            reward += ATTACK_REWARD
+                            self.pattern_state = "IDLE"
+                            self.pattern_steps = 0
+                        elif self.pattern_steps > 10:  # Reset if too long
+                            self.pattern_state = "IDLE"
+                            self.pattern_steps = 0
+                    elif distance < RANGED_ENEMY_DISTANCE_THRESHOLD * 1.5 and self.pattern_state == "IDLE":
+                        self.pattern_state = "ATTACKING"
+                        self.pattern_steps = 0
 
-                last_distance = abs(self.last_hero_pos_x - threat_x_game)
-                if distance < last_distance and threat_type == 'ranged_enemy':
-                    reward += 20  # Small reward for closing distance to ranged enemy
-
-        # Additional reward for attacking when ranged enemy was recently detected
-        if time.time() - self.last_ranged_detection_time < 2.0 and action in [3, 4, 5, 6, 7, 8]:
-            reward += APPROACH_REWARD / 2
+        # Reset pattern if no threats detected for a while
+        if not threat_detected and self.pattern_state != "IDLE" and self.pattern_steps > 20:
+            self.pattern_state = "IDLE"
+            self.pattern_steps = 0
 
         self.last_hero_pos_x = hero_pos_x
         self.last_score = current_score
         self.last_scroll = current_scroll
         self.last_stage = current_stage
+        self.last_action = action
         
         info['score'] = current_score
         info['hero_pos_x'] = hero_pos_x
@@ -329,6 +385,7 @@ class KungFuRewardWrapper(Wrapper):
         info['projectile_dodge_count'] = self.projectile_dodge_count
         info['projectile_hit_count'] = self.projectile_hit_count
         info['threat_object_action_counts'] = self.threat_object_action_counts.copy()
+        info['pattern_state'] = self.pattern_state  # For debugging
 
         return obs, reward, done, info
 
@@ -521,7 +578,7 @@ def play(args):
                 steps += 1
                 
                 action_name = env.envs[0].action_names[action[0] if isinstance(action, np.ndarray) else action]
-                print(f"Step {steps}: Action={action_name}, Reward={reward}, HP={info[0]['hp']}, Score={info[0]['score']}")
+                print(f"Step {steps}: Action={action_name}, Reward={reward}, HP={info[0]['hp']}, Score={info[0]['score']}, Pattern={info[0]['pattern_state']}")
                 
                 if info[0]['projectile_detected']:
                     print(f"PROJECTILE DETECTED! Action taken: {action_name}")
@@ -602,7 +659,6 @@ def capture(args):
             
             if keyboard.is_pressed('e'):
                 frame = env.envs[0].unwrapped.get_screen()
-                # Capture the ranged enemy (usually on the right side)
                 enemy_x, enemy_y = 180, 128  # Adjust based on enemy position
                 enemy_w, enemy_h = 16, 16
                 enemy_region = frame[enemy_y-enemy_h//2:enemy_y+enemy_h//2, enemy_x-enemy_w//2:enemy_x+enemy_w//2]
@@ -750,6 +806,18 @@ def evaluate(args, model=None, baseline_file=None):
     if args.enable_file_logging:
         with open(os.path.join(args.log_dir, 'evaluation_report.txt'), 'w') as f:
             f.write(report)
+
+# Define StateLoaderWrapper since it was missing
+class StateLoaderWrapper(Wrapper):
+    def __init__(self, env, state_file):
+        super().__init__(env)
+        self.state_file = state_file
+
+    def reset(self, **kwargs):
+        obs = super().reset(**kwargs)
+        with open(self.state_file, "rb") as f:
+            self.env.unwrapped.load_state(f.read())
+        return self.env.get_screen()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train, play, capture, or evaluate KungFu Master using PPO with Vision Transformer")
