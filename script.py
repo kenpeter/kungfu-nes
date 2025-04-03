@@ -14,35 +14,58 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, Subproc
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.logger import configure
 from tqdm import tqdm
 from gym import spaces, Wrapper
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 global_model = None
 global_model_path = None
 terminate_flag = False
 subproc_envs = None
 
+def setup_logging(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Configure SB3 logger to only use TensorBoard and log file
+    sb3_logger = configure(log_dir, ["tensorboard", "log"])
+    
+    # Create our main logger with just file output
+    logger = logging.getLogger('kungfu_ppo')
+    logger.setLevel(logging.INFO)
+    
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    
+    log_path = os.path.join(log_dir, "training.log")
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    return logger, sb3_logger
+
 def cleanup():
     global subproc_envs
+    logger = logging.getLogger('kungfu_ppo')
     if subproc_envs is not None:
         try:
             subproc_envs.close()
         except Exception as e:
-            logging.warning(f"Error closing subproc_envs: {e}")
+            logger.warning(f"Error closing subproc_envs: {e}")
         subproc_envs = None
     torch.cuda.empty_cache()
 
 def signal_handler(sig, frame):
     global terminate_flag, global_model, global_model_path
-    logging.info(f"Signal {sig} received! Preparing to terminate...")
+    logger = logging.getLogger('kungfu_ppo')
+    logger.info(f"Signal {sig} received! Preparing to terminate...")
     if global_model is not None and global_model_path is not None:
         try:
             global_model.save(f"{global_model_path}/kungfu_ppo")
-            logging.info(f"Emergency save completed: {global_model_path}/kungfu_ppo.zip")
+            logger.info(f"Emergency save completed: {global_model_path}/kungfu_ppo.zip")
         except Exception as e:
-            logging.error(f"Error saving model during signal handler: {e}")
+            logger.error(f"Error saving model during signal handler: {e}")
     terminate_flag = True
     cleanup()
     sys.exit(0)
@@ -50,7 +73,6 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# Vision Transformer Feature Extractor
 class VisionTransformer(BaseFeaturesExtractor):
     def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):
         super().__init__(observation_space, features_dim=embed_dim)
@@ -82,7 +104,6 @@ class VisionTransformer(BaseFeaturesExtractor):
         x = x.mean(dim=1)
         return x
 
-# Custom Policy using Vision Transformer
 class TransformerPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super().__init__(
@@ -91,10 +112,10 @@ class TransformerPolicy(ActorCriticPolicy):
             lr_schedule,
             features_extractor_class=VisionTransformer,
             features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=6, patch_size=14),
+            net_arch=[dict(pi=[256, 256], vf=[256, 256])],
             **kwargs
         )
 
-# Simplified Action Wrapper
 class KungFuDiscreteWrapper(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -117,20 +138,16 @@ class KungFuDiscreteWrapper(gym.ActionWrapper):
     def action(self, action):
         return self._actions[action]
 
-# Fixed Observation Wrapper
 class PreprocessFrame(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.observation_space = spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8)
 
     def observation(self, obs):
-        # Convert to grayscale
-        obs = np.dot(obs[..., :3], [0.299, 0.587, 0.114])  # Shape: (H, W)
-        # Resize to 84x84 directly
+        obs = np.dot(obs[..., :3], [0.299, 0.587, 0.114])
         obs = cv2.resize(obs, (84, 84), interpolation=cv2.INTER_AREA)
-        return obs[..., np.newaxis].astype(np.uint8)  # Shape: (84, 84, 1)
+        return obs[..., np.newaxis].astype(np.uint8)
 
-# Simplified Reward Wrapper
 class KungFuRewardWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -138,7 +155,7 @@ class KungFuRewardWrapper(Wrapper):
         self.last_scroll = 0
         self.last_hp = None
         self.ram_positions = {
-            'score': 0x0531,  # Simplified to one byte for demo
+            'score': 0x0531,
             'scroll': 0x00E5,
             'hero_hp': 0x04A6,
             'hero_pos_x': 0x0094
@@ -159,11 +176,9 @@ class KungFuRewardWrapper(Wrapper):
         current_scroll = ram[self.ram_positions['scroll']]
         current_hp = ram[self.ram_positions['hero_hp']]
 
-        # Simple reward calculation
         reward = 0
         score_delta = current_score - self.last_score
         scroll_delta = current_scroll - self.last_scroll if current_scroll >= self.last_scroll else (current_scroll + 256 - self.last_scroll)
-        # Cast to int to avoid uint8 overflow
         hp_loss = max(0, int(self.last_hp) - int(current_hp)) if self.last_hp is not None else 0
 
         reward += score_delta * 5
@@ -176,9 +191,9 @@ class KungFuRewardWrapper(Wrapper):
 
         info['score'] = current_score
         info['hp'] = current_hp
+        info['episode'] = {'r': reward, 'l': 1}  # Critical for logging
         return obs, reward, done, info
 
-# Environment Factory
 def make_kungfu_env(seed=None, render=False):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
@@ -196,26 +211,48 @@ def make_env(rank, seed=0, render=False):
         return env
     return _init
 
-# Training Callback
 class ProgressCallback(BaseCallback):
     def __init__(self, total_timesteps):
         super().__init__()
         self.pbar = None
         self.total_timesteps = total_timesteps
+        self.episode_rewards = []
 
     def _on_training_start(self):
-        self.pbar = tqdm(total=self.total_timesteps, desc="Training Progress")
+        self.pbar = tqdm(total=self.total_timesteps, desc="Training Progress", leave=True)
 
-    def _on_step(self):
+    def _on_step(self) -> bool:
         if terminate_flag:
             return False
+            
         self.pbar.update(1)
+        
+        # Log to TensorBoard without console output
+        if len(self.model.ep_info_buffer) > 0 and "r" in self.model.ep_info_buffer[0]:
+            self.episode_rewards.append(self.model.ep_info_buffer[0]["r"])
+            if len(self.episode_rewards) % 10 == 0:
+                self.logger.record("rollout/ep_rew_mean", np.mean(self.episode_rewards[-10:]))
+                self.logger.record("rollout/ep_len_mean", np.mean([ep_info["l"] for ep_info in self.model.ep_info_buffer if "l" in ep_info]))
         return True
 
     def _on_training_end(self):
         self.pbar.close()
+        if global_model_path:
+            np.save(os.path.join(global_model_path, 'episode_rewards.npy'), np.array(self.episode_rewards))
 
-# Training Function
+class TensorboardCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.episode_rewards = []
+
+    def _on_step(self) -> bool:
+        if len(self.model.ep_info_buffer) > 0 and "r" in self.model.ep_info_buffer[0]:
+            self.episode_rewards.append(self.model.ep_info_buffer[0]["r"])
+            if len(self.episode_rewards) % 10 == 0:
+                self.logger.record("custom/ep_rew_mean", np.mean(self.episode_rewards[-10:]))
+                self.logger.record("custom/ep_rew_max", np.max(self.episode_rewards[-10:]))
+        return True
+    
 def train(args):
     global global_model, global_model_path, subproc_envs
     global_model_path = args.model_path
@@ -223,8 +260,10 @@ def train(args):
     os.makedirs(args.model_path, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
+    logger, sb3_logger = setup_logging(args.log_dir)
+    
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    logging.info(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
 
     if args.num_envs > 1:
         subproc_envs = SubprocVecEnv([make_env(i, args.seed) for i in range(args.num_envs)])
@@ -239,7 +278,7 @@ def train(args):
         policy=TransformerPolicy,
         env=env,
         learning_rate=args.learning_rate,
-        n_steps=8192,
+        n_steps=2048,  # Smaller rollout for more frequent logging
         batch_size=64,
         n_epochs=args.n_epochs,
         gamma=args.gamma,
@@ -251,40 +290,48 @@ def train(args):
     )
 
     if os.path.exists(model_file) and args.resume:
-        logging.info(f"Resuming training from {model_file}")
+        logger.info(f"Resuming training from {model_file}")
         try:
             model = PPO.load(model_file, env=env, device=device)
+            model.set_logger(sb3_logger)
         except Exception as e:
-            logging.error(f"Failed to load model: {e}. Starting new training.")
+            logger.error(f"Failed to load model: {e}. Starting new training.")
             model = PPO(**ppo_kwargs)
+            model.set_logger(sb3_logger)
     else:
-        logging.info("Starting new training.")
+        logger.info("Starting new training.")
         model = PPO(**ppo_kwargs)
+        model.set_logger(sb3_logger)
 
     global_model = model
 
-    callbacks = [ProgressCallback(args.timesteps)] if args.progress_bar else []
+    callbacks = [ProgressCallback(args.timesteps), TensorboardCallback()]
 
     try:
-        model.learn(total_timesteps=args.timesteps, callback=callbacks)
+        model.learn(
+            total_timesteps=args.timesteps,
+            callback=callbacks,
+            log_interval=1,
+            tb_log_name="PPO_KungFu"
+        )
+        logger.info(f"Training completed. Model saved to {model_file}")
         model.save(model_file)
-        logging.info(f"Training completed. Model saved to {model_file}")
     except Exception as e:
-        logging.error(f"Error during training: {e}")
+        logger.error(f"Error during training: {e}")
         model.save(model_file)
-        logging.info(f"Model saved due to error: {model_file}")
+        logger.info(f"Model saved due to error: {model_file}")
     finally:
         cleanup()
 
-# Play Function
 def play(args):
+    logger = logging.getLogger('kungfu_ppo')
     env = make_kungfu_env(render=args.render)
     env = DummyVecEnv([lambda: env])
     env = VecFrameStack(env, n_stack=4)
 
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     if not os.path.exists(model_file):
-        logging.error(f"No model found at {model_file}.")
+        logger.error(f"No model found at {model_file}.")
         return
 
     model = PPO.load(model_file, env=env)
@@ -299,19 +346,19 @@ def play(args):
         if args.render:
             env.render()
 
-    logging.info(f"Total reward: {total_reward}")
+    logger.info(f"Total reward: {total_reward}")
     env.close()
     cleanup()
 
-# Evaluate Function
 def evaluate(args):
+    logger = logging.getLogger('kungfu_ppo')
     env = make_kungfu_env()
     env = DummyVecEnv([lambda: env])
     env = VecFrameStack(env, n_stack=4)
 
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     if not os.path.exists(model_file):
-        logging.error(f"No model found at {model_file}.")
+        logger.error(f"No model found at {model_file}.")
         return
 
     model = PPO.load(model_file, env=env)
@@ -328,7 +375,7 @@ def evaluate(args):
         rewards.append(episode_reward)
 
     avg_reward = np.mean(rewards)
-    logging.info(f"Average reward over {args.eval_episodes} episodes: {avg_reward:.2f}")
+    logger.info(f"Average reward over {args.eval_episodes} episodes: {avg_reward:.2f}")
     env.close()
     cleanup()
 
@@ -347,7 +394,7 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel envs")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
-    parser.add_argument("--eval_episodes", type=int, default=5, help="Number of eval episodes")
+    parser.add_argument("--eval_episodes", type=int, default=1, help="Number of eval episodes")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs")

@@ -11,8 +11,7 @@ python script.py --play --render
 
 
 
-tensorboard --logdir logs
-
+tensorboard --logdir=logs
 
 
 
