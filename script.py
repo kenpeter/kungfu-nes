@@ -536,7 +536,7 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel envs")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")  # Added
-    parser.add_argument("--eval_episodes", type=int, default=10, help="Number of eval episodes")
+    parser.add_argument("--eval_episodes", type=int, default=1, help="Number of eval episodes")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs")
