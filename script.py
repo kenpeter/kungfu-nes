@@ -536,37 +536,6 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel envs")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")  # Added
-    parser.add_argument("--eval_episodes", type=int, default=1, help="Number of eval episodes")
-    parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--clip_range", type=float, default=0.1, help="PPO clip range")
-    parser.add_argument("--log_dir", default="logs", help="Directory for logs")
-    parser.add_argument("--log_interval", type=int, default=10, help="Log interval in seconds")
-
-    args = parser.parse_args()
-    if not any([args.train, args.play, args.evaluate]):
-        args.train = True
-
-    if args.train:
-        train(args)
-    elif args.play:
-        play(args)
-    else:
-        evaluate(args)
-    parser = argparse.ArgumentParser(description="Train or play KungFu Master with PPO")
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument("--train", action="store_true", help="Train the model")
-    mode_group.add_argument("--play", action="store_true", help="Play with the trained model")
-    mode_group.add_argument("--evaluate", action="store_true", help="Evaluate the model")
-    parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save/load model")
-    parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--render", action="store_true", help="Render the game")
-    parser.add_argument("--resume", action="store_true", help="Resume training")
-    parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps")
-    parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel envs")
     parser.add_argument("--eval_episodes", type=int, default=10, help="Number of eval episodes")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
