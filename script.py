@@ -203,8 +203,8 @@ class KungFuRewardWrapper(Wrapper):
         reward = 0
         reward += score_delta * 5          # Points gained
         reward += scroll_delta * 10         # Progress through level
-        reward += pos_delta * 0.1           # Movement (small reward for moving)
-        reward -= hp_loss * 50              # Penalty for losing health
+        reward += pos_delta * 500           # Movement (small reward for moving)
+        reward -= hp_loss * 500              # Penalty for losing health
         
         # Update tracking variables
         self.last_score = current_score
