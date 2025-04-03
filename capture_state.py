@@ -45,7 +45,7 @@ def make_kungfu_env(render=True):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuDiscreteWrapper(env)
     if render:
-        env.render_mode = 'human'
+        env.render()
     return env
 
 def capture_state(args):
@@ -71,73 +71,101 @@ def capture_state(args):
                 save_requested = True
             elif k == 'q':
                 quit_requested = True
-            else:
-                current_keys.add(k)
+            elif k == 'z':
+                current_keys.add('punch')
+            elif k == 'x':
+                current_keys.add('kick')
+            elif k == 'c':
+                current_keys.add('jump')
+            elif k == 'down':
+                current_keys.add('duck')
         except AttributeError:
             if key == keyboard.Key.left:
                 current_keys.add('left')
             elif key == keyboard.Key.right:
                 current_keys.add('right')
             elif key == keyboard.Key.up:
-                current_keys.add('up')
+                current_keys.add('jump')
             elif key == keyboard.Key.down:
-                current_keys.add('down')
+                current_keys.add('duck')
 
     def on_release(key):
         try:
             k = key.char.lower()
-            current_keys.discard(k)
+            if k == 'z':
+                current_keys.discard('punch')
+            elif k == 'x':
+                current_keys.discard('kick')
+            elif k == 'c':
+                current_keys.discard('jump')
         except AttributeError:
             if key == keyboard.Key.left:
                 current_keys.discard('left')
             elif key == keyboard.Key.right:
                 current_keys.discard('right')
             elif key == keyboard.Key.up:
-                current_keys.discard('up')
+                current_keys.discard('jump')
             elif key == keyboard.Key.down:
-                current_keys.discard('down')
+                current_keys.discard('duck')
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
 
-    print("Controls: Left/Right Arrows, Z (Punch), X (Kick), Up (Jump), Down (Duck)")
-    print(f"Press 'S' to save state to '{args.state_file}', 'Q' to quit.")
+    print("Controls:")
+    print("Left/Right Arrows: Move")
+    print("Z: Punch")
+    print("X: Kick")
+    print("Up Arrow or C: Jump")
+    print("Down Arrow: Duck")
+    print("Press 'S' to save state, 'Q' to quit")
 
     try:
-        while not done:
+        while not done and not quit_requested:
             start_time = time.time()
             env.render()
             steps += 1
 
-            # Determine action
-            action = 0
-            if 'left' in current_keys or 'a' in current_keys:
+            # Determine action based on pressed keys
+            action = 0  # No action
+            
+            # Movement takes priority
+            if 'left' in current_keys:
                 action = 1
-            elif 'right' in current_keys or 'd' in current_keys:
+            elif 'right' in current_keys:
                 action = 2
-            if 'x' in current_keys:
-                action = 3 if action == 0 else action + 2
-            elif 'z' in current_keys:
-                action = 4 if action == 0 else action + 4
-            if 'up' in current_keys:
+            
+            # Attack combinations
+            if 'kick' in current_keys:
+                if action == 1:  # Left + Kick
+                    action = 5
+                elif action == 2:  # Right + Kick
+                    action = 6
+                elif action == 0:  # Just Kick
+                    action = 3
+            elif 'punch' in current_keys:
+                if action == 1:  # Left + Punch
+                    action = 7
+                elif action == 2:  # Right + Punch
+                    action = 8
+                elif action == 0:  # Just Punch
+                    action = 4
+            
+            # Special moves (override other actions)
+            if 'jump' in current_keys:
                 action = 10
-            elif 'down' in current_keys:
+            elif 'duck' in current_keys:
                 action = 9
 
             obs, reward, done, info = env.step(action)
             logging.info(f"Step {steps}: Action={env.action_names[action]}")
 
-            # Handle save/quit requests
+            # Handle save requests
             if save_requested:
                 with open(args.state_file, "wb") as f:
                     f.write(env.unwrapped.get_state())
                 print(f"State saved to '{args.state_file}' at step {steps}")
                 save_requested = False
                 
-            if quit_requested:
-                print("Quitting...")
-                break
-
             # Maintain frame rate
             elapsed = time.time() - start_time
             time.sleep(max(0, frame_time - elapsed))
