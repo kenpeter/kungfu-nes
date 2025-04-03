@@ -9,6 +9,8 @@ import signal
 import sys
 import logging
 import cv2
+import time
+from collections import deque
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
@@ -26,10 +28,10 @@ subproc_envs = None
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
     
-    # Configure SB3 logger to only use TensorBoard and log file
-    sb3_logger = configure(log_dir, ["tensorboard", "log"])
+    # Configure SB3 logger to use TensorBoard, log file, and stdout
+    sb3_logger = configure(log_dir, ["tensorboard", "log", "stdout"])
     
-    # Create our main logger with just file output
+    # Create our main logger with file and console output
     logger = logging.getLogger('kungfu_ppo')
     logger.setLevel(logging.INFO)
     
@@ -42,6 +44,11 @@ def setup_logging(log_dir):
     file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(file_formatter)
+    logger.addHandler(console_handler)
     
     return logger, sb3_logger
 
@@ -154,11 +161,15 @@ class KungFuRewardWrapper(Wrapper):
         self.last_score = 0
         self.last_scroll = 0
         self.last_hp = None
+        self.last_pos_x = 0
+        self.start_time = None
+        self.episode_start_time = None
         self.ram_positions = {
             'score': 0x0531,
             'scroll': 0x00E5,
             'hero_hp': 0x04A6,
-            'hero_pos_x': 0x0094
+            'hero_pos_x': 0x0094,
+            'stage': 0x00E4
         }
 
     def reset(self, **kwargs):
@@ -167,31 +178,62 @@ class KungFuRewardWrapper(Wrapper):
         self.last_hp = ram[self.ram_positions['hero_hp']]
         self.last_score = 0
         self.last_scroll = 0
+        self.last_pos_x = ram[self.ram_positions['hero_pos_x']]
+        self.episode_start_time = time.time()
         return obs
 
     def step(self, action):
         obs, _, done, info = super().step(action)
         ram = self.env.get_ram()
+        
+        # Extract game state information
         current_score = ram[self.ram_positions['score']] * 100
         current_scroll = ram[self.ram_positions['scroll']]
         current_hp = ram[self.ram_positions['hero_hp']]
-
-        reward = 0
+        current_pos_x = ram[self.ram_positions['hero_pos_x']]
+        current_stage = ram[self.ram_positions['stage']]
+        
+        # Calculate deltas
         score_delta = current_score - self.last_score
         scroll_delta = current_scroll - self.last_scroll if current_scroll >= self.last_scroll else (current_scroll + 256 - self.last_scroll)
         hp_loss = max(0, int(self.last_hp) - int(current_hp)) if self.last_hp is not None else 0
-
-        reward += score_delta * 5
-        reward += scroll_delta * 10
-        reward -= hp_loss * 50
-
+        pos_delta = current_pos_x - self.last_pos_x
+        
+        # Calculate reward components
+        reward = 0
+        reward += score_delta * 5          # Points gained
+        reward += scroll_delta * 10         # Progress through level
+        reward += pos_delta * 0.1           # Movement (small reward for moving)
+        reward -= hp_loss * 50              # Penalty for losing health
+        
+        # Update tracking variables
         self.last_score = current_score
         self.last_scroll = current_scroll
         self.last_hp = current_hp
-
+        self.last_pos_x = current_pos_x
+        
+        # Calculate survival time
+        survival_time = time.time() - self.episode_start_time if self.episode_start_time else 0
+        
+        # Add detailed info to the info dict
         info['score'] = current_score
         info['hp'] = current_hp
-        info['episode'] = {'r': reward, 'l': 1}  # Critical for logging
+        info['scroll'] = current_scroll
+        info['pos_x'] = current_pos_x
+        info['stage'] = current_stage
+        info['survival_time'] = survival_time
+        info['score_delta'] = score_delta
+        info['scroll_delta'] = scroll_delta
+        info['hp_loss'] = hp_loss
+        info['episode'] = {
+            'r': reward, 
+            'l': 1,  # Episode length (steps)
+            't': survival_time,
+            'score': current_score,
+            'scroll': current_scroll,
+            'hp': current_hp
+        }
+        
         return obs, reward, done, info
 
 def make_kungfu_env(seed=None, render=False):
@@ -212,14 +254,28 @@ def make_env(rank, seed=0, render=False):
     return _init
 
 class ProgressCallback(BaseCallback):
-    def __init__(self, total_timesteps):
+    def __init__(self, total_timesteps, log_interval=10):
         super().__init__()
         self.pbar = None
         self.total_timesteps = total_timesteps
+        self.log_interval = log_interval
         self.episode_rewards = []
+        self.episode_lengths = []
+        self.episode_scores = []
+        self.episode_scrolls = []
+        self.episode_survival_times = []
+        self.episode_hps = []
+        self.last_log_time = 0
+        self.episode_count = 0
+        self.reward_buffer = deque(maxlen=100)
+        self.score_buffer = deque(maxlen=100)
+        self.scroll_buffer = deque(maxlen=100)
+        self.time_buffer = deque(maxlen=100)
+        self.hp_buffer = deque(maxlen=100)
 
     def _on_training_start(self):
         self.pbar = tqdm(total=self.total_timesteps, desc="Training Progress", leave=True)
+        self.start_time = time.time()
 
     def _on_step(self) -> bool:
         if terminate_flag:
@@ -227,32 +283,150 @@ class ProgressCallback(BaseCallback):
             
         self.pbar.update(1)
         
-        # Log to TensorBoard without console output
+        # Collect episode information when available
         if len(self.model.ep_info_buffer) > 0 and "r" in self.model.ep_info_buffer[0]:
-            self.episode_rewards.append(self.model.ep_info_buffer[0]["r"])
-            if len(self.episode_rewards) % 10 == 0:
-                self.logger.record("rollout/ep_rew_mean", np.mean(self.episode_rewards[-10:]))
-                self.logger.record("rollout/ep_len_mean", np.mean([ep_info["l"] for ep_info in self.model.ep_info_buffer if "l" in ep_info]))
+            ep_info = self.model.ep_info_buffer[0]
+            self.episode_count += 1
+            self.episode_rewards.append(ep_info["r"])
+            self.reward_buffer.append(ep_info["r"])
+            
+            # Extract additional metrics if available
+            if "score" in ep_info:
+                self.episode_scores.append(ep_info["score"])
+                self.score_buffer.append(ep_info["score"])
+            if "scroll" in ep_info:
+                self.episode_scrolls.append(ep_info["scroll"])
+                self.scroll_buffer.append(ep_info["scroll"])
+            if "t" in ep_info:
+                self.episode_survival_times.append(ep_info["t"])
+                self.time_buffer.append(ep_info["t"])
+            if "hp" in ep_info:
+                self.episode_hps.append(ep_info["hp"])
+                self.hp_buffer.append(ep_info["hp"])
+            if "l" in ep_info:
+                self.episode_lengths.append(ep_info["l"])
+            
+            # Log metrics periodically
+            current_time = time.time()
+            if current_time - self.last_log_time >= self.log_interval:
+                self._log_metrics()
+                self.last_log_time = current_time
+        
         return True
+
+    def _log_metrics(self):
+        """Log all relevant metrics to TensorBoard and console"""
+        if len(self.reward_buffer) > 0:
+            # Reward statistics
+            self.logger.record("rollout/ep_rew_mean", np.mean(self.reward_buffer))
+            self.logger.record("rollout/ep_rew_max", np.max(self.reward_buffer))
+            self.logger.record("rollout/ep_rew_min", np.min(self.reward_buffer))
+            
+            # Score statistics
+            if len(self.score_buffer) > 0:
+                self.logger.record("metrics/score_mean", np.mean(self.score_buffer))
+                self.logger.record("metrics/score_max", np.max(self.score_buffer))
+                self.logger.record("metrics/score_improvement", np.mean(self.score_buffer) - self.score_buffer[0] if len(self.score_buffer) > 1 else 0)
+            
+            # Scroll progress statistics
+            if len(self.scroll_buffer) > 0:
+                self.logger.record("metrics/scroll_mean", np.mean(self.scroll_buffer))
+                self.logger.record("metrics/scroll_max", np.max(self.scroll_buffer))
+                self.logger.record("metrics/scroll_improvement", np.mean(self.scroll_buffer) - self.scroll_buffer[0] if len(self.scroll_buffer) > 1 else 0)
+            
+            # Survival time statistics
+            if len(self.time_buffer) > 0:
+                self.logger.record("metrics/survival_time_mean", np.mean(self.time_buffer))
+                self.logger.record("metrics/survival_time_max", np.max(self.time_buffer))
+                self.logger.record("metrics/survival_improvement", np.mean(self.time_buffer) - self.time_buffer[0] if len(self.time_buffer) > 1 else 0)
+            
+            # Health statistics
+            if len(self.hp_buffer) > 0:
+                self.logger.record("metrics/hp_mean", np.mean(self.hp_buffer))
+                self.logger.record("metrics/hp_min", np.min(self.hp_buffer))
+            
+            # Episode length statistics
+            if len(self.episode_lengths) > 0:
+                self.logger.record("rollout/ep_len_mean", np.mean(self.episode_lengths))
+            
+            # Training statistics
+            elapsed_time = time.time() - self.start_time
+            self.logger.record("time/episodes", self.episode_count)
+            self.logger.record("time/time_elapsed", elapsed_time)
+            self.logger.record("time/fps", int(self.model.num_timesteps / elapsed_time))
+            
+            # Log all metrics at once
+            self.logger.dump(self.model.num_timesteps)
 
     def _on_training_end(self):
         self.pbar.close()
         if global_model_path:
+            # Save all training metrics
             np.save(os.path.join(global_model_path, 'episode_rewards.npy'), np.array(self.episode_rewards))
+            np.save(os.path.join(global_model_path, 'episode_scores.npy'), np.array(self.episode_scores))
+            np.save(os.path.join(global_model_path, 'episode_scrolls.npy'), np.array(self.episode_scrolls))
+            np.save(os.path.join(global_model_path, 'episode_survival_times.npy'), np.array(self.episode_survival_times))
+            np.save(os.path.join(global_model_path, 'episode_hps.npy'), np.array(self.episode_hps))
+            
+            # Generate a summary report
+            with open(os.path.join(global_model_path, 'training_summary.txt'), 'w') as f:
+                f.write(f"Training Summary\n")
+                f.write(f"================\n")
+                f.write(f"Total timesteps: {self.model.num_timesteps}\n")
+                f.write(f"Total episodes: {self.episode_count}\n")
+                f.write(f"Average reward: {np.mean(self.episode_rewards) if self.episode_rewards else 0:.2f}\n")
+                f.write(f"Max reward: {np.max(self.episode_rewards) if self.episode_rewards else 0:.2f}\n")
+                f.write(f"Average score: {np.mean(self.episode_scores) if self.episode_scores else 0:.2f}\n")
+                f.write(f"Max score: {np.max(self.episode_scores) if self.episode_scores else 0:.2f}\n")
+                f.write(f"Average scroll progress: {np.mean(self.episode_scrolls) if self.episode_scrolls else 0:.2f}\n")
+                f.write(f"Max scroll progress: {np.max(self.episode_scrolls) if self.episode_scrolls else 0:.2f}\n")
+                f.write(f"Average survival time: {np.mean(self.episode_survival_times) if self.episode_survival_times else 0:.2f}s\n")
+                f.write(f"Max survival time: {np.max(self.episode_survival_times) if self.episode_survival_times else 0:.2f}s\n")
+                f.write(f"Average health: {np.mean(self.episode_hps) if self.episode_hps else 0:.2f}\n")
+                f.write(f"Training time: {time.time() - self.start_time:.2f}s\n")
 
 class TensorboardCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
         self.episode_rewards = []
+        self.episode_scores = []
+        self.episode_scrolls = []
+        self.episode_times = []
 
     def _on_step(self) -> bool:
         if len(self.model.ep_info_buffer) > 0 and "r" in self.model.ep_info_buffer[0]:
-            self.episode_rewards.append(self.model.ep_info_buffer[0]["r"])
+            ep_info = self.model.ep_info_buffer[0]
+            self.episode_rewards.append(ep_info["r"])
+            
+            # Track additional metrics if available
+            if "score" in ep_info:
+                self.episode_scores.append(ep_info["score"])
+            if "scroll" in ep_info:
+                self.episode_scrolls.append(ep_info["scroll"])
+            if "t" in ep_info:
+                self.episode_times.append(ep_info["t"])
+            
+            # Log every 10 episodes
             if len(self.episode_rewards) % 10 == 0:
                 self.logger.record("custom/ep_rew_mean", np.mean(self.episode_rewards[-10:]))
                 self.logger.record("custom/ep_rew_max", np.max(self.episode_rewards[-10:]))
+                
+                if len(self.episode_scores) >= 10:
+                    self.logger.record("custom/score_mean", np.mean(self.episode_scores[-10:]))
+                    self.logger.record("custom/score_max", np.max(self.episode_scores[-10:]))
+                
+                if len(self.episode_scrolls) >= 10:
+                    self.logger.record("custom/scroll_mean", np.mean(self.episode_scrolls[-10:]))
+                    self.logger.record("custom/scroll_max", np.max(self.episode_scrolls[-10:]))
+                
+                if len(self.episode_times) >= 10:
+                    self.logger.record("custom/survival_time_mean", np.mean(self.episode_times[-10:]))
+                    self.logger.record("custom/survival_time_max", np.max(self.episode_times[-10:]))
+                
+                self.logger.dump(self.model.num_timesteps)
+        
         return True
-    
+
 def train(args):
     global global_model, global_model_path, subproc_envs
     global_model_path = args.model_path
@@ -338,15 +512,25 @@ def play(args):
     obs = env.reset()
     done = False
     total_reward = 0
+    start_time = time.time()
 
     while not done and not terminate_flag:
         action, _ = model.predict(obs, deterministic=args.deterministic)
         obs, reward, done, info = env.step(action)
         total_reward += reward[0]
+        
         if args.render:
             env.render()
+            # Display additional game info
+            ram = env.envs[0].env.get_ram()
+            score = ram[0x0531] * 100
+            hp = ram[0x04A6]
+            scroll = ram[0x00E5]
+            stage = ram[0x00E4]
+            print(f"Score: {score} | HP: {hp} | Scroll: {scroll} | Stage: {stage} | Reward: {total_reward:.1f}")
 
-    logger.info(f"Total reward: {total_reward}")
+    survival_time = time.time() - start_time
+    logger.info(f"Play session completed - Total reward: {total_reward:.1f} | Survival time: {survival_time:.1f}s")
     env.close()
     cleanup()
 
@@ -363,19 +547,46 @@ def evaluate(args):
 
     model = PPO.load(model_file, env=env)
     rewards = []
+    scores = []
+    scrolls = []
+    survival_times = []
+    hps = []
 
-    for _ in range(args.eval_episodes):
+    for ep in range(args.eval_episodes):
         obs = env.reset()
         done = False
         episode_reward = 0
+        start_time = time.time()
+        
         while not done:
             action, _ = model.predict(obs, deterministic=args.deterministic)
-            obs, reward, done, _ = env.step(action)
+            obs, reward, done, info = env.step(action)
             episode_reward += reward[0]
+        
+        # Collect metrics from the last info dict
+        if info and isinstance(info, list) and len(info) > 0:
+            last_info = info[0]
+            scores.append(last_info.get('score', 0))
+            scrolls.append(last_info.get('scroll', 0))
+            survival_times.append(time.time() - start_time)
+            hps.append(last_info.get('hp', 0))
+        
         rewards.append(episode_reward)
+        logger.info(f"Episode {ep + 1}: Reward={episode_reward:.1f}, Score={scores[-1] if scores else 0}, Scroll={scrolls[-1] if scrolls else 0}, Survival={survival_times[-1]:.1f}s, HP={hps[-1] if hps else 0}")
 
     avg_reward = np.mean(rewards)
-    logger.info(f"Average reward over {args.eval_episodes} episodes: {avg_reward:.2f}")
+    avg_score = np.mean(scores) if scores else 0
+    avg_scroll = np.mean(scrolls) if scrolls else 0
+    avg_time = np.mean(survival_times) if survival_times else 0
+    avg_hp = np.mean(hps) if hps else 0
+    
+    logger.info(f"Evaluation Summary (over {args.eval_episodes} episodes):")
+    logger.info(f"Average reward: {avg_reward:.2f}")
+    logger.info(f"Average score: {avg_score:.2f}")
+    logger.info(f"Average scroll progress: {avg_scroll:.2f}")
+    logger.info(f"Average survival time: {avg_time:.2f}s")
+    logger.info(f"Average ending HP: {avg_hp:.2f}")
+    
     env.close()
     cleanup()
 
@@ -394,13 +605,14 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel envs")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
-    parser.add_argument("--eval_episodes", type=int, default=1, help="Number of eval episodes")
+    parser.add_argument("--eval_episodes", type=int, default=10, help="Number of eval episodes")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--clip_range", type=float, default=0.1, help="PPO clip range")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
+    parser.add_argument("--log_interval", type=int, default=10, help="Log interval in seconds")
 
     args = parser.parse_args()
     if not any([args.train, args.play, args.evaluate]):
