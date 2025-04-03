@@ -27,29 +27,21 @@ subproc_envs = None
 
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
-    
-    # Configure SB3 logger to use TensorBoard, log file, and stdout
     sb3_logger = configure(log_dir, ["tensorboard", "log", "stdout"])
-    
-    # Create our main logger with file and console output
     logger = logging.getLogger('kungfu_ppo')
     logger.setLevel(logging.INFO)
-    
     if logger.hasHandlers():
         logger.handlers.clear()
-    
     log_path = os.path.join(log_dir, "training.log")
     file_handler = logging.FileHandler(log_path)
     file_handler.setLevel(logging.INFO)
     file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
-    
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(file_formatter)
     logger.addHandler(console_handler)
-    
     return logger, sb3_logger
 
 def cleanup():
@@ -88,7 +80,6 @@ class VisionTransformer(BaseFeaturesExtractor):
         self.patch_size = patch_size
         self.num_patches = (self.img_size // self.patch_size) ** 2
         self.embed_dim = embed_dim
-
         self.patch_embed = nn.Conv2d(
             in_channels=self.in_channels,
             out_channels=embed_dim,
@@ -185,37 +176,25 @@ class KungFuRewardWrapper(Wrapper):
     def step(self, action):
         obs, _, done, info = super().step(action)
         ram = self.env.get_ram()
-        
-        # Extract game state information
         current_score = ram[self.ram_positions['score']] * 100
         current_scroll = ram[self.ram_positions['scroll']]
         current_hp = ram[self.ram_positions['hero_hp']]
         current_pos_x = ram[self.ram_positions['hero_pos_x']]
         current_stage = ram[self.ram_positions['stage']]
-        
-        # Calculate deltas
         score_delta = current_score - self.last_score
         scroll_delta = current_scroll - self.last_scroll if current_scroll >= self.last_scroll else (current_scroll + 256 - self.last_scroll)
         hp_loss = max(0, int(self.last_hp) - int(current_hp)) if self.last_hp is not None else 0
         pos_delta = current_pos_x - self.last_pos_x
-        
-        # Calculate reward components
         reward = 0
-        reward += score_delta * 5          # Points gained
-        reward += scroll_delta * 10         # Progress through level
-        reward += pos_delta * 500           # Movement (small reward for moving)
-        reward -= hp_loss * 500              # Penalty for losing health
-        
-        # Update tracking variables
+        reward += score_delta * 5
+        reward += scroll_delta * 10
+        reward += pos_delta * 0.2
+        reward -= hp_loss * 50
         self.last_score = current_score
         self.last_scroll = current_scroll
         self.last_hp = current_hp
         self.last_pos_x = current_pos_x
-        
-        # Calculate survival time
         survival_time = time.time() - self.episode_start_time if self.episode_start_time else 0
-        
-        # Add detailed info to the info dict
         info['score'] = current_score
         info['hp'] = current_hp
         info['scroll'] = current_scroll
@@ -226,14 +205,13 @@ class KungFuRewardWrapper(Wrapper):
         info['scroll_delta'] = scroll_delta
         info['hp_loss'] = hp_loss
         info['episode'] = {
-            'r': reward, 
-            'l': 1,  # Episode length (steps)
+            'r': reward,
+            'l': 1,
             't': survival_time,
             'score': current_score,
             'scroll': current_scroll,
             'hp': current_hp
         }
-        
         return obs, reward, done, info
 
 def make_kungfu_env(seed=None, render=False):
@@ -279,18 +257,19 @@ class ProgressCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         if terminate_flag:
+            logger.info(f"Terminating training at timestep {self.model.num_timesteps}")
             return False
-            
-        self.pbar.update(1)
-        
-        # Collect episode information when available
+        # Sync progress bar with actual timesteps
+        current_steps = self.model.num_timesteps
+        if current_steps > self.pbar.n:
+            self.pbar.n = min(current_steps, self.total_timesteps)  # Cap at total_timesteps
+            self.pbar.refresh()
+        # Collect episode info
         if len(self.model.ep_info_buffer) > 0 and "r" in self.model.ep_info_buffer[0]:
             ep_info = self.model.ep_info_buffer[0]
             self.episode_count += 1
             self.episode_rewards.append(ep_info["r"])
             self.reward_buffer.append(ep_info["r"])
-            
-            # Extract additional metrics if available
             if "score" in ep_info:
                 self.episode_scores.append(ep_info["score"])
                 self.score_buffer.append(ep_info["score"])
@@ -305,70 +284,50 @@ class ProgressCallback(BaseCallback):
                 self.hp_buffer.append(ep_info["hp"])
             if "l" in ep_info:
                 self.episode_lengths.append(ep_info["l"])
-            
-            # Log metrics periodically
             current_time = time.time()
             if current_time - self.last_log_time >= self.log_interval:
                 self._log_metrics()
                 self.last_log_time = current_time
-        
         return True
 
     def _log_metrics(self):
-        """Log all relevant metrics to TensorBoard and console"""
         if len(self.reward_buffer) > 0:
-            # Reward statistics
             self.logger.record("rollout/ep_rew_mean", np.mean(self.reward_buffer))
             self.logger.record("rollout/ep_rew_max", np.max(self.reward_buffer))
             self.logger.record("rollout/ep_rew_min", np.min(self.reward_buffer))
-            
-            # Score statistics
             if len(self.score_buffer) > 0:
                 self.logger.record("metrics/score_mean", np.mean(self.score_buffer))
                 self.logger.record("metrics/score_max", np.max(self.score_buffer))
                 self.logger.record("metrics/score_improvement", np.mean(self.score_buffer) - self.score_buffer[0] if len(self.score_buffer) > 1 else 0)
-            
-            # Scroll progress statistics
             if len(self.scroll_buffer) > 0:
                 self.logger.record("metrics/scroll_mean", np.mean(self.scroll_buffer))
                 self.logger.record("metrics/scroll_max", np.max(self.scroll_buffer))
                 self.logger.record("metrics/scroll_improvement", np.mean(self.scroll_buffer) - self.scroll_buffer[0] if len(self.scroll_buffer) > 1 else 0)
-            
-            # Survival time statistics
             if len(self.time_buffer) > 0:
                 self.logger.record("metrics/survival_time_mean", np.mean(self.time_buffer))
                 self.logger.record("metrics/survival_time_max", np.max(self.time_buffer))
                 self.logger.record("metrics/survival_improvement", np.mean(self.time_buffer) - self.time_buffer[0] if len(self.time_buffer) > 1 else 0)
-            
-            # Health statistics
             if len(self.hp_buffer) > 0:
                 self.logger.record("metrics/hp_mean", np.mean(self.hp_buffer))
                 self.logger.record("metrics/hp_min", np.min(self.hp_buffer))
-            
-            # Episode length statistics
             if len(self.episode_lengths) > 0:
                 self.logger.record("rollout/ep_len_mean", np.mean(self.episode_lengths))
-            
-            # Training statistics
             elapsed_time = time.time() - self.start_time
             self.logger.record("time/episodes", self.episode_count)
             self.logger.record("time/time_elapsed", elapsed_time)
             self.logger.record("time/fps", int(self.model.num_timesteps / elapsed_time))
-            
-            # Log all metrics at once
             self.logger.dump(self.model.num_timesteps)
 
     def _on_training_end(self):
+        if self.model.num_timesteps >= self.total_timesteps:
+            self.pbar.n = self.total_timesteps  # Ensure 100% if target reached
         self.pbar.close()
         if global_model_path:
-            # Save all training metrics
             np.save(os.path.join(global_model_path, 'episode_rewards.npy'), np.array(self.episode_rewards))
             np.save(os.path.join(global_model_path, 'episode_scores.npy'), np.array(self.episode_scores))
             np.save(os.path.join(global_model_path, 'episode_scrolls.npy'), np.array(self.episode_scrolls))
             np.save(os.path.join(global_model_path, 'episode_survival_times.npy'), np.array(self.episode_survival_times))
             np.save(os.path.join(global_model_path, 'episode_hps.npy'), np.array(self.episode_hps))
-            
-            # Generate a summary report
             with open(os.path.join(global_model_path, 'training_summary.txt'), 'w') as f:
                 f.write(f"Training Summary\n")
                 f.write(f"================\n")
@@ -397,45 +356,33 @@ class TensorboardCallback(BaseCallback):
         if len(self.model.ep_info_buffer) > 0 and "r" in self.model.ep_info_buffer[0]:
             ep_info = self.model.ep_info_buffer[0]
             self.episode_rewards.append(ep_info["r"])
-            
-            # Track additional metrics if available
             if "score" in ep_info:
                 self.episode_scores.append(ep_info["score"])
             if "scroll" in ep_info:
                 self.episode_scrolls.append(ep_info["scroll"])
             if "t" in ep_info:
                 self.episode_times.append(ep_info["t"])
-            
-            # Log every 10 episodes
             if len(self.episode_rewards) % 10 == 0:
                 self.logger.record("custom/ep_rew_mean", np.mean(self.episode_rewards[-10:]))
                 self.logger.record("custom/ep_rew_max", np.max(self.episode_rewards[-10:]))
-                
                 if len(self.episode_scores) >= 10:
                     self.logger.record("custom/score_mean", np.mean(self.episode_scores[-10:]))
                     self.logger.record("custom/score_max", np.max(self.episode_scores[-10:]))
-                
                 if len(self.episode_scrolls) >= 10:
                     self.logger.record("custom/scroll_mean", np.mean(self.episode_scrolls[-10:]))
                     self.logger.record("custom/scroll_max", np.max(self.episode_scrolls[-10:]))
-                
                 if len(self.episode_times) >= 10:
                     self.logger.record("custom/survival_time_mean", np.mean(self.episode_times[-10:]))
                     self.logger.record("custom/survival_time_max", np.max(self.episode_times[-10:]))
-                
                 self.logger.dump(self.model.num_timesteps)
-        
         return True
 
 def train(args):
     global global_model, global_model_path, subproc_envs
     global_model_path = args.model_path
-
     os.makedirs(args.model_path, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
-
     logger, sb3_logger = setup_logging(args.log_dir)
-    
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
@@ -444,7 +391,6 @@ def train(args):
         env = subproc_envs
     else:
         env = DummyVecEnv([make_env(0, args.seed, args.render)])
-
     env = VecFrameStack(env, n_stack=4)
 
     model_file = f"{args.model_path}/kungfu_ppo.zip"
@@ -452,7 +398,7 @@ def train(args):
         policy=TransformerPolicy,
         env=env,
         learning_rate=args.learning_rate,
-        n_steps=2048,  # Smaller rollout for more frequent logging
+        n_steps=2048,
         batch_size=64,
         n_epochs=args.n_epochs,
         gamma=args.gamma,
@@ -478,8 +424,10 @@ def train(args):
         model.set_logger(sb3_logger)
 
     global_model = model
-
-    callbacks = [ProgressCallback(args.timesteps), TensorboardCallback()]
+    # Conditionally include ProgressCallback based on --progress_bar
+    callbacks = [TensorboardCallback()]
+    if args.progress_bar:
+        callbacks.append(ProgressCallback(args.timesteps))
 
     try:
         model.learn(
@@ -488,12 +436,12 @@ def train(args):
             log_interval=1,
             tb_log_name="PPO_KungFu"
         )
-        logger.info(f"Training completed. Model saved to {model_file}")
+        logger.info(f"Training fully completed! Total timesteps: {model.num_timesteps}")
         model.save(model_file)
     except Exception as e:
         logger.error(f"Error during training: {e}")
         model.save(model_file)
-        logger.info(f"Model saved due to error: {model_file}")
+        logger.info(f"Training stopped early at {model.num_timesteps}/{args.timesteps} timesteps")
     finally:
         cleanup()
 
@@ -502,33 +450,27 @@ def play(args):
     env = make_kungfu_env(render=args.render)
     env = DummyVecEnv([lambda: env])
     env = VecFrameStack(env, n_stack=4)
-
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     if not os.path.exists(model_file):
         logger.error(f"No model found at {model_file}.")
         return
-
     model = PPO.load(model_file, env=env)
     obs = env.reset()
     done = False
     total_reward = 0
     start_time = time.time()
-
     while not done and not terminate_flag:
         action, _ = model.predict(obs, deterministic=args.deterministic)
         obs, reward, done, info = env.step(action)
         total_reward += reward[0]
-        
         if args.render:
             env.render()
-            # Display additional game info
             ram = env.envs[0].env.get_ram()
             score = ram[0x0531] * 100
             hp = ram[0x04A6]
             scroll = ram[0x00E5]
             stage = ram[0x00E4]
             print(f"Score: {score} | HP: {hp} | Scroll: {scroll} | Stage: {stage} | Reward: {total_reward:.1f}")
-
     survival_time = time.time() - start_time
     logger.info(f"Play session completed - Total reward: {total_reward:.1f} | Survival time: {survival_time:.1f}s")
     env.close()
@@ -539,54 +481,44 @@ def evaluate(args):
     env = make_kungfu_env()
     env = DummyVecEnv([lambda: env])
     env = VecFrameStack(env, n_stack=4)
-
     model_file = f"{args.model_path}/kungfu_ppo.zip"
     if not os.path.exists(model_file):
         logger.error(f"No model found at {model_file}.")
         return
-
     model = PPO.load(model_file, env=env)
     rewards = []
     scores = []
     scrolls = []
     survival_times = []
     hps = []
-
     for ep in range(args.eval_episodes):
         obs = env.reset()
         done = False
         episode_reward = 0
         start_time = time.time()
-        
         while not done:
             action, _ = model.predict(obs, deterministic=args.deterministic)
             obs, reward, done, info = env.step(action)
             episode_reward += reward[0]
-        
-        # Collect metrics from the last info dict
         if info and isinstance(info, list) and len(info) > 0:
             last_info = info[0]
             scores.append(last_info.get('score', 0))
             scrolls.append(last_info.get('scroll', 0))
             survival_times.append(time.time() - start_time)
             hps.append(last_info.get('hp', 0))
-        
         rewards.append(episode_reward)
         logger.info(f"Episode {ep + 1}: Reward={episode_reward:.1f}, Score={scores[-1] if scores else 0}, Scroll={scrolls[-1] if scrolls else 0}, Survival={survival_times[-1]:.1f}s, HP={hps[-1] if hps else 0}")
-
     avg_reward = np.mean(rewards)
     avg_score = np.mean(scores) if scores else 0
     avg_scroll = np.mean(scrolls) if scrolls else 0
     avg_time = np.mean(survival_times) if survival_times else 0
     avg_hp = np.mean(hps) if hps else 0
-    
     logger.info(f"Evaluation Summary (over {args.eval_episodes} episodes):")
     logger.info(f"Average reward: {avg_reward:.2f}")
     logger.info(f"Average score: {avg_score:.2f}")
     logger.info(f"Average scroll progress: {avg_scroll:.2f}")
     logger.info(f"Average survival time: {avg_time:.2f}s")
     logger.info(f"Average ending HP: {avg_hp:.2f}")
-    
     env.close()
     cleanup()
 
@@ -596,7 +528,6 @@ if __name__ == "__main__":
     mode_group.add_argument("--train", action="store_true", help="Train the model")
     mode_group.add_argument("--play", action="store_true", help="Play with the trained model")
     mode_group.add_argument("--evaluate", action="store_true", help="Evaluate the model")
-
     parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save/load model")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -604,7 +535,38 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume training")
     parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel envs")
-    parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
+    parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")  # Added
+    parser.add_argument("--eval_episodes", type=int, default=10, help="Number of eval episodes")
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
+    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--clip_range", type=float, default=0.1, help="PPO clip range")
+    parser.add_argument("--log_dir", default="logs", help="Directory for logs")
+    parser.add_argument("--log_interval", type=int, default=10, help="Log interval in seconds")
+
+    args = parser.parse_args()
+    if not any([args.train, args.play, args.evaluate]):
+        args.train = True
+
+    if args.train:
+        train(args)
+    elif args.play:
+        play(args)
+    else:
+        evaluate(args)
+    parser = argparse.ArgumentParser(description="Train or play KungFu Master with PPO")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--train", action="store_true", help="Train the model")
+    mode_group.add_argument("--play", action="store_true", help="Play with the trained model")
+    mode_group.add_argument("--evaluate", action="store_true", help="Evaluate the model")
+    parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save/load model")
+    parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--render", action="store_true", help="Render the game")
+    parser.add_argument("--resume", action="store_true", help="Resume training")
+    parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps")
+    parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel envs")
     parser.add_argument("--eval_episodes", type=int, default=10, help="Number of eval episodes")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
