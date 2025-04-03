@@ -12,7 +12,7 @@ import cv2
 import time
 from collections import deque
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -73,35 +73,50 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 class VisionTransformer(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=6, patch_size=14):
+    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=4, patch_size=12):
         super().__init__(observation_space, features_dim=embed_dim)
-        self.img_size = observation_space.shape[1]
-        self.in_channels = observation_space.shape[0]
+        self.img_size = observation_space.shape[1]  # e.g., 84
+        self.in_channels = observation_space.shape[0]  # e.g., 16 (n_stack)
         self.patch_size = patch_size
-        self.num_patches = (self.img_size // self.patch_size) ** 2
+        self.num_patches = (self.img_size // self.patch_size) ** 2  # e.g., (84 // 12) ^ 2 = 49
         self.embed_dim = embed_dim
+
+        # Patch embedding convolution
         self.patch_embed = nn.Conv2d(
             in_channels=self.in_channels,
             out_channels=embed_dim,
             kernel_size=patch_size,
             stride=patch_size
         )
+        
+        # Initialize positional embeddings correctly
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads, dim_feedforward=1024, dropout=0.1, batch_first=True
+            d_model=embed_dim, 
+            nhead=num_heads, 
+            dim_feedforward=1024, 
+            dropout=0.1,  # Reduced dropout
+            batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.patch_embed(x)
-        x = x.flatten(2).transpose(1, 2)
-        x = x + self.pos_embed
-        x = self.transformer(x)
-        x = self.norm(x)
-        x = x.mean(dim=1)
+        # x shape: (batch_size, in_channels, height, width), e.g., (batch_size, 16, 84, 84)
+        x = self.patch_embed(x)  # (batch_size, embed_dim, H', W'), e.g., (batch_size, 256, 7, 7)
+        x = x.flatten(2).transpose(1, 2)  # (batch_size, num_patches, embed_dim), e.g., (batch_size, 49, 256)
+        
+        # Ensure positional embeddings match the input size
+        pos_embed = self.pos_embed[:, :x.shape[1], :]  # Truncate if necessary
+        x = x + pos_embed  # Add positional embeddings
+        
+        x = self.transformer(x)  # (batch_size, num_patches, embed_dim)
+        x = self.norm(x)  # Normalize
+        x = x.mean(dim=1)  # Global average pooling: (batch_size, embed_dim)
         return x
-
+    
 class TransformerPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super().__init__(
@@ -109,7 +124,7 @@ class TransformerPolicy(ActorCriticPolicy):
             action_space,
             lr_schedule,
             features_extractor_class=VisionTransformer,
-            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=6, patch_size=14),
+            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=4, patch_size=12),
             net_arch=dict(pi=[256, 256], vf=[256, 256]),
             **kwargs
         )
@@ -193,12 +208,12 @@ class KungFuRewardWrapper(Wrapper):
         reward = 0
         reward += score_delta * 5           # Score points
         reward += scroll_delta * 10         # Level progress
-        reward += pos_delta * 1.0           # Movement (increased from 0.2)
-        reward -= hp_loss * 50              # Health penalty
+        reward += pos_delta * 2.0           # Movement (increased from 0.2)
+        reward -= hp_loss * 10              # Health penalty (reduced from 50)
         
         # Small penalty for standing still
         if pos_delta == 0:
-            reward -= 0.3
+            reward -= 0.1                   # Reduced from 0.3
 
         # Update last values
         self.last_score = current_score
@@ -340,6 +355,8 @@ class ProgressCallback(BaseCallback):
                 self.logger.record("debug/pos_delta", self.model.ep_info_buffer[0]["pos_delta"])
             if "scroll_delta" in self.model.ep_info_buffer[0]:
                 self.logger.record("debug/scroll_delta", self.model.ep_info_buffer[0]["scroll_delta"])
+            if "hp_loss" in self.model.ep_info_buffer[0]:
+                self.logger.record("debug/hp_loss", self.model.ep_info_buffer[0]["hp_loss"])
                 
             self.logger.dump(self.model.num_timesteps)
 
@@ -364,6 +381,19 @@ class ProgressCallback(BaseCallback):
                 f.write(f"Average survival: {np.mean(self.episode_survival_times) if self.episode_survival_times else 0:.2f}s\n")
                 f.write(f"Training time: {time.time() - self.start_time:.2f}s\n")
 
+def linear_schedule(initial_value):
+    def func(progress_remaining):
+        return progress_remaining * initial_value
+    return func
+
+def create_base_env(args, seed_offset=0, render=False):
+    """Create the base environment without frame stacking or normalization."""
+    if args.num_envs > 1:
+        env = SubprocVecEnv([make_env(i, args.seed + seed_offset) for i in range(args.num_envs)])
+    else:
+        env = DummyVecEnv([make_env(0, args.seed + seed_offset, render)])
+    return env
+
 def train(args):
     global global_model, global_model_path, subproc_envs
     global_model_path = args.model_path
@@ -372,40 +402,44 @@ def train(args):
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
-    if args.num_envs > 1:
-        subproc_envs = SubprocVecEnv([make_env(i, args.seed) for i in range(args.num_envs)])
-        env = subproc_envs
-    else:
-        env = DummyVecEnv([make_env(0, args.seed, args.render)])
-    env = VecFrameStack(env, n_stack=4)
-
     model_file = f"{args.model_path}/kungfu_ppo.zip"
-    ppo_kwargs = dict(
-        policy=TransformerPolicy,
-        env=env,
-        learning_rate=args.learning_rate,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        clip_range=args.clip_range,
-        ent_coef=0.01,
-        verbose=1,
-        device=device,
-        tensorboard_log=args.log_dir,
-        vf_coef=0.5,
-        max_grad_norm=0.5
-    )
+    vecnorm_file = f"{args.model_path}/kungfu_ppo_vecnormalize.pkl"
+    desired_n_stack = 16  # The desired frame stacking for this training session
 
-    if os.path.exists(model_file) and args.resume:
+    # Create the environment with the desired configuration
+    env = create_base_env(args)
+    env = VecFrameStack(env, n_stack=desired_n_stack)
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_reward=10.0)
+
+    # Check if we're resuming training
+    if args.resume and os.path.exists(model_file):
         logger.info(f"Resuming training from {model_file}")
         model = PPO.load(model_file, env=env, device=device)
-        model.set_logger(sb3_logger)
+        if os.path.exists(vecnorm_file):
+            env = VecNormalize.load(vecnorm_file, env)
+            logger.info("Loaded saved VecNormalize stats")
     else:
         logger.info("Starting new training.")
+        # Initialize a new PPO model
+        ppo_kwargs = dict(
+            policy=TransformerPolicy,
+            env=env,
+            learning_rate=linear_schedule(args.learning_rate),
+            n_steps=2048,
+            batch_size=64,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            clip_range=args.clip_range,
+            ent_coef=0.01,
+            verbose=1,
+            device=device,
+            tensorboard_log=args.log_dir,
+            vf_coef=0.5,
+            max_grad_norm=0.5
+        )
         model = PPO(**ppo_kwargs)
-        model.set_logger(sb3_logger)
 
+    model.set_logger(sb3_logger)
     global_model = model
     callbacks = [ProgressCallback(args.timesteps)] if args.progress_bar else []
 
@@ -414,13 +448,16 @@ def train(args):
             total_timesteps=args.timesteps,
             callback=callbacks,
             log_interval=1,
-            tb_log_name="PPO_KungFu"
+            tb_log_name="PPO_KungFu",
+            reset_num_timesteps=not args.resume  # Don't reset timestep counter if resuming
         )
         model.save(model_file)
+        env.save(vecnorm_file)
         logger.info(f"Training completed! Saved to {model_file}")
     except Exception as e:
         logger.error(f"Training error: {e}")
         model.save(model_file)
+        env.save(vecnorm_file)
     finally:
         cleanup()
 
@@ -431,15 +468,15 @@ if __name__ == "__main__":
     parser.add_argument("--cuda", action="store_true", help="Use GPU")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--render", action="store_true", help="Render gameplay")
-    parser.add_argument("--resume", action="store_true", help="Resume training")
     parser.add_argument("--timesteps", type=int, default=500000, help="Training steps")
-    parser.add_argument("--num_envs", type=int, default=4, help="Parallel environments")
+    parser.add_argument("--num_envs", type=int, default=8, help="Parallel environments")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
-    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--n_epochs", type=int, default=10, help="PPO epochs")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--clip_range", type=float, default=0.2, help="PPO clip range")
+    parser.add_argument("--gamma", type=float, default=0.95, help="Discount factor")
+    parser.add_argument("--clip_range", type=float, default=0.1, help="PPO clip range")
     parser.add_argument("--log_dir", default="logs", help="Log directory")
+    parser.add_argument("--resume", action="store_true", help="Resume training from saved model")
     
     args = parser.parse_args()
     if args.train:
