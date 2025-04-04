@@ -416,7 +416,89 @@ def train(args):
     global_model = None
     global_model_file = None
 
+def play(args):
+    """Play the game using a pre-trained model."""
+    # Ensure model path exists
+    model_file = os.path.join(args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path), "kungfu_ppo_optuna")
+    if not os.path.exists(model_file + ".zip"):
+        print(f"Error: No trained model found at {model_file}.zip. Please train a model first.")
+        sys.exit(1)
+
+    # Create environment with rendering enabled
+    env = make_vec_env(1, render=True)  # Render set to True for visual play
+    env = VecFrameStack(env, n_stack=4)
+
+    # Determine device
+    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Load the trained model
+    model = PPO.load(model_file, env=env, device=device)
+    print(f"Loaded model from {model_file}.zip")
+
+    # Play loop
+    obs = env.reset()
+    total_reward = 0
+    done = False
+    step_count = 0
+
+    try:
+        while not done:
+            action, _states = model.predict(obs, deterministic=True)  # Use deterministic for best performance
+            obs, reward, done, info = env.step(action)
+            total_reward += reward[0]  # Assuming single environment
+            step_count += 1
+            
+            # Optional: Print some info during play
+            if step_count % 100 == 0:
+                print(f"Step: {step_count}, Reward: {reward[0]}, Total Reward: {total_reward}, Info: {info[0]}")
+            
+            env.render()  # Render the environment (handled by retro if render_mode='human')
+
+    except KeyboardInterrupt:
+        print("\nPlay interrupted by user.")
+    
+    finally:
+        print(f"Play ended. Total steps: {step_count}, Total reward: {total_reward}")
+        env.close()
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train or play Kung Fu with PPO.")
+    parser.add_argument("--train", action="store_true", help="Train the model")
+    parser.add_argument("--play", action="store_true", help="Play the game with a trained model")
+    parser.add_argument("--model_path", default="models/kungfu_ppo_optuna", help="Path to save/load model")
+    parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
+    parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps for training")
+    parser.add_argument("--eval_timesteps", type=int, default=50000, help="Timesteps per Optuna trial")
+    parser.add_argument("--n_trials", type=int, default=20, help="Number of Optuna trials")
+    parser.add_argument("--timeout", type=int, default=3600, help="Optuna timeout in seconds")
+    parser.add_argument("--log_dir", default="logs", help="Directory for logs")
+    parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
+    parser.add_argument("--render", action="store_true", help="Render during training (slows down)")
+    parser.add_argument("--enable_file_logging", action="store_true", help="Enable file logging")
+    parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
+    parser.add_argument("--resume", action="store_true", help="Resume training from saved model")
+    parser.add_argument("--skip_optuna", action="store_true", help="Skip Optuna optimization")
+    
+    args = parser.parse_args()
+
+    # Ensure directories exist if training
+    if args.train or args.play:
+        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+        if args.train:
+            os.makedirs(args.log_dir, exist_ok=True)
+
+    # Execute based on mode
+    if args.train and args.play:
+        print("Error: Cannot use --train and --play together. Choose one mode.")
+        sys.exit(1)
+    elif args.train:
+        train(args)
+    elif args.play:
+        play(args)
+    else:
+        print("Please specify a mode: --train or --play")
+        parser.print_help()
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--model_path", default="models/kungfu_ppo_optuna")
