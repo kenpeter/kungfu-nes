@@ -12,13 +12,15 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from gym import spaces, Wrapper
 import optuna
 import logging
+import atexit
+import signal
+import sys
 
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=256):
         super(SimpleCNN, self).__init__(observation_space, features_dim)
         assert isinstance(observation_space, spaces.Dict), "Observation space must be a Dict"
         
-        # CNN expects 4 input channels (from VecFrameStack n_stack=4)
         self.cnn = nn.Sequential(
             nn.Conv2d(4, 32, kernel_size=8, stride=4),
             nn.ReLU(),
@@ -29,24 +31,14 @@ class SimpleCNN(BaseFeaturesExtractor):
             nn.Flatten(),
         )
         
-        # Compute flattened size
         with torch.no_grad():
-            # Use the actual observation space dimensions for calculation
             sample_input = torch.zeros(1, 4, 84, 84)
             n_flatten = self.cnn(sample_input).shape[1]
         
-        # Debug print to see the actual flattened size
-        #print(f"CNN flattened output size: {n_flatten}")
-        
-        # Check enemy vector size by examining observation space
         enemy_vec_size = observation_space["enemy_vector"].shape[0]
-        # When using VecFrameStack with n_stack=4, each frame's enemy vector (4 values) gets stacked
-        # resulting in 16 values total
-        
-        #print(f"Enemy vector size from observation space: {enemy_vec_size}")
         
         self.linear = nn.Sequential(
-            nn.Linear(n_flatten + enemy_vec_size, features_dim),  # Dynamically set input size
+            nn.Linear(n_flatten + enemy_vec_size, features_dim),
             nn.ReLU()
         )
     
@@ -54,43 +46,30 @@ class SimpleCNN(BaseFeaturesExtractor):
         viewport = observations["viewport"]
         enemy_vector = observations["enemy_vector"]
         
-        # Debug the input shapes
-        #print(f"Viewport shape before processing: {viewport.shape}")
-        #print(f"Enemy vector shape before processing: {enemy_vector.shape}")
-        
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport)
             
         if isinstance(enemy_vector, np.ndarray):
             enemy_vector = torch.from_numpy(enemy_vector)
             
-        # Handle single and batched observations
-        if len(viewport.shape) == 3:  # Single observation
-            # Add batch dimension
+        if len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0)
             
-        if len(viewport.shape) == 4:  # Batched observations
-            # Check if we need to rearrange dimensions
-            if viewport.shape[3] == 4 or viewport.shape[3] == 1:  # Shape is [batch, H, W, C]
-                viewport = viewport.permute(0, 3, 1, 2)  # Convert to [batch, C, H, W]
+        if len(viewport.shape) == 4:
+            if viewport.shape[3] == 4 or viewport.shape[3] == 1:
+                viewport = viewport.permute(0, 3, 1, 2)
         
-        # Final check on dimensions
-        #print(f"Viewport shape after processing: {viewport.shape}")
         if viewport.shape[1] != 4:
             raise ValueError(f"Expected 4 channels in viewport, got shape {viewport.shape}")
             
-        # Process with CNN
         cnn_output = self.cnn(viewport)
         
-        # Handle enemy vector dimensions
-        if len(enemy_vector.shape) == 1:  # Single observation
+        if len(enemy_vector.shape) == 1:
             enemy_vector = enemy_vector.unsqueeze(0)
             
-        # Combine features
-        #print(f"CNN output shape: {cnn_output.shape}, Enemy vector shape: {enemy_vector.shape}")
         combined = torch.cat([cnn_output, enemy_vector], dim=1)
         return self.linear(combined)
-        
+
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -136,7 +115,7 @@ class KungFuWrapper(Wrapper):
         prev_projectiles = self.projectiles.copy()
         self._update_projectiles(obs)
         
-        hp_loss = max(0, self.last_hp - hp)
+        hp_loss = max(0, int(self.last_hp) - int(hp))
         dodge_reward = self._calculate_dodge_reward(prev_projectiles, pos_x, hp_loss)
         reward = (score * 0.1 + scroll * 0.5 - hp_loss * 10 + dodge_reward)
         self.last_hp = hp
@@ -151,26 +130,21 @@ class KungFuWrapper(Wrapper):
         return self._get_obs(obs), reward, done, info
 
     def _get_obs(self, obs):
-        # Convert RGB image to grayscale and resize
         gray = np.dot(obs[..., :3], [0.299, 0.587, 0.114])
         viewport = cv2.resize(gray, self.viewport_size)[..., np.newaxis]
         
-        # Get enemy positions from RAM
         ram = self.env.get_ram()
         hero_x = int(ram[0x0094])
         enemy_xs = [
-            int(ram[0x008E]),  # Enemy 1 Pos X
-            int(ram[0x008F]),  # Enemy 2 Pos X
-            int(ram[0x0090]),  # Enemy 3 Pos X
-            int(ram[0x0091])   # Enemy 4 Pos X
+            int(ram[0x008E]), int(ram[0x008F]),
+            int(ram[0x0090]), int(ram[0x0091])
         ]
         
-        # Calculate relative positions (-ve: enemy to left, +ve: enemy to right)
         enemy_vector = np.array([e - hero_x if e != 0 else 0 for e in enemy_xs], dtype=np.float32)
         
         return {
-            "viewport": viewport.astype(np.uint8),  # Shape: (84, 84, 1)
-            "enemy_vector": enemy_vector            # Shape: (4,)
+            "viewport": viewport.astype(np.uint8),
+            "enemy_vector": enemy_vector
         }
 
     def _update_projectiles(self, obs):
@@ -219,39 +193,21 @@ class KungFuWrapper(Wrapper):
         return dodge_reward
 
 def debug_network_dimensions():
-    """Debug function to check dimensions of the observation space and CNN output."""
-    #print("Debugging network dimensions...")
-    
-    # Create test environment
     env = make_env()
     obs = env.reset()
     
-    # Print observation shapes
-    #print(f"Viewport shape: {obs['viewport'].shape}")
-    #print(f"Enemy vector shape: {obs['enemy_vector'].shape}")
-    
-    # Test CNN
     cnn = SimpleCNN(env.observation_space, features_dim=256)
     
-    # Convert to torch tensors
-    viewport_tensor = torch.from_numpy(obs['viewport']).unsqueeze(0).float()  # Add batch dim
-    viewport_tensor = viewport_tensor.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
-    enemy_tensor = torch.from_numpy(obs['enemy_vector']).unsqueeze(0).float()  # Add batch dim
+    viewport_tensor = torch.from_numpy(obs['viewport']).unsqueeze(0).float()
+    viewport_tensor = viewport_tensor.permute(0, 3, 1, 2)
+    enemy_tensor = torch.from_numpy(obs['enemy_vector']).unsqueeze(0).float()
     
-    # Stack 4 frames as VecFrameStack would do
-    viewport_stacked = torch.cat([viewport_tensor] * 4, dim=1)  # Simulate 4 stacked frames
+    viewport_stacked = torch.cat([viewport_tensor] * 4, dim=1)
     
-    #print(f"Stacked viewport shape: {viewport_stacked.shape}")
-    
-    # Forward through CNN only
     with torch.no_grad():
         cnn_output = cnn.cnn(viewport_stacked)
         combined = torch.cat([cnn_output, enemy_tensor], dim=1)
         final_output = cnn.linear(combined)
-    
-    #print(f"CNN output shape: {cnn_output.shape}")
-    #print(f"Combined shape: {combined.shape}")
-    #print(f"Final output shape: {final_output.shape}")
     
     env.close()
     return
@@ -276,7 +232,7 @@ class TrainingCallback(BaseCallback):
         self.logger = logger
         if progress_bar:
             from tqdm import tqdm
-            self.pbar = tqdm(total=10000)  # Default, updated in train
+            self.pbar = tqdm(total=10000)
 
     def _on_step(self):
         env = self.training_env.envs[0]
@@ -295,8 +251,6 @@ class TrainingCallback(BaseCallback):
         
         if self.logger:
             self.logger.info(f"Step: {self.num_timesteps}, Reward: {self.locals['rewards'][0]}, Score: {info['score']}")
-        
-        if self.logger:
             self.logger.record("rollout/ep_rew_mean", np.mean(self.locals["rewards"]))
             self.logger.record("metrics/score", info["score"])
             self.logger.record("metrics/hp", info["hp"])
@@ -320,7 +274,7 @@ def objective(trial):
     gamma = trial.suggest_float("gamma", 0.9, 0.999)
     clip_range = trial.suggest_float("clip_range", 0.1, 0.3)
 
-    env = make_vec_env(1)  # Use single env for hyperparameter tuning for simplicity
+    env = make_vec_env(1)
     env = VecFrameStack(env, n_stack=4)
     
     model = PPO(
@@ -346,12 +300,38 @@ def objective(trial):
         )
     except Exception as e:
         print(f"Trial failed: {e}")
-        return float('-inf')  # Return a bad score if the trial fails
+        return float('-inf')
     
     return callback.total_reward / args.eval_timesteps
 
+# Global variable to store the model for emergency save
+global_model = None
+global_model_file = None
+
+def save_model_on_exit():
+    """Save the model when the program exits or is interrupted."""
+    global global_model, global_model_file
+    if global_model is not None and global_model_file is not None:
+        try:
+            global_model.save(global_model_file)
+            print(f"\nEmergency save: Model saved to {global_model_file}.zip")
+        except Exception as e:
+            print(f"\nFailed to save model: {e}")
+    sys.exit(0)
+
+def signal_handler(sig, frame):
+    """Handle SIGINT (Ctrl+C) signal."""
+    print('\nReceived Ctrl+C, saving model...')
+    save_model_on_exit()
+
 def train(args):
-    # Run the debug function to check dimensions
+    global global_model, global_model_file
+    
+    # Register signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+    # Register atexit handler for normal program termination
+    atexit.register(save_model_on_exit)
+    
     debug_network_dimensions()
     
     if args.enable_file_logging:
@@ -364,7 +344,6 @@ def train(args):
     else:
         logger = None
 
-    # For resuming, we'll use the best hyperparameters we found previously or defaults
     best_params = {
         "learning_rate": 0.0001,
         "n_steps": 2048,
@@ -379,6 +358,7 @@ def train(args):
     
     model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
     model_file = os.path.join(model_path, "kungfu_ppo_optuna")
+    global_model_file = model_file
     
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -410,21 +390,31 @@ def train(args):
             device=device
         )
 
+    global_model = model
+    
     callback = TrainingCallback(progress_bar=args.progress_bar, logger=logger)
     if args.progress_bar:
         callback.pbar.total = args.timesteps
     
-    model.learn(
-        total_timesteps=args.timesteps,
-        callback=callback,
-        tb_log_name="PPO_KungFu_Best",
-        reset_num_timesteps=not args.resume
-    )
+    try:
+        model.learn(
+            total_timesteps=args.timesteps,
+            callback=callback,
+            tb_log_name="PPO_KungFu_Best",
+            reset_num_timesteps=not args.resume
+        )
+    except KeyboardInterrupt:
+        # This block won't normally be reached due to signal handler,
+        # but included as a fallback
+        save_model_on_exit()
     
-    # Make sure the model directory exists
     os.makedirs(os.path.dirname(model_file), exist_ok=True)
     model.save(model_file)
     print(f"Model saved to {model_file}.zip")
+    
+    # Clear global references after successful completion
+    global_model = None
+    global_model_file = None
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -436,12 +426,12 @@ if __name__ == "__main__":
     parser.add_argument("--n_trials", type=int, default=20)
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--log_dir", default="logs")
-    parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
-    parser.add_argument("--render", action="store_true", help="Render the environment")
-    parser.add_argument("--enable_file_logging", action="store_true", help="Enable file logging")
-    parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
-    parser.add_argument("--resume", action="store_true", help="Resume training from saved model")
-    parser.add_argument("--skip_optuna", action="store_true", help="Skip Optuna hyperparameter optimization")
+    parser.add_argument("--num_envs", type=int, default=1)
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--enable_file_logging", action="store_true")
+    parser.add_argument("--progress_bar", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--skip_optuna", action="store_true")
     
     args = parser.parse_args()
     if args.train:
