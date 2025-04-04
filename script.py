@@ -1,483 +1,450 @@
 import argparse
 import os
-import gym
 import retro
 import numpy as np
 import torch
 import torch.nn as nn
-import signal
-import sys
-import logging
 import cv2
-import time
-from collections import deque
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.logger import configure
-from tqdm import tqdm
 from gym import spaces, Wrapper
+import optuna
+import logging
 
-global_model = None
-global_model_path = None
-terminate_flag = False
-subproc_envs = None
-
-def setup_logging(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-    sb3_logger = configure(log_dir, ["tensorboard", "log", "stdout"])
-    logger = logging.getLogger('kungfu_ppo')
-    logger.setLevel(logging.INFO)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    log_path = os.path.join(log_dir, "training.log")
-    file_handler = logging.FileHandler(log_path)
-    file_handler.setLevel(logging.INFO)
-    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(file_formatter)
-    logger.addHandler(console_handler)
-    return logger, sb3_logger
-
-def cleanup():
-    global subproc_envs
-    logger = logging.getLogger('kungfu_ppo')
-    if subproc_envs is not None:
-        try:
-            subproc_envs.close()
-        except Exception as e:
-            logger.warning(f"Error closing subproc_envs: {e}")
-        subproc_envs = None
-    torch.cuda.empty_cache()
-
-def signal_handler(sig, frame):
-    global terminate_flag, global_model, global_model_path
-    logger = logging.getLogger('kungfu_ppo')
-    logger.info(f"Signal {sig} received! Preparing to terminate...")
-    if global_model is not None and global_model_path is not None:
-        try:
-            global_model.save(f"{global_model_path}/kungfu_ppo")
-            logger.info(f"Emergency save completed: {global_model_path}/kungfu_ppo.zip")
-        except Exception as e:
-            logger.error(f"Error saving model during signal handler: {e}")
-    terminate_flag = True
-    cleanup()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-class VisionTransformer(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, embed_dim=256, num_heads=8, num_layers=4, patch_size=12):
-        super().__init__(observation_space, features_dim=embed_dim)
-        self.img_size = observation_space.shape[1]  # e.g., 84
-        self.in_channels = observation_space.shape[0]  # e.g., 16 (n_stack)
-        self.patch_size = patch_size
-        self.num_patches = (self.img_size // self.patch_size) ** 2  # e.g., (84 // 12) ^ 2 = 49
-        self.embed_dim = embed_dim
-
-        # Patch embedding convolution
-        self.patch_embed = nn.Conv2d(
-            in_channels=self.in_channels,
-            out_channels=embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size
+class SimpleCNN(BaseFeaturesExtractor):
+    def __init__(self, observation_space, features_dim=256):
+        super(SimpleCNN, self).__init__(observation_space, features_dim)
+        assert isinstance(observation_space, spaces.Dict), "Observation space must be a Dict"
+        
+        # CNN expects 4 input channels (from VecFrameStack n_stack=4)
+        self.cnn = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
         )
         
-        # Initialize positional embeddings correctly
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        # Compute flattened size
+        with torch.no_grad():
+            # Use the actual observation space dimensions for calculation
+            sample_input = torch.zeros(1, 4, 84, 84)
+            n_flatten = self.cnn(sample_input).shape[1]
         
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=num_heads, 
-            dim_feedforward=1024, 
-            dropout=0.1,  # Reduced dropout
-            batch_first=True
+        # Debug print to see the actual flattened size
+        #print(f"CNN flattened output size: {n_flatten}")
+        
+        # Check enemy vector size by examining observation space
+        enemy_vec_size = observation_space["enemy_vector"].shape[0]
+        # When using VecFrameStack with n_stack=4, each frame's enemy vector (4 values) gets stacked
+        # resulting in 16 values total
+        
+        #print(f"Enemy vector size from observation space: {enemy_vec_size}")
+        
+        self.linear = nn.Sequential(
+            nn.Linear(n_flatten + enemy_vec_size, features_dim),  # Dynamically set input size
+            nn.ReLU()
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (batch_size, in_channels, height, width), e.g., (batch_size, 16, 84, 84)
-        x = self.patch_embed(x)  # (batch_size, embed_dim, H', W'), e.g., (batch_size, 256, 7, 7)
-        x = x.flatten(2).transpose(1, 2)  # (batch_size, num_patches, embed_dim), e.g., (batch_size, 49, 256)
-        
-        # Ensure positional embeddings match the input size
-        pos_embed = self.pos_embed[:, :x.shape[1], :]  # Truncate if necessary
-        x = x + pos_embed  # Add positional embeddings
-        
-        x = self.transformer(x)  # (batch_size, num_patches, embed_dim)
-        x = self.norm(x)  # Normalize
-        x = x.mean(dim=1)  # Global average pooling: (batch_size, embed_dim)
-        return x
     
-class TransformerPolicy(ActorCriticPolicy):
-    def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
-        super().__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            features_extractor_class=VisionTransformer,
-            features_extractor_kwargs=dict(embed_dim=256, num_heads=8, num_layers=4, patch_size=12),
-            net_arch=dict(pi=[256, 256], vf=[256, 256]),
-            **kwargs
-        )
-
-class KungFuDiscreteWrapper(gym.ActionWrapper):
+    def forward(self, observations):
+        viewport = observations["viewport"]
+        enemy_vector = observations["enemy_vector"]
+        
+        # Debug the input shapes
+        #print(f"Viewport shape before processing: {viewport.shape}")
+        #print(f"Enemy vector shape before processing: {enemy_vector.shape}")
+        
+        if isinstance(viewport, np.ndarray):
+            viewport = torch.from_numpy(viewport)
+            
+        if isinstance(enemy_vector, np.ndarray):
+            enemy_vector = torch.from_numpy(enemy_vector)
+            
+        # Handle single and batched observations
+        if len(viewport.shape) == 3:  # Single observation
+            # Add batch dimension
+            viewport = viewport.unsqueeze(0)
+            
+        if len(viewport.shape) == 4:  # Batched observations
+            # Check if we need to rearrange dimensions
+            if viewport.shape[3] == 4 or viewport.shape[3] == 1:  # Shape is [batch, H, W, C]
+                viewport = viewport.permute(0, 3, 1, 2)  # Convert to [batch, C, H, W]
+        
+        # Final check on dimensions
+        #print(f"Viewport shape after processing: {viewport.shape}")
+        if viewport.shape[1] != 4:
+            raise ValueError(f"Expected 4 channels in viewport, got shape {viewport.shape}")
+            
+        # Process with CNN
+        cnn_output = self.cnn(viewport)
+        
+        # Handle enemy vector dimensions
+        if len(enemy_vector.shape) == 1:  # Single observation
+            enemy_vector = enemy_vector.unsqueeze(0)
+            
+        # Combine features
+        #print(f"CNN output shape: {cnn_output.shape}, Enemy vector shape: {enemy_vector.shape}")
+        combined = torch.cat([cnn_output, enemy_vector], dim=1)
+        return self.linear(combined)
+        
+class KungFuWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
+        self.viewport_size = (84, 84)
         self.action_space = spaces.Discrete(11)
-        self._actions = [
-            [0,0,0,0,0,0,0,0,0,0,0,0],  # No action
-            [0,0,0,0,0,0,1,0,0,0,0,0],  # Left
-            [0,0,0,0,0,0,0,0,1,0,0,0],  # Right
-            [1,0,0,0,0,0,0,0,0,0,0,0],  # Kick
-            [0,1,0,0,0,0,0,0,0,0,0,0],  # Punch
-            [1,0,0,0,0,0,1,0,0,0,0,0],  # Kick+Left
-            [1,0,0,0,0,0,0,0,1,0,0,0],  # Kick+Right
-            [0,1,0,0,0,0,1,0,0,0,0,0],  # Punch+Left
-            [0,1,0,0,0,0,0,0,1,0,0,0],  # Punch+Right
-            [0,0,0,0,0,1,0,0,0,0,0,0],  # Down (Duck)
-            [0,0,1,0,0,0,0,0,0,0,0,0]   # Up (Jump)
+        self.observation_space = spaces.Dict({
+            "viewport": spaces.Box(0, 255, (*self.viewport_size, 1), np.uint8),
+            "enemy_vector": spaces.Box(-255, 255, (4,), np.float32)
+        })
+        self.actions = [
+            [0,0,0,0,0,0,0,0,0,0,0,0], [0,0,0,0,0,0,1,0,0,0,0,0], [0,0,0,0,0,0,0,0,1,0,0,0],
+            [1,0,0,0,0,0,0,0,0,0,0,0], [0,1,0,0,0,0,0,0,0,0,0,0], [1,0,0,0,0,0,1,0,0,0,0,0],
+            [1,0,0,0,0,0,0,0,1,0,0,0], [0,1,0,0,0,0,1,0,0,0,0,0], [0,1,0,0,0,0,0,0,1,0,0,0],
+            [0,0,0,0,0,1,0,0,0,0,0,0], [0,0,1,0,0,0,0,0,0,0,0,0]
         ]
-        self.action_names = ["No action", "Left", "Right", "Kick", "Punch", "Kick+Left", "Kick+Right", "Punch+Left", "Punch+Right", "Duck", "Jump"]
-
-    def action(self, action):
-        return self._actions[action]
-
-class PreprocessFrame(gym.ObservationWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        self.observation_space = spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8)
-
-    def observation(self, obs):
-        obs = np.dot(obs[..., :3], [0.299, 0.587, 0.114])
-        obs = cv2.resize(obs, (84, 84), interpolation=cv2.INTER_AREA)
-        return obs[..., np.newaxis].astype(np.uint8)
-
-class KungFuRewardWrapper(Wrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        self.ram_positions = {
-            'score': 0x0531,
-            'scroll': 0x00E5,
-            'hero_hp': 0x04A6,
-            'hero_pos_x': 0x0094,
-            'stage': 0x00E4
-        }
-        self.last_score = 0
-        self.last_scroll = 0
-        self.last_hp = None
-        self.last_pos_x = 0
-        self.start_time = None
-        self.episode_start_time = None
+        self.projectiles = []
+        self.last_hp = 0
+        self.action_counts = np.zeros(11)
+        self.last_frame = None
+        self.success_dodges = 0
+        self.failed_dodges = 0
 
     def reset(self, **kwargs):
-        obs = super().reset(**kwargs)
-        ram = self.env.get_ram()
-        self.last_hp = ram[self.ram_positions['hero_hp']]
-        self.last_score = 0
-        self.last_scroll = 0
-        self.last_pos_x = ram[self.ram_positions['hero_pos_x']]
-        self.episode_start_time = time.time()
-        return obs
+        obs = self.env.reset(**kwargs)
+        self.last_hp = self.env.get_ram()[0x04A6]
+        self.action_counts = np.zeros(11)
+        self.projectiles = []
+        self.last_frame = None
+        self.success_dodges = 0
+        self.failed_dodges = 0
+        return self._get_obs(obs)
 
     def step(self, action):
-        obs, _, done, info = super().step(action)
+        self.action_counts[action] += 1
+        obs, _, done, info = self.env.step(self.actions[action])
         ram = self.env.get_ram()
         
-        current_score = ram[self.ram_positions['score']] * 100
-        current_scroll = ram[self.ram_positions['scroll']]
-        current_hp = ram[self.ram_positions['hero_hp']]
-        current_pos_x = ram[self.ram_positions['hero_pos_x']]
-        current_stage = ram[self.ram_positions['stage']]
-
-        # Overflow-safe delta calculations
-        score_delta = current_score - self.last_score
-        scroll_delta = current_scroll - self.last_scroll if current_scroll >= self.last_scroll else (current_scroll + 256 - self.last_scroll)
-        pos_delta = current_pos_x - self.last_pos_x if current_pos_x >= self.last_pos_x else (current_pos_x + 256 - self.last_pos_x)
-        hp_loss = max(0, int(self.last_hp) - int(current_hp)) if self.last_hp is not None else 0
-
-        # Reward components
-        reward = 0
-        reward += score_delta * 5           # Score points
-        reward += scroll_delta * 10         # Level progress
-        reward += pos_delta * 2.0           # Movement (increased from 0.2)
-        reward -= hp_loss * 10              # Health penalty (reduced from 50)
+        score = sum(ram[0x0531:0x0536]) * 100
+        scroll = ram[0x00E5]
+        hp = ram[0x04A6]
+        pos_x = ram[0x0094]
         
-        # Small penalty for standing still
-        if pos_delta == 0:
-            reward -= 0.1                   # Reduced from 0.3
-
-        # Update last values
-        self.last_score = current_score
-        self.last_scroll = current_scroll
-        self.last_hp = current_hp
-        self.last_pos_x = current_pos_x
-
-        # Info dictionary
-        survival_time = time.time() - self.episode_start_time if self.episode_start_time else 0
+        prev_projectiles = self.projectiles.copy()
+        self._update_projectiles(obs)
+        
+        hp_loss = max(0, self.last_hp - hp)
+        dodge_reward = self._calculate_dodge_reward(prev_projectiles, pos_x, hp_loss)
+        reward = (score * 0.1 + scroll * 0.5 - hp_loss * 10 + dodge_reward)
+        self.last_hp = hp
+        
         info.update({
-            'score': current_score,
-            'hp': current_hp,
-            'scroll': current_scroll,
-            'pos_x': current_pos_x,
-            'stage': current_stage,
-            'survival_time': survival_time,
-            'score_delta': score_delta,
-            'scroll_delta': scroll_delta,
-            'hp_loss': hp_loss,
-            'pos_delta': pos_delta
+            "score": score, "hp": hp, "pos_x": pos_x,
+            "action_percentages": self.action_counts / (sum(self.action_counts) + 1e-6),
+            "projectiles": len(self.projectiles),
+            "success_dodges": self.success_dodges,
+            "failed_dodges": self.failed_dodges
         })
+        return self._get_obs(obs), reward, done, info
 
-        return obs, reward, done, info
+    def _get_obs(self, obs):
+        # Convert RGB image to grayscale and resize
+        gray = np.dot(obs[..., :3], [0.299, 0.587, 0.114])
+        viewport = cv2.resize(gray, self.viewport_size)[..., np.newaxis]
+        
+        # Get enemy positions from RAM
+        ram = self.env.get_ram()
+        hero_x = int(ram[0x0094])
+        enemy_xs = [
+            int(ram[0x008E]),  # Enemy 1 Pos X
+            int(ram[0x008F]),  # Enemy 2 Pos X
+            int(ram[0x0090]),  # Enemy 3 Pos X
+            int(ram[0x0091])   # Enemy 4 Pos X
+        ]
+        
+        # Calculate relative positions (-ve: enemy to left, +ve: enemy to right)
+        enemy_vector = np.array([e - hero_x if e != 0 else 0 for e in enemy_xs], dtype=np.float32)
+        
+        return {
+            "viewport": viewport.astype(np.uint8),  # Shape: (84, 84, 1)
+            "enemy_vector": enemy_vector            # Shape: (4,)
+        }
 
-def make_kungfu_env(seed=None, render=False):
+    def _update_projectiles(self, obs):
+        if self.last_frame is None:
+            self.last_frame = obs
+            self.projectiles = []
+            return
+
+        curr_gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        last_gray = cv2.cvtColor(self.last_frame, cv2.COLOR_RGB2GRAY)
+        
+        frame_diff = cv2.absdiff(curr_gray, last_gray)
+        thresh = cv2.threshold(frame_diff, 30, 255, cv2.THRESH_BINARY)[1]
+        
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        new_projectiles = []
+        for contour in contours:
+            if 10 < cv2.contourArea(contour) < 100:
+                x, y, w, h = cv2.boundingRect(contour)
+                cx = x + w // 2
+                cy = y + h // 2
+                
+                speed_x = 0
+                for old_x, old_y, old_speed in self.projectiles:
+                    if abs(old_y - cy) < 10:
+                        speed_x = cx - old_x
+                        break
+                
+                new_projectiles.append((cx, cy, speed_x))
+        
+        self.projectiles = new_projectiles
+        self.last_frame = obs.copy()
+
+    def _calculate_dodge_reward(self, prev_projectiles, hero_x, hp_loss):
+        dodge_reward = 0
+        for px, py, speed in prev_projectiles:
+            if abs(px - hero_x) < 20 and speed != 0:
+                new_dist = abs(px + speed - hero_x)
+                if hp_loss == 0 and new_dist > 20:
+                    dodge_reward += 5
+                    self.success_dodges += 1
+                elif hp_loss > 0:
+                    dodge_reward -= 5
+                    self.failed_dodges += 1
+        return dodge_reward
+
+def debug_network_dimensions():
+    """Debug function to check dimensions of the observation space and CNN output."""
+    #print("Debugging network dimensions...")
+    
+    # Create test environment
+    env = make_env()
+    obs = env.reset()
+    
+    # Print observation shapes
+    #print(f"Viewport shape: {obs['viewport'].shape}")
+    #print(f"Enemy vector shape: {obs['enemy_vector'].shape}")
+    
+    # Test CNN
+    cnn = SimpleCNN(env.observation_space, features_dim=256)
+    
+    # Convert to torch tensors
+    viewport_tensor = torch.from_numpy(obs['viewport']).unsqueeze(0).float()  # Add batch dim
+    viewport_tensor = viewport_tensor.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+    enemy_tensor = torch.from_numpy(obs['enemy_vector']).unsqueeze(0).float()  # Add batch dim
+    
+    # Stack 4 frames as VecFrameStack would do
+    viewport_stacked = torch.cat([viewport_tensor] * 4, dim=1)  # Simulate 4 stacked frames
+    
+    #print(f"Stacked viewport shape: {viewport_stacked.shape}")
+    
+    # Forward through CNN only
+    with torch.no_grad():
+        cnn_output = cnn.cnn(viewport_stacked)
+        combined = torch.cat([cnn_output, enemy_tensor], dim=1)
+        final_output = cnn.linear(combined)
+    
+    #print(f"CNN output shape: {cnn_output.shape}")
+    #print(f"Combined shape: {combined.shape}")
+    #print(f"Final output shape: {final_output.shape}")
+    
+    env.close()
+    return
+
+def make_env(render=False):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
-    env = KungFuDiscreteWrapper(env)
-    env = PreprocessFrame(env)
-    env = KungFuRewardWrapper(env)
-    if seed is not None:
-        env.seed(seed)
     if render:
         env.render_mode = 'human'
-    return env
+    return KungFuWrapper(env)
 
-def make_env(rank, seed=0, render=False):
-    def _init():
-        env = make_kungfu_env(seed=seed + rank, render=(rank == 0 and render))
-        return env
-    return _init
+def make_vec_env(num_envs, render=False):
+    if num_envs > 1:
+        return SubprocVecEnv([lambda: make_env(render) for _ in range(num_envs)])
+    return DummyVecEnv([lambda: make_env(render)])
 
-class ProgressCallback(BaseCallback):
-    def __init__(self, total_timesteps, log_interval=10):
+class TrainingCallback(BaseCallback):
+    def __init__(self, progress_bar=False, logger=None):
         super().__init__()
-        self.pbar = None
-        self.total_timesteps = total_timesteps
-        self.log_interval = log_interval
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.episode_scores = []
-        self.episode_scrolls = []
-        self.episode_survival_times = []
-        self.episode_hps = []
-        self.last_log_time = 0
-        self.episode_count = 0
-        self.reward_buffer = deque(maxlen=100)
-        self.score_buffer = deque(maxlen=100)
-        self.scroll_buffer = deque(maxlen=100)
-        self.time_buffer = deque(maxlen=100)
-        self.hp_buffer = deque(maxlen=100)
+        self.projectile_logs = []
+        self.total_reward = 0
+        self.progress_bar = progress_bar
+        self.logger = logger
+        if progress_bar:
+            from tqdm import tqdm
+            self.pbar = tqdm(total=10000)  # Default, updated in train
 
-    def _on_training_start(self):
-        self.pbar = tqdm(total=self.total_timesteps, desc="Training Progress", leave=True)
-        self.start_time = time.time()
-
-    def _on_step(self) -> bool:
-        if terminate_flag:
-            return False
+    def _on_step(self):
+        env = self.training_env.envs[0]
+        ram = self.training_env.envs[0].env.get_ram()
+        info = self.locals["infos"][0]
         
-        current_steps = self.model.num_timesteps
-        if current_steps > self.pbar.n:
-            self.pbar.n = min(current_steps, self.total_timesteps)
-            self.pbar.refresh()
-            
-        if len(self.model.ep_info_buffer) > 0 and "r" in self.model.ep_info_buffer[0]:
-            ep_info = self.model.ep_info_buffer[0]
-            self.episode_count += 1
-            self.episode_rewards.append(ep_info["r"])
-            self.reward_buffer.append(ep_info["r"])
-            
-            if "score" in ep_info:
-                self.episode_scores.append(ep_info["score"])
-                self.score_buffer.append(ep_info["score"])
-                
-            if "scroll" in ep_info:
-                self.episode_scrolls.append(ep_info["scroll"])
-                self.scroll_buffer.append(ep_info["scroll"])
-                
-            if "t" in ep_info:
-                self.episode_survival_times.append(ep_info["t"])
-                self.time_buffer.append(ep_info["t"])
-                
-            if "hp" in ep_info:
-                self.episode_hps.append(ep_info["hp"])
-                self.hp_buffer.append(ep_info["hp"])
-                
-            if "l" in ep_info:
-                self.episode_lengths.append(ep_info["l"])
-                
-            current_time = time.time()
-            if current_time - self.last_log_time >= self.log_interval:
-                self._log_metrics()
-                self.last_log_time = current_time
-                
+        self.projectile_logs.append({
+            "agent_x": ram[0x0094],
+            "agent_y": ram[0x00B6],
+            "hp_loss": max(0, env.last_hp - ram[0x04A6]),
+            "action_percentages": info["action_percentages"],
+            "projectiles": [(x, y, speed) for x, y, speed in env.projectiles]
+        })
+        
+        self.total_reward += self.locals["rewards"][0]
+        
+        if self.logger:
+            self.logger.info(f"Step: {self.num_timesteps}, Reward: {self.locals['rewards'][0]}, Score: {info['score']}")
+        
+        if self.logger:
+            self.logger.record("rollout/ep_rew_mean", np.mean(self.locals["rewards"]))
+            self.logger.record("metrics/score", info["score"])
+            self.logger.record("metrics/hp", info["hp"])
+            self.logger.record("metrics/projectiles", info["projectiles"])
+            self.logger.record("metrics/success_dodges", info["success_dodges"])
+            self.logger.record("metrics/failed_dodges", info["failed_dodges"])
+        
+        if self.progress_bar:
+            self.pbar.update(1)
         return True
 
-    def _log_metrics(self):
-        if len(self.reward_buffer) > 0:
-            self.logger.record("rollout/ep_rew_mean", np.mean(self.reward_buffer))
-            self.logger.record("rollout/ep_rew_max", np.max(self.reward_buffer))
-            self.logger.record("rollout/ep_rew_min", np.min(self.reward_buffer))
-            
-            if len(self.score_buffer) > 0:
-                self.logger.record("metrics/score_mean", np.mean(self.score_buffer))
-                self.logger.record("metrics/score_max", np.max(self.score_buffer))
-                
-            if len(self.scroll_buffer) > 0:
-                self.logger.record("metrics/scroll_mean", np.mean(self.scroll_buffer))
-                self.logger.record("metrics/scroll_max", np.max(self.scroll_buffer))
-                
-            if len(self.time_buffer) > 0:
-                self.logger.record("metrics/survival_time_mean", np.mean(self.time_buffer))
-                self.logger.record("metrics/survival_time_max", np.max(self.time_buffer))
-                
-            if len(self.hp_buffer) > 0:
-                self.logger.record("metrics/hp_mean", np.mean(self.hp_buffer))
-                self.logger.record("metrics/hp_min", np.min(self.hp_buffer))
-                
-            if len(self.episode_lengths) > 0:
-                self.logger.record("rollout/ep_len_mean", np.mean(self.episode_lengths))
-                
-            elapsed_time = time.time() - self.start_time
-            self.logger.record("time/episodes", self.episode_count)
-            self.logger.record("time/time_elapsed", elapsed_time)
-            self.logger.record("time/fps", int(self.model.num_timesteps / elapsed_time))
-            
-            # Debug metrics
-            if "pos_delta" in self.model.ep_info_buffer[0]:
-                self.logger.record("debug/pos_delta", self.model.ep_info_buffer[0]["pos_delta"])
-            if "scroll_delta" in self.model.ep_info_buffer[0]:
-                self.logger.record("debug/scroll_delta", self.model.ep_info_buffer[0]["scroll_delta"])
-            if "hp_loss" in self.model.ep_info_buffer[0]:
-                self.logger.record("debug/hp_loss", self.model.ep_info_buffer[0]["hp_loss"])
-                
-            self.logger.dump(self.model.num_timesteps)
-
     def _on_training_end(self):
-        self.pbar.close()
-        if global_model_path:
-            np.save(os.path.join(global_model_path, 'episode_rewards.npy'), np.array(self.episode_rewards))
-            np.save(os.path.join(global_model_path, 'episode_scores.npy'), np.array(self.episode_scores))
-            np.save(os.path.join(global_model_path, 'episode_scrolls.npy'), np.array(self.episode_scrolls))
-            np.save(os.path.join(global_model_path, 'episode_survival_times.npy'), np.array(self.episode_survival_times))
-            np.save(os.path.join(global_model_path, 'episode_hps.npy'), np.array(self.episode_hps))
-            
-            with open(os.path.join(global_model_path, 'training_summary.txt'), 'w') as f:
-                f.write(f"Training Summary\n")
-                f.write(f"Total timesteps: {self.model.num_timesteps}\n")
-                f.write(f"Average reward: {np.mean(self.episode_rewards) if self.episode_rewards else 0:.2f}\n")
-                f.write(f"Max reward: {np.max(self.episode_rewards) if self.episode_rewards else 0:.2f}\n")
-                f.write(f"Average score: {np.mean(self.episode_scores) if self.episode_scores else 0:.2f}\n")
-                f.write(f"Max score: {np.max(self.episode_scores) if self.episode_scores else 0:.2f}\n")
-                f.write(f"Average scroll: {np.mean(self.episode_scrolls) if self.episode_scrolls else 0:.2f}\n")
-                f.write(f"Max scroll: {np.max(self.episode_scrolls) if self.episode_scrolls else 0:.2f}\n")
-                f.write(f"Average survival: {np.mean(self.episode_survival_times) if self.episode_survival_times else 0:.2f}s\n")
-                f.write(f"Training time: {time.time() - self.start_time:.2f}s\n")
+        if self.progress_bar:
+            self.pbar.close()
 
-def linear_schedule(initial_value):
-    def func(progress_remaining):
-        return progress_remaining * initial_value
-    return func
+def objective(trial):
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+    n_steps = trial.suggest_int("n_steps", 2048, 16384, step=2048)
+    batch_size = trial.suggest_int("batch_size", 64, 512, step=64)
+    n_epochs = trial.suggest_int("n_epochs", 3, 20)
+    gamma = trial.suggest_float("gamma", 0.9, 0.999)
+    clip_range = trial.suggest_float("clip_range", 0.1, 0.3)
 
-def create_base_env(args, seed_offset=0, render=False):
-    """Create the base environment without frame stacking or normalization."""
-    if args.num_envs > 1:
-        env = SubprocVecEnv([make_env(i, args.seed + seed_offset) for i in range(args.num_envs)])
-    else:
-        env = DummyVecEnv([make_env(0, args.seed + seed_offset, render)])
-    return env
+    env = make_vec_env(1)  # Use single env for hyperparameter tuning for simplicity
+    env = VecFrameStack(env, n_stack=4)
+    
+    model = PPO(
+        policy="MultiInputPolicy",
+        env=env,
+        policy_kwargs={"features_extractor_class": SimpleCNN},
+        learning_rate=learning_rate,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        gamma=gamma,
+        clip_range=clip_range,
+        tensorboard_log=args.log_dir,
+        device="cuda" if args.cuda and torch.cuda.is_available() else "cpu"
+    )
 
-def train(args):
-    global global_model, global_model_path, subproc_envs
-    global_model_path = args.model_path
-    os.makedirs(args.model_path, exist_ok=True)
-    logger, sb3_logger = setup_logging(args.log_dir)
-    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    logger.info(f"Using device: {device}")
-
-    model_file = f"{args.model_path}/kungfu_ppo.zip"
-    vecnorm_file = f"{args.model_path}/kungfu_ppo_vecnormalize.pkl"
-    desired_n_stack = 16  # The desired frame stacking for this training session
-
-    # Create the environment with the desired configuration
-    env = create_base_env(args)
-    env = VecFrameStack(env, n_stack=desired_n_stack)
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_reward=10.0)
-
-    # Check if we're resuming training
-    if args.resume and os.path.exists(model_file):
-        logger.info(f"Resuming training from {model_file}")
-        model = PPO.load(model_file, env=env, device=device)
-        if os.path.exists(vecnorm_file):
-            env = VecNormalize.load(vecnorm_file, env)
-            logger.info("Loaded saved VecNormalize stats")
-    else:
-        logger.info("Starting new training.")
-        # Initialize a new PPO model
-        ppo_kwargs = dict(
-            policy=TransformerPolicy,
-            env=env,
-            learning_rate=linear_schedule(args.learning_rate),
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=args.n_epochs,
-            gamma=args.gamma,
-            clip_range=args.clip_range,
-            ent_coef=0.01,
-            verbose=1,
-            device=device,
-            tensorboard_log=args.log_dir,
-            vf_coef=0.5,
-            max_grad_norm=0.5
-        )
-        model = PPO(**ppo_kwargs)
-
-    model.set_logger(sb3_logger)
-    global_model = model
-    callbacks = [ProgressCallback(args.timesteps)] if args.progress_bar else []
-
+    callback = TrainingCallback(progress_bar=args.progress_bar)
     try:
         model.learn(
-            total_timesteps=args.timesteps,
-            callback=callbacks,
-            log_interval=1,
-            tb_log_name="PPO_KungFu",
-            reset_num_timesteps=not args.resume  # Don't reset timestep counter if resuming
+            total_timesteps=args.eval_timesteps,
+            callback=callback,
+            tb_log_name=f"PPO_KungFu_trial_{trial.number}"
         )
-        model.save(model_file)
-        env.save(vecnorm_file)
-        logger.info(f"Training completed! Saved to {model_file}")
     except Exception as e:
-        logger.error(f"Training error: {e}")
-        model.save(model_file)
-        env.save(vecnorm_file)
-    finally:
-        cleanup()
+        print(f"Trial failed: {e}")
+        return float('-inf')  # Return a bad score if the trial fails
+    
+    return callback.total_reward / args.eval_timesteps
+
+def train(args):
+    # Run the debug function to check dimensions
+    debug_network_dimensions()
+    
+    if args.enable_file_logging:
+        logging.basicConfig(
+            filename=os.path.join(args.log_dir, 'training.log'),
+            level=logging.INFO,
+            format='%(asctime)s - %(message)s'
+        )
+        logger = logging.getLogger(__name__)
+    else:
+        logger = None
+
+    # For resuming, we'll use the best hyperparameters we found previously or defaults
+    best_params = {
+        "learning_rate": 0.0001,
+        "n_steps": 2048,
+        "batch_size": 128,
+        "n_epochs": 10,
+        "gamma": 0.99,
+        "clip_range": 0.2
+    }
+    
+    env = make_vec_env(args.num_envs, render=args.render)
+    env = VecFrameStack(env, n_stack=4)
+    
+    model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
+    model_file = os.path.join(model_path, "kungfu_ppo_optuna")
+    
+    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    if args.resume and os.path.exists(model_file + ".zip"):
+        model = PPO.load(model_file, env=env, device=device)
+        print(f"Resumed from {model_file}.zip")
+    else:
+        if not args.skip_optuna:
+            print("Running Optuna optimization...")
+            study = optuna.create_study(direction="maximize")
+            study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout)
+            
+            print("Best hyperparameters:", study.best_params)
+            print("Best value:", study.best_value)
+            best_params = study.best_params
+        
+        model = PPO(
+            policy="MultiInputPolicy",
+            env=env,
+            policy_kwargs={"features_extractor_class": SimpleCNN},
+            learning_rate=best_params["learning_rate"],
+            n_steps=best_params["n_steps"],
+            batch_size=best_params["batch_size"],
+            n_epochs=best_params["n_epochs"],
+            gamma=best_params["gamma"],
+            clip_range=best_params["clip_range"],
+            tensorboard_log=args.log_dir,
+            device=device
+        )
+
+    callback = TrainingCallback(progress_bar=args.progress_bar, logger=logger)
+    if args.progress_bar:
+        callback.pbar.total = args.timesteps
+    
+    model.learn(
+        total_timesteps=args.timesteps,
+        callback=callback,
+        tb_log_name="PPO_KungFu_Best",
+        reset_num_timesteps=not args.resume
+    )
+    
+    # Make sure the model directory exists
+    os.makedirs(os.path.dirname(model_file), exist_ok=True)
+    model.save(model_file)
+    print(f"Model saved to {model_file}.zip")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train KungFu Master with PPO")
-    parser.add_argument("--train", action="store_true", help="Train mode")
-    parser.add_argument("--model_path", default="models/kungfu_ppo", help="Model directory")
-    parser.add_argument("--cuda", action="store_true", help="Use GPU")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--render", action="store_true", help="Render gameplay")
-    parser.add_argument("--timesteps", type=int, default=500000, help="Training steps")
-    parser.add_argument("--num_envs", type=int, default=8, help="Parallel environments")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train", action="store_true")
+    parser.add_argument("--model_path", default="models/kungfu_ppo_optuna")
+    parser.add_argument("--cuda", action="store_true")
+    parser.add_argument("--timesteps", type=int, default=500000)
+    parser.add_argument("--eval_timesteps", type=int, default=50000)
+    parser.add_argument("--n_trials", type=int, default=20)
+    parser.add_argument("--timeout", type=int, default=3600)
+    parser.add_argument("--log_dir", default="logs")
+    parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
+    parser.add_argument("--render", action="store_true", help="Render the environment")
+    parser.add_argument("--enable_file_logging", action="store_true", help="Enable file logging")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--n_epochs", type=int, default=10, help="PPO epochs")
-    parser.add_argument("--gamma", type=float, default=0.95, help="Discount factor")
-    parser.add_argument("--clip_range", type=float, default=0.1, help="PPO clip range")
-    parser.add_argument("--log_dir", default="logs", help="Log directory")
     parser.add_argument("--resume", action="store_true", help="Resume training from saved model")
+    parser.add_argument("--skip_optuna", action="store_true", help="Skip Optuna hyperparameter optimization")
     
     args = parser.parse_args()
     if args.train:
+        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+        os.makedirs(args.log_dir, exist_ok=True)
         train(args)
