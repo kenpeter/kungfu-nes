@@ -93,11 +93,13 @@ class KungFuWrapper(Wrapper):
         ]
         self.last_hp = 0
         self.action_counts = np.zeros(11)
+        self.last_enemies = [0] * 4  # Track previous enemy states
 
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
         self.last_hp = self.env.get_ram()[0x04A6]
         self.action_counts = np.zeros(11)
+        self.last_enemies = [0] * 4
         return self._get_obs(obs)
 
     def step(self, action):
@@ -113,11 +115,16 @@ class KungFuWrapper(Wrapper):
         boss_hp = ram[0x04A5]
         
         hp_loss = max(0, int(self.last_hp) - int(hp))
+        curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
+        enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)  # Enemy defeated
+        self.last_enemies = curr_enemies
+        
         raw_reward = (
-            score * 0.01 +
+            score * 1.0 +          # Increased from 0.01 to 1.0
             scroll * 0.5 +
             pos_x * 0.1 +
-            (255 - boss_hp) * 1.0 -
+            (255 - boss_hp) * 1.0 +
+            enemy_hit * 50.0 -     # Bonus for hitting enemies
             hp_loss * 10.0
         )
         clipped_reward = np.clip(raw_reward, -10, 10)
@@ -134,7 +141,8 @@ class KungFuWrapper(Wrapper):
             "boss_hp": boss_hp,
             "raw_reward": raw_reward,
             "normalized_reward": normalized_reward,
-            "action_percentages": self.action_counts / (sum(self.action_counts) + 1e-6)
+            "action_percentages": self.action_counts / (sum(self.action_counts) + 1e-6),
+            "enemy_hit": enemy_hit
         })
         
         return self._get_obs(obs), normalized_reward, done, info
@@ -358,7 +366,6 @@ def train(args):
     global_model_file = model_file
     os.makedirs(model_path, exist_ok=True)
     
-    # Default parameters if not using Optuna
     default_params = {
         'learning_rate': 0.0003,
         'n_steps': 2048,
@@ -460,13 +467,30 @@ def play(args):
             total_reward += reward[0]
             step_count += 1
             if step_count % 100 == 0:
-                logger.info(f"Step: {step_count}, Reward: {reward[0]:.2f}, Total: {total_reward:.2f}")
-            env.render()
+                action_pct = env.envs[0].action_counts / (sum(env.envs[0].action_counts) + 1e-6)
+                logger.info(
+                    f"Step: {step_count}, "
+                    f"Reward: {reward[0]:.2f}, "
+                    f"Total: {total_reward:.2f}, "
+                    f"Raw Reward: {info[0]['raw_reward']:.2f}, "
+                    f"Score: {info[0]['score']}, "
+                    f"HP: {info[0]['hp']}, "
+                    f"Scroll: {info[0]['scroll']}, "
+                    f"Enemy Hits: {info[0]['enemy_hit']}, "
+                    f"Actions: {action_pct.tolist()}"
+                )
+            if args.render:
+                env.render()
     except KeyboardInterrupt:
         logger.info("\nPlay interrupted by user.")
     finally:
         logger.info(f"Play ended. Total steps: {step_count}, Total reward: {total_reward:.2f}")
         env.close()
+        if args.render:
+            try:
+                env.envs[0].env.close()  # Explicitly close the underlying Retro env
+            except Exception as e:
+                logger.warning(f"Error closing render window: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or play Kung Fu with PPO.")
@@ -476,11 +500,11 @@ if __name__ == "__main__":
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--timesteps", type=int, default=10000, help="Total timesteps for training")
     parser.add_argument("--eval_timesteps", type=int, default=10000, help="Timesteps per Optuna trial")
-    parser.add_argument("--n_trials", type=int, default=5, help="Number of Optuna trials")
+    parser.add_argument("--n_trials", type=int, default=10, help="Number of Optuna trials")
     parser.add_argument("--timeout", type=int, default=3600, help="Optuna timeout in seconds")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
-    parser.add_argument("--render", action="store_true", help="Render during training")
+    parser.add_argument("--render", action="store_true", help="Render during training/play")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
     parser.add_argument("--resume", action="store_true", help="Resume training from saved model")
     parser.add_argument("--skip_optuna", action="store_true", help="Skip Optuna optimization")
