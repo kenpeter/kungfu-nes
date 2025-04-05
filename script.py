@@ -235,23 +235,43 @@ class TrainingCallback(BaseCallback):
             self.pbar = tqdm(total=10000)
 
     def _on_step(self):
+        # Get the vectorized environment
         vec_env = self.training_env
+        
+        # Handle VecFrameStack unwrapping
         if isinstance(vec_env, VecFrameStack):
             vec_env = vec_env.venv
-        env = vec_env.envs[0]
-        while hasattr(env, 'env'):
-            env = env.env
-        ram = env.env.get_ram()
+        
+        # Check if we can access individual environments
+        if hasattr(vec_env, 'envs'):
+            # For DummyVecEnv
+            env = vec_env.envs[0]
+            while hasattr(env, 'env'):
+                env = env.env
+            ram = env.env.get_ram()
+        else:
+            # For SubprocVecEnv
+            ram = None
+        
+        # Get info from the first environment
         info = self.locals["infos"][0]
         
-        self.projectile_logs.append({
-            "agent_x": ram[0x0094],
-            "agent_y": ram[0x00B6],
-            "hp_loss": max(0, env.last_hp - ram[0x04A6]),
+        # Log data
+        log_entry = {
             "action_percentages": info["action_percentages"],
-            "projectiles": [(x, y, speed) for x, y, speed in env.projectiles]
-        })
+            "projectiles": info["projectiles"],
+            "success_dodges": info["success_dodges"],
+            "failed_dodges": info["failed_dodges"]
+        }
         
+        if ram is not None:
+            log_entry.update({
+                "agent_x": ram[0x0094],
+                "agent_y": ram[0x00B6],
+                "hp_loss": max(0, env.last_hp - ram[0x04A6])
+            })
+        
+        self.projectile_logs.append(log_entry)
         self.total_reward += self.locals["rewards"][0]
         
         if self.logger:
@@ -270,7 +290,7 @@ class TrainingCallback(BaseCallback):
     def _on_training_end(self):
         if self.progress_bar:
             self.pbar.close()
-
+                     
 def objective(trial):
     learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
     n_steps = trial.suggest_int("n_steps", 2048, 16384, step=2048)
@@ -345,23 +365,39 @@ def train(args):
     else:
         logger = None
 
-    best_params = {'learning_rate': 0.0007181399768445935, 'n_steps': 16384, 'batch_size': 256, 'n_epochs': 4, 'gamma': 0.9051620100876205, 'clip_range': 0.1003777999324603}
-    
-    env = make_vec_env(args.num_envs, render=args.render)
-    env = VecFrameStack(env, n_stack=4)
-    
+    # Define model path and ensure directory exists
     model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
     model_file = os.path.join(model_path, "kungfu_ppo_optuna")
     global_model_file = model_file
+    os.makedirs(model_path, exist_ok=True)
+    
+    # Check for existing model and optimization results
+    model_exists = os.path.exists(model_file + ".zip")
+    optuna_study_file = os.path.join(model_path, "optuna_study.pkl")
+    optuna_completed = os.path.exists(optuna_study_file)
     
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    if args.resume and os.path.exists(model_file + ".zip"):
+    env = make_vec_env(args.num_envs, render=args.render)
+    env = VecFrameStack(env, n_stack=4)
+    
+    # Default best parameters
+    best_params = {
+        'learning_rate': 0.0007181399768445935, 
+        'n_steps': 16384, 
+        'batch_size': 256, 
+        'n_epochs': 4, 
+        'gamma': 0.9051620100876205, 
+        'clip_range': 0.1003777999324603
+    }
+    
+    # Load or create model
+    if args.resume and model_exists:
         model = PPO.load(model_file, env=env, device=device)
         print(f"Resumed from {model_file}.zip")
     else:
-        if not args.skip_optuna:
+        if not args.skip_optuna and not optuna_completed:
             print("Running Optuna optimization...")
             study = optuna.create_study(direction="maximize")
             study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout)
@@ -369,6 +405,19 @@ def train(args):
             print("Best hyperparameters:", study.best_params)
             print("Best value:", study.best_value)
             best_params = study.best_params
+            
+            # Save Optuna study
+            import pickle
+            with open(optuna_study_file, 'wb') as f:
+                pickle.dump(study, f)
+            print(f"Optuna study saved to {optuna_study_file}")
+        elif optuna_completed:
+            print("Loading previous Optuna results...")
+            import pickle
+            with open(optuna_study_file, 'rb') as f:
+                study = pickle.load(f)
+            best_params = study.best_params
+            print("Loaded best hyperparameters:", best_params)
         
         model = PPO(
             policy="MultiInputPolicy",
@@ -397,12 +446,13 @@ def train(args):
             tb_log_name="PPO_KungFu_Best",
             reset_num_timesteps=not args.resume
         )
+        
+        # Save the final model
+        model.save(model_file)
+        print(f"Model saved to {model_file}.zip")
+        
     except KeyboardInterrupt:
         save_model_on_exit()
-    
-    os.makedirs(os.path.dirname(model_file), exist_ok=True)
-    model.save(model_file)
-    print(f"Model saved to {model_file}.zip")
     
     global_model = None
     global_model_file = None
