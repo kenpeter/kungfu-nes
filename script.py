@@ -235,8 +235,13 @@ class TrainingCallback(BaseCallback):
             self.pbar = tqdm(total=10000)
 
     def _on_step(self):
-        env = self.training_env.envs[0]
-        ram = self.training_env.envs[0].env.get_ram()
+        vec_env = self.training_env
+        if isinstance(vec_env, VecFrameStack):
+            vec_env = vec_env.venv
+        env = vec_env.envs[0]
+        while hasattr(env, 'env'):
+            env = env.env
+        ram = env.env.get_ram()
         info = self.locals["infos"][0]
         
         self.projectile_logs.append({
@@ -309,7 +314,6 @@ global_model = None
 global_model_file = None
 
 def save_model_on_exit():
-    """Save the model when the program exits or is interrupted."""
     global global_model, global_model_file
     if global_model is not None and global_model_file is not None:
         try:
@@ -320,16 +324,13 @@ def save_model_on_exit():
     sys.exit(0)
 
 def signal_handler(sig, frame):
-    """Handle SIGINT (Ctrl+C) signal."""
     print('\nReceived Ctrl+C, saving model...')
     save_model_on_exit()
 
 def train(args):
     global global_model, global_model_file
     
-    # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
-    # Register atexit handler for normal program termination
     atexit.register(save_model_on_exit)
     
     debug_network_dimensions()
@@ -344,14 +345,7 @@ def train(args):
     else:
         logger = None
 
-    best_params = {
-        "learning_rate": 0.0001,
-        "n_steps": 2048,
-        "batch_size": 128,
-        "n_epochs": 10,
-        "gamma": 0.99,
-        "clip_range": 0.2
-    }
+    best_params = {'learning_rate': 0.0007181399768445935, 'n_steps': 16384, 'batch_size': 256, 'n_epochs': 4, 'gamma': 0.9051620100876205, 'clip_range': 0.1003777999324603}
     
     env = make_vec_env(args.num_envs, render=args.render)
     env = VecFrameStack(env, n_stack=4)
@@ -404,39 +398,30 @@ def train(args):
             reset_num_timesteps=not args.resume
         )
     except KeyboardInterrupt:
-        # This block won't normally be reached due to signal handler,
-        # but included as a fallback
         save_model_on_exit()
     
     os.makedirs(os.path.dirname(model_file), exist_ok=True)
     model.save(model_file)
     print(f"Model saved to {model_file}.zip")
     
-    # Clear global references after successful completion
     global_model = None
     global_model_file = None
 
 def play(args):
-    """Play the game using a pre-trained model."""
-    # Ensure model path exists
     model_file = os.path.join(args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path), "kungfu_ppo_optuna")
     if not os.path.exists(model_file + ".zip"):
         print(f"Error: No trained model found at {model_file}.zip. Please train a model first.")
         sys.exit(1)
 
-    # Create environment with rendering enabled
-    env = make_vec_env(1, render=True)  # Render set to True for visual play
+    env = make_vec_env(1, render=True)
     env = VecFrameStack(env, n_stack=4)
 
-    # Determine device
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Load the trained model
     model = PPO.load(model_file, env=env, device=device)
     print(f"Loaded model from {model_file}.zip")
 
-    # Play loop
     obs = env.reset()
     total_reward = 0
     done = False
@@ -444,23 +429,22 @@ def play(args):
 
     try:
         while not done:
-            action, _states = model.predict(obs, deterministic=True)  # Use deterministic for best performance
+            action, _states = model.predict(obs, deterministic=True)
             obs, reward, done, info = env.step(action)
-            total_reward += reward[0]  # Assuming single environment
+            total_reward += reward[0]
             step_count += 1
             
-            # Optional: Print some info during play
             if step_count % 100 == 0:
                 print(f"Step: {step_count}, Reward: {reward[0]}, Total Reward: {total_reward}, Info: {info[0]}")
             
-            env.render()  # Render the environment (handled by retro if render_mode='human')
+            env.render()
 
     except KeyboardInterrupt:
         print("\nPlay interrupted by user.")
     
     finally:
         print(f"Play ended. Total steps: {step_count}, Total reward: {total_reward}")
-        env.close()
+        env.close()  # Ensure environment is properly closed
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or play Kung Fu with PPO.")
@@ -468,9 +452,9 @@ if __name__ == "__main__":
     parser.add_argument("--play", action="store_true", help="Play the game with a trained model")
     parser.add_argument("--model_path", default="models/kungfu_ppo_optuna", help="Path to save/load model")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
-    parser.add_argument("--timesteps", type=int, default=500000, help="Total timesteps for training")
-    parser.add_argument("--eval_timesteps", type=int, default=50000, help="Timesteps per Optuna trial")
-    parser.add_argument("--n_trials", type=int, default=20, help="Number of Optuna trials")
+    parser.add_argument("--timesteps", type=int, default=100_000, help="Total timesteps for training")
+    parser.add_argument("--eval_timesteps", type=int, default=10_000, help="Timesteps per Optuna trial")
+    parser.add_argument("--n_trials", type=int, default=10, help="Number of Optuna trials")
     parser.add_argument("--timeout", type=int, default=3600, help="Optuna timeout in seconds")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
@@ -482,13 +466,11 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    # Ensure directories exist if training
     if args.train or args.play:
         os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
         if args.train:
             os.makedirs(args.log_dir, exist_ok=True)
 
-    # Execute based on mode
     if args.train and args.play:
         print("Error: Cannot use --train and --play together. Choose one mode.")
         sys.exit(1)
@@ -499,24 +481,3 @@ if __name__ == "__main__":
     else:
         print("Please specify a mode: --train or --play")
         parser.print_help()
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train", action="store_true")
-    parser.add_argument("--model_path", default="models/kungfu_ppo_optuna")
-    parser.add_argument("--cuda", action="store_true")
-    parser.add_argument("--timesteps", type=int, default=500000)
-    parser.add_argument("--eval_timesteps", type=int, default=50000)
-    parser.add_argument("--n_trials", type=int, default=20)
-    parser.add_argument("--timeout", type=int, default=3600)
-    parser.add_argument("--log_dir", default="logs")
-    parser.add_argument("--num_envs", type=int, default=1)
-    parser.add_argument("--render", action="store_true")
-    parser.add_argument("--enable_file_logging", action="store_true")
-    parser.add_argument("--progress_bar", action="store_true")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--skip_optuna", action="store_true")
-    
-    args = parser.parse_args()
-    if args.train:
-        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
-        os.makedirs(args.log_dir, exist_ok=True)
-        train(args)
