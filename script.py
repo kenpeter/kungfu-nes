@@ -93,9 +93,12 @@ class KungFuWrapper(Wrapper):
         ]
         self.last_hp = 0
         self.action_counts = np.zeros(11)
-        self.last_enemies = [0] * 4  # Track previous enemy states
+        self.last_enemies = [0] * 4
+        self.max_steps = 1000  # Terminate episode after 1000 steps
+        self.current_step = 0
 
     def reset(self, **kwargs):
+        self.current_step = 0
         obs = self.env.reset(**kwargs)
         self.last_hp = self.env.get_ram()[0x04A6]
         self.action_counts = np.zeros(11)
@@ -103,6 +106,7 @@ class KungFuWrapper(Wrapper):
         return self._get_obs(obs)
 
     def step(self, action):
+        self.current_step += 1
         self.action_counts[action] += 1
         obs, _, done, info = self.env.step(self.actions[action])
         ram = self.env.get_ram()
@@ -116,21 +120,25 @@ class KungFuWrapper(Wrapper):
         
         hp_loss = max(0, int(self.last_hp) - int(hp))
         curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
-        enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)  # Enemy defeated
+        enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
         self.last_enemies = curr_enemies
         
         raw_reward = (
-            score * 1.0 +          # Increased from 0.01 to 1.0
+            score * 1.0 +
             scroll * 0.5 +
             pos_x * 0.1 +
             (255 - boss_hp) * 1.0 +
-            enemy_hit * 50.0 -     # Bonus for hitting enemies
-            hp_loss * 10.0
+            enemy_hit * 100.0 -
+            hp_loss * 5.0
         )
-        clipped_reward = np.clip(raw_reward, -10, 10)
-        normalized_reward = clipped_reward / 10.0
+        clipped_reward = np.clip(raw_reward, -20, 20)
+        normalized_reward = clipped_reward / 20.0
         
         self.last_hp = hp
+        
+        if self.current_step >= self.max_steps:
+            done = True
+            info["terminated_by_step_limit"] = True
         
         info.update({
             "score": score,
@@ -157,7 +165,7 @@ class KungFuWrapper(Wrapper):
         return {"viewport": viewport.astype(np.uint8), "enemy_vector": enemy_vector}
 
 class TrainingCallback(BaseCallback):
-    def __init__(self, progress_bar=False, logger=None):
+    def __init__(self, progress_bar=False, logger=None, total_timesteps=10000):
         super().__init__()
         self.logger = logger or logging.getLogger()
         self.progress_bar = progress_bar
@@ -170,7 +178,7 @@ class TrainingCallback(BaseCallback):
         self.episode_start_step = 0
         
         if progress_bar:
-            self.pbar = tqdm(total=10000, desc="Training")
+            self.pbar = tqdm(total=total_timesteps, desc="Combat Training")
 
     def _on_step(self):
         self.total_steps += 1
@@ -187,6 +195,7 @@ class TrainingCallback(BaseCallback):
             self.logger.record("game/pos_x", info.get("pos_x", 0))
             self.logger.record("game/stage", info.get("stage", 0))
             self.logger.record("game/boss_hp", info.get("boss_hp", 0))
+            self.logger.record("game/enemy_hit", info.get("enemy_hit", 0))
             action_percentages = info.get("action_percentages", np.zeros(11))
             for i, percentage in enumerate(action_percentages):
                 self.logger.record(f"actions/action_{i}_pct", percentage)
@@ -203,7 +212,8 @@ class TrainingCallback(BaseCallback):
                 f"Score={info.get('score', 0)}, "
                 f"HP={info.get('hp', 0)}, "
                 f"Scroll={info.get('scroll', 0)}, "
-                f"Stage={info.get('stage', 0)}"
+                f"Stage={info.get('stage', 0)}, "
+                f"Enemy Hits={info.get('enemy_hit', 0)}"
             )
             self.last_log_time = current_time
         
@@ -310,7 +320,7 @@ def objective(trial):
     batch_size = trial.suggest_int("batch_size", 64, 512, step=64)
     n_epochs = trial.suggest_int("n_epochs", 3, 20)
     gamma = trial.suggest_float("gamma", 0.9, 0.999)
-    clip_range = trial.suggest_float("clip_range", 0.1, 0.3)
+    clip_range = trial.suggest_float("clip_range", 0.1, 0.4)
 
     env = make_vec_env(1)
     env = VecFrameStack(env, n_stack=4)
@@ -325,11 +335,13 @@ def objective(trial):
         n_epochs=n_epochs,
         gamma=gamma,
         clip_range=clip_range,
+        ent_coef=0.01,
+        vf_coef=0.75,
         tensorboard_log=args.log_dir,
         device="cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     )
 
-    callback = TrainingCallback(progress_bar=args.progress_bar, logger=logger)
+    callback = TrainingCallback(progress_bar=args.progress_bar, logger=logger, total_timesteps=args.eval_timesteps)
     try:
         model.learn(
             total_timesteps=args.eval_timesteps,
@@ -367,35 +379,37 @@ def train(args):
     os.makedirs(model_path, exist_ok=True)
     
     default_params = {
-        'learning_rate': 0.0003,
-        'n_steps': 2048,
-        'batch_size': 64,
+        'learning_rate': 0.0001,
+        'n_steps': 4096,
+        'batch_size': 128,
         'n_epochs': 10,
         'gamma': 0.99,
-        'clip_range': 0.2
+        'clip_range': 0.3
     }
     
-    if args.resume and os.path.exists(model_file + ".zip"):
+    # Decide whether to run Optuna (default is True, unless --no-optuna is set)
+    if not args.no_optuna:
+        logger.info("Running Optuna optimization...")
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout)
+        
+        logger.info("Best hyperparameters: %s", study.best_params)
+        logger.info("Best value: %s", study.best_value)
+        best_params = study.best_params
+        
+        study_file = os.path.join(model_path, "optuna_study.pkl")
+        with open(study_file, 'wb') as f:
+            pickle.dump(study, f)
+        logger.info(f"Optuna study saved to {study_file}")
+    else:
+        logger.info("Skipping Optuna, using default parameters")
+        best_params = default_params
+    
+    # Create or load the model
+    if args.resume and os.path.exists(model_file + ".zip") and args.no_optuna:
         logger.info(f"Loading existing model from {model_file}.zip")
         model = PPO.load(model_file, env=env, device="cuda" if args.cuda and torch.cuda.is_available() else "cpu")
     else:
-        if not args.skip_optuna:
-            logger.info("Running Optuna optimization...")
-            study = optuna.create_study(direction="maximize")
-            study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout)
-            
-            logger.info("Best hyperparameters: %s", study.best_params)
-            logger.info("Best value: %s", study.best_value)
-            best_params = study.best_params
-            
-            study_file = os.path.join(model_path, "optuna_study.pkl")
-            with open(study_file, 'wb') as f:
-                pickle.dump(study, f)
-            logger.info(f"Optuna study saved to {study_file}")
-        else:
-            logger.info("Skipping Optuna, using default parameters")
-            best_params = default_params
-        
         logger.info("Creating new model with parameters: %s", best_params)
         model = PPO(
             policy="MultiInputPolicy",
@@ -407,13 +421,15 @@ def train(args):
             n_epochs=best_params["n_epochs"],
             gamma=best_params["gamma"],
             clip_range=best_params["clip_range"],
+            ent_coef=0.01,
+            vf_coef=0.75,
             tensorboard_log=args.log_dir,
             device="cuda" if args.cuda and torch.cuda.is_available() else "cpu"
         )
 
     global_model = model
     
-    callback = TrainingCallback(progress_bar=args.progress_bar, logger=logger)
+    callback = TrainingCallback(progress_bar=args.progress_bar, logger=logger, total_timesteps=args.timesteps)
     if args.progress_bar:
         callback.pbar.total = args.timesteps
     
@@ -488,7 +504,7 @@ def play(args):
         env.close()
         if args.render:
             try:
-                env.envs[0].env.close()  # Explicitly close the underlying Retro env
+                env.envs[0].env.close()
             except Exception as e:
                 logger.warning(f"Error closing render window: {e}")
 
@@ -498,16 +514,16 @@ if __name__ == "__main__":
     parser.add_argument("--play", action="store_true", help="Play with a trained model")
     parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save/load model")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
-    parser.add_argument("--timesteps", type=int, default=10000, help="Total timesteps for training")
+    parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps for training")
     parser.add_argument("--eval_timesteps", type=int, default=10000, help="Timesteps per Optuna trial")
-    parser.add_argument("--n_trials", type=int, default=10, help="Number of Optuna trials")
+    parser.add_argument("--n_trials", type=int, default=5, help="Number of Optuna trials")
     parser.add_argument("--timeout", type=int, default=3600, help="Optuna timeout in seconds")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
     parser.add_argument("--render", action="store_true", help="Render during training/play")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
     parser.add_argument("--resume", action="store_true", help="Resume training from saved model")
-    parser.add_argument("--skip_optuna", action="store_true", help="Skip Optuna optimization")
+    parser.add_argument("--no_optuna", action="store_true", help="Disable Optuna optimization (default: enabled)")
     
     args = parser.parse_args()
 
