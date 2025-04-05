@@ -57,16 +57,13 @@ class SimpleCNN(BaseFeaturesExtractor):
         
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport)
-            
         if isinstance(enemy_vector, np.ndarray):
             enemy_vector = torch.from_numpy(enemy_vector)
             
         if len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0)
-            
-        if len(viewport.shape) == 4:
-            if viewport.shape[3] == 4 or viewport.shape[3] == 1:
-                viewport = viewport.permute(0, 3, 1, 2)
+        if len(viewport.shape) == 4 and (viewport.shape[3] == 4 or viewport.shape[3] == 1):
+            viewport = viewport.permute(0, 3, 1, 2)
         
         if viewport.shape[1] != 4:
             raise ValueError(f"Expected 4 channels in viewport, got shape {viewport.shape}")
@@ -99,7 +96,7 @@ class KungFuWrapper(Wrapper):
 
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
-        self.last_hp = self.env.get_ram()[0x04A6]  # Initialize HP
+        self.last_hp = self.env.get_ram()[0x04A6]
         self.action_counts = np.zeros(11)
         return self._get_obs(obs)
 
@@ -108,34 +105,26 @@ class KungFuWrapper(Wrapper):
         obs, _, done, info = self.env.step(self.actions[action])
         ram = self.env.get_ram()
         
-        # Extract key variables from RAM
-        score = sum(ram[0x0531:0x0536]) * 100  # Combine score digits (5 bytes)
-        scroll = ram[0x00E5]                    # Screen Scroll 1 (primary scroll value)
-        hp = ram[0x04A6]                        # Hero HP
-        pos_x = ram[0x0094]                     # Hero X position
-        stage = ram[0x0058]                     # Current stage
-        boss_hp = ram[0x04A5]                   # Boss HP
+        score = sum(ram[0x0531:0x0536]) * 100
+        scroll = ram[0x00E5]
+        hp = ram[0x04A6]
+        pos_x = ram[0x0094]
+        stage = ram[0x0058]
+        boss_hp = ram[0x04A5]
         
-        # Calculate HP loss
         hp_loss = max(0, int(self.last_hp) - int(hp))
-        
-        # Reward components
         raw_reward = (
-            score * 0.01 +           # Small reward for accumulating score
-            scroll * 0.5 +           # Reward for progressing through the level
-            pos_x * 0.1 +            # Reward for moving right
-            (255 - boss_hp) * 1.0 -  # Reward for damaging boss (255 is max HP)
-            hp_loss * 10.0           # Penalty for losing HP
+            score * 0.01 +
+            scroll * 0.5 +
+            pos_x * 0.1 +
+            (255 - boss_hp) * 1.0 -
+            hp_loss * 10.0
         )
-        
-        # Clip and normalize reward
         clipped_reward = np.clip(raw_reward, -10, 10)
-        normalized_reward = clipped_reward / 10.0  # Range [-1, 1]
+        normalized_reward = clipped_reward / 10.0
         
-        # Update last HP for next step
         self.last_hp = hp
         
-        # Info for logging/debugging
         info.update({
             "score": score,
             "hp": hp,
@@ -149,26 +138,16 @@ class KungFuWrapper(Wrapper):
         })
         
         return self._get_obs(obs), normalized_reward, done, info
+
     def _get_obs(self, obs):
-        # Convert to grayscale and resize
         gray = np.dot(obs[..., :3], [0.299, 0.587, 0.114])
         viewport = cv2.resize(gray, self.viewport_size)[..., np.newaxis]
-        
-        # Get enemy positions relative to hero
         ram = self.env.get_ram()
         hero_x = int(ram[0x0094])
-        enemy_xs = [
-            int(ram[0x008E]), int(ram[0x008F]),
-            int(ram[0x0090]), int(ram[0x0091])
-        ]
-        
+        enemy_xs = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
         enemy_vector = np.array([e - hero_x if e != 0 else 0 for e in enemy_xs], dtype=np.float32)
-        
-        return {
-            "viewport": viewport.astype(np.uint8),
-            "enemy_vector": enemy_vector
-        }
-    
+        return {"viewport": viewport.astype(np.uint8), "enemy_vector": enemy_vector}
+
 class TrainingCallback(BaseCallback):
     def __init__(self, progress_bar=False, logger=None):
         super().__init__()
@@ -180,6 +159,7 @@ class TrainingCallback(BaseCallback):
         self.total_steps = 0
         self.episode_rewards = []
         self.current_episode_reward = 0
+        self.episode_start_step = 0
         
         if progress_bar:
             self.pbar = tqdm(total=10000, desc="Training")
@@ -188,30 +168,34 @@ class TrainingCallback(BaseCallback):
         self.total_steps += 1
         self.current_episode_reward += self.locals["rewards"][0]
         
-        # Log to TensorBoard
         if self.num_timesteps % 100 == 0:
             info = self.locals["infos"][0]
             self.logger.record("train/step_reward", self.locals["rewards"][0])
-            self.logger.record("train/total_reward", self.current_episode_reward)
+            self.logger.record("train/total_episode_reward", self.current_episode_reward)
+            self.logger.record("train/avg_episode_reward", np.mean(self.episode_rewards or [0]))
             self.logger.record("game/score", info.get("score", 0))
             self.logger.record("game/hp", info.get("hp", 0))
-            self.logger.record("game/projectiles", info.get("projectiles", 0))
-            self.logger.record("game/success_dodges", info.get("success_dodges", 0))
-            self.logger.record("game/failed_dodges", info.get("failed_dodges", 0))
-            self.logger.record("time/steps_per_second", self.total_steps / (time.time() - self.start_time))
+            self.logger.record("game/scroll", info.get("scroll", 0))
+            self.logger.record("game/pos_x", info.get("pos_x", 0))
+            self.logger.record("game/stage", info.get("stage", 0))
+            self.logger.record("game/boss_hp", info.get("boss_hp", 0))
+            action_percentages = info.get("action_percentages", np.zeros(11))
+            for i, percentage in enumerate(action_percentages):
+                self.logger.record(f"actions/action_{i}_pct", percentage)
+            steps_per_second = self.total_steps / (time.time() - self.start_time)
+            self.logger.record("time/steps_per_second", steps_per_second)
         
-        # Console logging
         current_time = time.time()
         if current_time - self.last_log_time > 30 or self.total_steps % 100 == 0:
             info = self.locals["infos"][0]
             self.logger.info(
                 f"Step {self.total_steps}: "
                 f"Reward={self.locals['rewards'][0]:.2f}, "
-                f"Total Reward={self.current_episode_reward:.2f}, "
+                f"Total={self.current_episode_reward:.2f}, "
                 f"Score={info.get('score', 0)}, "
                 f"HP={info.get('hp', 0)}, "
-                f"Projectiles={info.get('projectiles', 0)}, "
-                f"Dodges={info.get('success_dodges', 0)}"
+                f"Scroll={info.get('scroll', 0)}, "
+                f"Stage={info.get('stage', 0)}"
             )
             self.last_log_time = current_time
         
@@ -222,19 +206,20 @@ class TrainingCallback(BaseCallback):
     def _on_rollout_end(self):
         self.episode_count += 1
         self.episode_rewards.append(self.current_episode_reward)
-        
-        # Log episode metrics to TensorBoard
+        episode_length = self.total_steps - self.episode_start_step
         self.logger.record("train/episode_reward", self.current_episode_reward)
         self.logger.record("train/avg_episode_reward", np.mean(self.episode_rewards))
-        self.logger.record("train/episode_length", self.total_steps / self.episode_count)
-        
+        self.logger.record("train/episode_length", episode_length)
+        self.logger.record("train/episode_count", self.episode_count)
         self.logger.info(
             f"Episode {self.episode_count} completed: "
             f"Total Reward={self.current_episode_reward:.2f}, "
-            f"Avg Reward={np.mean(self.episode_rewards):.2f}"
+            f"Avg Reward={np.mean(self.episode_rewards):.2f}, "
+            f"Length={episode_length}"
         )
         self.current_episode_reward = 0
-        
+        self.episode_start_step = self.total_steps
+
     def _on_training_end(self):
         if self.progress_bar:
             self.pbar.close()
@@ -245,34 +230,28 @@ class TrainingCallback(BaseCallback):
             f"Avg Reward: {np.mean(self.episode_rewards):.2f}, "
             f"Duration: {training_duration:.2f} seconds"
         )
-        
+
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
     )
     return logging.getLogger()
 
 def save_model_with_logging(model, path, logger):
     logger.info(f"Starting model save to {path}")
     start_time = time.time()
-    
     logger.info("Saving model components:")
     logger.info(f"- Policy network: {model.policy}")
     optimizer_state = getattr(model.policy, 'optimizer', None)
     if optimizer_state:
         logger.info(f"- Optimizer state: {optimizer_state.state_dict()}")
     else:
-        logger.info("- Optimizer state: Not initialized (training may not have started)")
+        logger.info("- Optimizer state: Not initialized")
     logger.info(f"- Features extractor: {model.policy.features_extractor}")
-    
     try:
         save_start = time.time()
         model.save(path)
@@ -308,12 +287,10 @@ def make_env(render=False):
 def make_vec_env(num_envs, render=False):
     logger.info(f"Creating vectorized environment with {num_envs} subprocesses")
     start_time = time.time()
-    
     if num_envs > 1:
         env = SubprocVecEnv([lambda: make_env(render) for _ in range(num_envs)])
     else:
         env = DummyVecEnv([lambda: make_env(render)])
-    
     logger.info(f"Environment created in {time.time() - start_time:.2f} seconds")
     return env
 
@@ -368,41 +345,34 @@ def train(args):
     logger.info("Starting training session")
     logger.info(f"Command line arguments: {vars(args)}")
     
-    # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     atexit.register(save_model_on_exit)
     
-    # Environment setup
-    logger.info("Creating environments...")
     env_start_time = time.time()
     env = make_vec_env(args.num_envs, render=args.render)
     env = VecFrameStack(env, n_stack=4)
     logger.info(f"Environments created in {time.time() - env_start_time:.2f} seconds")
     
-    # Model setup
     model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
-    model_file = os.path.join(model_path, "kungfu_ppo_optuna")
+    model_file = os.path.join(model_path, "kungfu_ppo")
     global_model_file = model_file
     os.makedirs(model_path, exist_ok=True)
     
-    # Default best parameters
-    best_params = {
-        'learning_rate': 0.0007181399768445935, 
-        'n_steps': 16384, 
-        'batch_size': 256, 
-        'n_epochs': 4, 
-        'gamma': 0.9051620100876205, 
-        'clip_range': 0.1003777999324603
+    # Default parameters if not using Optuna
+    default_params = {
+        'learning_rate': 0.0003,
+        'n_steps': 2048,
+        'batch_size': 64,
+        'n_epochs': 10,
+        'gamma': 0.99,
+        'clip_range': 0.2
     }
     
-    # Load or create model
     if args.resume and os.path.exists(model_file + ".zip"):
         logger.info(f"Loading existing model from {model_file}.zip")
-        load_start = time.time()
         model = PPO.load(model_file, env=env, device="cuda" if args.cuda and torch.cuda.is_available() else "cpu")
-        logger.info(f"Model loaded in {time.time() - load_start:.2f} seconds")
     else:
-        if not args.skip_optuna and not os.path.exists(os.path.join(model_path, "optuna_study.pkl")):
+        if not args.skip_optuna:
             logger.info("Running Optuna optimization...")
             study = optuna.create_study(direction="maximize")
             study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout)
@@ -411,18 +381,13 @@ def train(args):
             logger.info("Best value: %s", study.best_value)
             best_params = study.best_params
             
-            # Save Optuna study
             study_file = os.path.join(model_path, "optuna_study.pkl")
             with open(study_file, 'wb') as f:
                 pickle.dump(study, f)
             logger.info(f"Optuna study saved to {study_file}")
-        elif os.path.exists(os.path.join(model_path, "optuna_study.pkl")):
-            logger.info("Loading previous Optuna results...")
-            study_file = os.path.join(model_path, "optuna_study.pkl")
-            with open(study_file, 'rb') as f:
-                study = pickle.load(f)
-            best_params = study.best_params
-            logger.info("Loaded best hyperparameters: %s", best_params)
+        else:
+            logger.info("Skipping Optuna, using default parameters")
+            best_params = default_params
         
         logger.info("Creating new model with parameters: %s", best_params)
         model = PPO(
@@ -451,17 +416,11 @@ def train(args):
         model.learn(
             total_timesteps=args.timesteps,
             callback=callback,
-            tb_log_name="PPO_KungFu_Best",
+            tb_log_name="PPO_KungFu",
             reset_num_timesteps=not args.resume
         )
         logger.info(f"Training completed in {time.time() - train_start:.2f} seconds")
-        
-        # Model saving
         save_model_with_logging(model, model_file, logger)
-        
-    except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
-        save_model_on_exit()
     except Exception as e:
         logger.error(f"Training failed: {str(e)}")
         raise
@@ -477,18 +436,14 @@ def play(args):
     logger = setup_logging(args.log_dir)
     logger.info("Starting play session")
     
-    model_file = os.path.join(args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path), "kungfu_ppo_optuna")
+    model_file = os.path.join(args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path), "kungfu_ppo")
     if not os.path.exists(model_file + ".zip"):
         logger.error(f"No trained model found at {model_file}.zip")
         sys.exit(1)
 
-    logger.info("Creating environment...")
     env = make_vec_env(1, render=True)
     env = VecFrameStack(env, n_stack=4)
-
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    logger.info(f"Using device: {device}")
-
     logger.info(f"Loading model from {model_file}.zip")
     model = PPO.load(model_file, env=env, device=device)
 
@@ -504,15 +459,9 @@ def play(args):
             obs, reward, done, info = env.step(action)
             total_reward += reward[0]
             step_count += 1
-            
             if step_count % 100 == 0:
-                logger.info(
-                    f"Step: {step_count}, Reward: {reward[0]:.2f}, "
-                    f"Total Reward: {total_reward:.2f}, HP: {info[0].get('hp', 0)}"
-                )
-            
+                logger.info(f"Step: {step_count}, Reward: {reward[0]:.2f}, Total: {total_reward:.2f}")
             env.render()
-
     except KeyboardInterrupt:
         logger.info("\nPlay interrupted by user.")
     finally:
@@ -522,17 +471,16 @@ def play(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or play Kung Fu with PPO.")
     parser.add_argument("--train", action="store_true", help="Train the model")
-    parser.add_argument("--play", action="store_true", help="Play the game with a trained model")
-    parser.add_argument("--model_path", default="models/kungfu_ppo_optuna", help="Path to save/load model")
+    parser.add_argument("--play", action="store_true", help="Play with a trained model")
+    parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save/load model")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
-    parser.add_argument("--timesteps", type=int, default=100_000, help="Total timesteps for training")
-    parser.add_argument("--eval_timesteps", type=int, default=10_000, help="Timesteps per Optuna trial")
+    parser.add_argument("--timesteps", type=int, default=10000, help="Total timesteps for training")
+    parser.add_argument("--eval_timesteps", type=int, default=10000, help="Timesteps per Optuna trial")
     parser.add_argument("--n_trials", type=int, default=5, help="Number of Optuna trials")
     parser.add_argument("--timeout", type=int, default=3600, help="Optuna timeout in seconds")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
-    parser.add_argument("--render", action="store_true", help="Render during training (slows down)")
-    parser.add_argument("--enable_file_logging", action="store_true", help="Enable file logging")
+    parser.add_argument("--render", action="store_true", help="Render during training")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
     parser.add_argument("--resume", action="store_true", help="Resume training from saved model")
     parser.add_argument("--skip_optuna", action="store_true", help="Skip Optuna optimization")
@@ -545,7 +493,7 @@ if __name__ == "__main__":
             os.makedirs(args.log_dir, exist_ok=True)
 
     if args.train and args.play:
-        print("Error: Cannot use --train and --play together. Choose one mode.")
+        print("Error: Cannot use --train and --play together.")
         sys.exit(1)
     elif args.train:
         train(args)
