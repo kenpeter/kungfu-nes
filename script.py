@@ -24,10 +24,7 @@ global_model = None
 global_model_file = None
 logger = None
 
-# [SimpleCNN, KungFuWrapper, CombatTrainingCallback classes remain unchanged]
-# Skipping repetition for brevity
 class SimpleCNN(BaseFeaturesExtractor):
-    # ... (unchanged)
     def __init__(self, observation_space, features_dim=256):
         super(SimpleCNN, self).__init__(observation_space, features_dim)
         assert isinstance(observation_space, spaces.Dict), "Observation space must be a Dict"
@@ -82,12 +79,10 @@ class SimpleCNN(BaseFeaturesExtractor):
         return self.linear(combined)
 
 class KungFuWrapper(Wrapper):
-    # ... (unchanged)
     def __init__(self, env):
         super().__init__(env)
         self.viewport_size = (84, 84)
         
-        # Define actions with names
         self.actions = [
             [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op
             [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch
@@ -195,7 +190,6 @@ class KungFuWrapper(Wrapper):
         }
 
 class CombatTrainingCallback(BaseCallback):
-    # ... (unchanged)
     def __init__(self, progress_bar=False, logger=None):
         super().__init__()
         self.logger = logger or logging.getLogger()
@@ -291,18 +285,16 @@ class CombatTrainingCallback(BaseCallback):
         )
 
 def setup_logging(log_dir):
-    # ... (unchanged)
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
     )
     return logging.getLogger()
 
 def save_model_with_logging(model, path, logger):
-    # ... (unchanged)
     logger.info(f"Starting model save to {path}")
     start_time = time.time()
     try:
@@ -317,12 +309,10 @@ def save_model_with_logging(model, path, logger):
         raise
 
 def signal_handler(sig, frame):
-    # ... (unchanged)
     logger.info('\nReceived interrupt signal, saving model...')
     save_model_on_exit()
 
 def save_model_on_exit():
-    # ... (unchanged)
     global global_model, global_model_file, logger
     if global_model is not None and global_model_file is not None:
         try:
@@ -333,14 +323,12 @@ def save_model_on_exit():
     sys.exit(0)
 
 def make_env(render=False):
-    # ... (unchanged)
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     if render:
         env.render_mode = 'human'
     return KungFuWrapper(env)
 
 def make_vec_env(num_envs, render=False):
-    # ... (unchanged)
     logger.info(f"Creating vectorized environment with {num_envs} subprocesses")
     if num_envs > 1:
         env = SubprocVecEnv([lambda: make_env(render) for _ in range(num_envs)])
@@ -351,7 +339,6 @@ def make_vec_env(num_envs, render=False):
 def objective(trial, args, env):
     global global_model, global_model_file, logger
     
-    # Define hyperparameter search space
     combat_params = {
         'learning_rate': trial.suggest_loguniform('learning_rate', 1e-5, 1e-2),
         'n_steps': trial.suggest_categorical('n_steps', [512, 1024, 2048, 4096]),
@@ -366,7 +353,6 @@ def objective(trial, args, env):
     
     logger.info(f"Trial {trial.number} with params: {combat_params}")
     
-    # Create or load model
     model_file = os.path.join(args.model_path, f"kungfu_ppo_trial_{trial.number}")
     if args.resume and os.path.exists(model_file + ".zip"):
         logger.info(f"Resuming model from {model_file}.zip")
@@ -388,24 +374,20 @@ def objective(trial, args, env):
     global_model = model
     global_model_file = model_file
     
-    # Callback for training
     callback = CombatTrainingCallback(progress_bar=args.progress_bar, logger=logger)
     if args.progress_bar:
         callback.pbar.total = args.timesteps
     
-    # Train the model
     model.learn(
         total_timesteps=args.timesteps,
         callback=callback,
         tb_log_name=f"PPO_KungFu_trial_{trial.number}",
-        reset_num_timesteps=not args.resume  # Reset timesteps if not resuming
+        reset_num_timesteps=not args.resume
     )
     
-    # Evaluate the model (total hits as the objective to maximize)
     total_hits = callback.total_hits
     logger.info(f"Trial {trial.number} completed with total_hits: {total_hits}")
     
-    # Save the model for this trial
     save_model_with_logging(model, global_model_file, logger)
     
     return total_hits
@@ -424,11 +406,9 @@ def train(args):
     model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
     os.makedirs(model_path, exist_ok=True)
     
-    # Optuna study storage
     study_name = "kungfu_ppo_study"
     storage_name = f"sqlite:///{os.path.join(args.log_dir, 'optuna_study.db')}"
     
-    # Load or create study
     if args.resume and os.path.exists(os.path.join(args.log_dir, 'optuna_study.db')):
         logger.info(f"Resuming existing Optuna study from {storage_name}")
         study = optuna.load_study(study_name=study_name, storage=storage_name)
@@ -440,12 +420,10 @@ def train(args):
     logger.info(f"Starting Optuna optimization with {n_trials} trials")
     study.optimize(lambda trial: objective(trial, args, env), n_trials=n_trials)
     
-    # Log best trial
     logger.info(f"Best trial: {study.best_trial.number}")
     logger.info(f"Best parameters: {study.best_params}")
     logger.info(f"Best value (total hits): {study.best_value}")
     
-    # Save the best model
     best_model_file = os.path.join(model_path, "kungfu_ppo_best")
     global_model_file = best_model_file
     best_model = PPO.load(f"{model_path}/kungfu_ppo_trial_{study.best_trial.number}", env=env)
@@ -455,7 +433,6 @@ def train(args):
     logger.info("Training session ended")
 
 def play(args):
-    # ... (unchanged)
     global logger
     logger = setup_logging(args.log_dir)
     logger.info("Starting play session")
@@ -465,9 +442,12 @@ def play(args):
         logger.error(f"No trained model found at {model_file}.zip")
         sys.exit(1)
 
-    env = make_vec_env(1, render=True)
+    # Create a single vectorized environment
+    env = DummyVecEnv([lambda: make_env(render=args.render)])
+    env = VecFrameStack(env, n_stack=4)
+    
     model = PPO.load(model_file, env=env, device="cuda" if args.cuda else "cpu")
-
+    
     obs = env.reset()
     total_reward = 0
     total_hits = 0
@@ -500,13 +480,33 @@ def play(args):
                     print(">>> ENEMY HIT! <<<")
             
             if args.render:
-                env.render()
+                try:
+                    env.render(mode='human')
+                    logger.debug("Rendering frame")
+                except Exception as e:
+                    logger.warning(f"Rendering failed: {str(e)}")
+                    break
+
     except KeyboardInterrupt:
         logger.info("\nPlay interrupted by user.")
     finally:
         hit_rate = total_hits / (step_count + 1e-6)
         logger.info(f"Play ended. Steps: {step_count}, Hits: {total_hits}, Hit Rate: {hit_rate:.2%}")
-        env.close()
+        
+        if args.render:
+            try:
+                env.render(mode='human')
+                base_env = env.envs[0]
+                if hasattr(base_env, 'viewer') and base_env.viewer is not None:
+                    base_env.viewer.close()
+                    base_env.viewer = None
+            except Exception as e:
+                logger.warning(f"Render cleanup error: {str(e)}")
+        
+        try:
+            env.close()
+        except Exception as e:
+            logger.warning(f"Environment close error: {str(e)}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or play Kung Fu with PPO and Optuna.")
@@ -519,7 +519,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--render", action="store_true", help="Render during training/play")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
-    parser.add_argument("--n_trials", type=int, default=10, help="Number of Optuna trials")
+    parser.add_argument("--n_trials", type=int, default=5, help="Number of Optuna trials")
     parser.add_argument("--resume", action="store_true", help="Resume training from saved study and models")
     
     args = parser.parse_args()
