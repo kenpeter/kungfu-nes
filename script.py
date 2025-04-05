@@ -117,7 +117,16 @@ class KungFuWrapper(Wrapper):
         
         hp_loss = max(0, int(self.last_hp) - int(hp))
         dodge_reward = self._calculate_dodge_reward(prev_projectiles, pos_x, hp_loss)
-        reward = (score * 0.1 + scroll * 0.5 - hp_loss * 10 + dodge_reward)
+        
+        # Calculate raw reward
+        raw_reward = (score * 0.1 + scroll * 0.5 - hp_loss * 10 + dodge_reward)
+        
+        # Clip to [-10, 10] to match the assumed range
+        clipped_reward = np.clip(raw_reward, -10, 10)
+        
+        # Normalize to [-1, 1]
+        normalized_reward = clipped_reward / 10.0
+        
         self.last_hp = hp
         
         info.update({
@@ -125,9 +134,12 @@ class KungFuWrapper(Wrapper):
             "action_percentages": self.action_counts / (sum(self.action_counts) + 1e-6),
             "projectiles": len(self.projectiles),
             "success_dodges": self.success_dodges,
-            "failed_dodges": self.failed_dodges
+            "failed_dodges": self.failed_dodges,
+            "raw_reward": raw_reward,  # Optional: for debugging
+            "normalized_reward": normalized_reward  # Optional: for debugging
         })
-        return self._get_obs(obs), reward, done, info
+        
+        return self._get_obs(obs), normalized_reward, done, info
 
     def _get_obs(self, obs):
         gray = np.dot(obs[..., :3], [0.299, 0.587, 0.114])
