@@ -519,7 +519,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--render", action="store_true", help="Render during training/play")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
-    parser.add_argument("--n_trials", type=int, default=5, help="Number of Optuna trials")
+    parser.add_argument("--n_trials", type=int, default=3, help="Number of Optuna trials")
     parser.add_argument("--resume", action="store_true", help="Resume training from saved study and models")
     
     args = parser.parse_args()
