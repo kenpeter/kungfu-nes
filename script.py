@@ -559,7 +559,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Kung Fu with PPO and Optuna.")
     parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save model")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
-    parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps per trial")
+    parser.add_argument("--timesteps", type=int, default=10000, help="Total timesteps per trial")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--render", action="store_true", help="Render during training")
