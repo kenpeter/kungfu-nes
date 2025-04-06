@@ -18,6 +18,7 @@ import time
 from datetime import datetime
 from tqdm import tqdm
 import optuna
+import sqlite3
 
 # Global variables
 global_model = None
@@ -44,32 +45,57 @@ class SimpleCNN(BaseFeaturesExtractor):
             n_flatten = self.cnn(sample_input).shape[1]
         
         enemy_vec_size = observation_space["enemy_vector"].shape[0]
-        combat_status_size = observation_space["combat_status"].shape[0]  # Now 2 elements
-        projectile_vec_size = observation_space["projectile_vector"].shape[0]
-        enemy_proximity_size = observation_space["enemy_proximity"].shape[0]  # New field
+        enemy_types_size = observation_space["enemy_types"].shape[0]
+        enemy_history_size = observation_space["enemy_history"].shape[0]
+        enemy_timers_size = observation_space["enemy_timers"].shape[0]
+        enemy_patterns_size = observation_space["enemy_patterns"].shape[0]
+        combat_status_size = observation_space["combat_status"].shape[0]
+        projectile_vec_size = observation_space["projectile_vectors"].shape[0]
+        enemy_proximity_size = observation_space["enemy_proximity"].shape[0]
+        boss_info_size = observation_space["boss_info"].shape[0]
         
         self.linear = nn.Sequential(
-            nn.Linear(n_flatten + enemy_vec_size + combat_status_size + projectile_vec_size + enemy_proximity_size, features_dim),
+            nn.Linear(
+                n_flatten + enemy_vec_size + enemy_types_size + enemy_history_size +
+                enemy_timers_size + enemy_patterns_size + combat_status_size +
+                projectile_vec_size + enemy_proximity_size + boss_info_size,
+                features_dim
+            ),
             nn.ReLU()
         )
     
     def forward(self, observations):
         viewport = observations["viewport"]
         enemy_vector = observations["enemy_vector"]
+        enemy_types = observations["enemy_types"]
+        enemy_history = observations["enemy_history"]
+        enemy_timers = observations["enemy_timers"]
+        enemy_patterns = observations["enemy_patterns"]
         combat_status = observations["combat_status"]
-        projectile_vector = observations["projectile_vector"]
-        enemy_proximity = observations["enemy_proximity"]  # New field
+        projectile_vectors = observations["projectile_vectors"]
+        enemy_proximity = observations["enemy_proximity"]
+        boss_info = observations["boss_info"]
         
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport)
         if isinstance(enemy_vector, np.ndarray):
             enemy_vector = torch.from_numpy(enemy_vector)
+        if isinstance(enemy_types, np.ndarray):
+            enemy_types = torch.from_numpy(enemy_types)
+        if isinstance(enemy_history, np.ndarray):
+            enemy_history = torch.from_numpy(enemy_history)
+        if isinstance(enemy_timers, np.ndarray):
+            enemy_timers = torch.from_numpy(enemy_timers)
+        if isinstance(enemy_patterns, np.ndarray):
+            enemy_patterns = torch.from_numpy(enemy_patterns)
         if isinstance(combat_status, np.ndarray):
             combat_status = torch.from_numpy(combat_status)
-        if isinstance(projectile_vector, np.ndarray):
-            projectile_vector = torch.from_numpy(projectile_vector)
+        if isinstance(projectile_vectors, np.ndarray):
+            projectile_vectors = torch.from_numpy(projectile_vectors)
         if isinstance(enemy_proximity, np.ndarray):
             enemy_proximity = torch.from_numpy(enemy_proximity)
+        if isinstance(boss_info, np.ndarray):
+            boss_info = torch.from_numpy(boss_info)
             
         if len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0)
@@ -80,18 +106,31 @@ class SimpleCNN(BaseFeaturesExtractor):
         
         if len(enemy_vector.shape) == 1:
             enemy_vector = enemy_vector.unsqueeze(0)
+        if len(enemy_types.shape) == 1:
+            enemy_types = enemy_types.unsqueeze(0)
+        if len(enemy_history.shape) == 1:
+            enemy_history = enemy_history.unsqueeze(0)
+        if len(enemy_timers.shape) == 1:
+            enemy_timers = enemy_timers.unsqueeze(0)
+        if len(enemy_patterns.shape) == 1:
+            enemy_patterns = enemy_patterns.unsqueeze(0)
         if len(combat_status.shape) == 1:
             combat_status = combat_status.unsqueeze(0)
-        if len(projectile_vector.shape) == 1:
-            projectile_vector = projectile_vector.unsqueeze(0)
+        if len(projectile_vectors.shape) == 1:
+            projectile_vectors = projectile_vectors.unsqueeze(0)
         if len(enemy_proximity.shape) == 1:
             enemy_proximity = enemy_proximity.unsqueeze(0)
+        if len(boss_info.shape) == 1:
+            boss_info = boss_info.unsqueeze(0)
             
-        combined = torch.cat([cnn_output, enemy_vector, combat_status, projectile_vector, enemy_proximity], dim=1)
+        combined = torch.cat([
+            cnn_output, enemy_vector, enemy_types, enemy_history, enemy_timers,
+            enemy_patterns, combat_status, projectile_vectors, enemy_proximity, boss_info
+        ], dim=1)
         return self.linear(combined)
 
 class KungFuWrapper(Wrapper):
-    def __init__(self, env):
+    def __init__(self, env, patterns_db="enemy_patterns.db"):
         super().__init__(env)
         self.viewport_size = (84, 84)
         
@@ -112,24 +151,99 @@ class KungFuWrapper(Wrapper):
         ]
         
         self.action_space = spaces.Discrete(len(self.actions))
+        self.enemy_types_map = {
+            0: "None",
+            1: "Knife Thrower",
+            2: "Midget",
+            3: "Snake",
+            4: "Dragon",
+            5: "Boss"
+        }
+        self.max_enemy_types = len(self.enemy_types_map)
+        self.max_enemies = 4
+        self.history_length = 5
+        self.max_projectiles = 2
+        self.patterns_length = 2  # [avg_attack_interval, avg_dx] per enemy type
+        
         self.observation_space = spaces.Dict({
             "viewport": spaces.Box(0, 255, (*self.viewport_size, 1), np.uint8),
-            "enemy_vector": spaces.Box(-255, 255, (8,), np.float32),
-            "combat_status": spaces.Box(-1, 1, (2,), np.float32),  # [HP, HP_change_rate]
-            "projectile_vector": spaces.Box(-255, 255, (4,), np.float32),
-            "enemy_proximity": spaces.Box(0, 1, (1,), np.float32)  # 1 if enemy is very close, 0 otherwise
+            "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
+            "enemy_types": spaces.Box(0, self.max_enemy_types - 1, (self.max_enemies,), np.float32),
+            "enemy_history": spaces.Box(-255, 255, (self.max_enemies * self.history_length * 2,), np.float32),
+            "enemy_timers": spaces.Box(0, 255, (self.max_enemies,), np.float32),
+            "enemy_patterns": spaces.Box(-255, 255, (self.max_enemies * self.patterns_length,), np.float32),
+            "combat_status": spaces.Box(-1, 1, (2,), np.float32),
+            "projectile_vectors": spaces.Box(-255, 255, (self.max_projectiles * 4,), np.float32),
+            "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
+            "boss_info": spaces.Box(-255, 255, (3,), np.float32)
         })
         
         self.last_hp = 0
-        self.last_hp_change = 0  # Track HP change rate
+        self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
-        self.last_enemies = [0] * 4
+        self.last_enemies = [0] * self.max_enemies
         self.max_steps = 1000
         self.current_step = 0
         self.total_steps = 0
         self.last_projectile_positions = []
         self.was_hit_by_projectile = False
         self.prev_frame = None
+        self.enemy_history = np.zeros((self.max_enemies, self.history_length, 2), dtype=np.float32)
+        self.enemy_positions = np.zeros((self.max_enemies, 2), dtype=np.float32)
+        self.enemy_types = np.zeros(self.max_enemies, dtype=np.float32)
+        self.enemy_timers = np.zeros(self.max_enemies, dtype=np.float32)
+        self.boss_info = np.zeros(3, dtype=np.float32)
+        self.enemy_patterns = np.zeros((self.max_enemies, self.patterns_length), dtype=np.float32)
+        
+        # Initialize SQLite database for enemy patterns
+        self.patterns_db = patterns_db
+        self._init_db()
+        self.stored_patterns = self._load_patterns()
+        # Track observations for updating patterns
+        self.attack_intervals = {et: [] for et in range(self.max_enemy_types)}
+        self.dx_history = {et: [] for et in range(self.max_enemy_types)}
+        self.last_attack_steps = [-1] * self.max_enemies
+        self.observation_counts = {et: 0 for et in range(self.max_enemy_types)}  # Track total observations
+
+    def _init_db(self):
+        """Initialize the SQLite database and create the enemy_patterns table if it doesn't exist."""
+        conn = sqlite3.connect(self.patterns_db)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS enemy_patterns (
+                enemy_type INTEGER PRIMARY KEY,
+                attack_interval REAL,
+                avg_dx REAL,
+                observations INTEGER
+            )
+        ''')
+        # Initialize entries for each enemy type
+        for et in range(self.max_enemy_types):
+            c.execute('INSERT OR IGNORE INTO enemy_patterns (enemy_type, attack_interval, avg_dx, observations) VALUES (?, 0, 0, 0)', (et,))
+        conn.commit()
+        conn.close()
+
+    def _load_patterns(self):
+        """Load enemy patterns from the SQLite database into a dictionary."""
+        conn = sqlite3.connect(self.patterns_db)
+        c = conn.cursor()
+        c.execute('SELECT enemy_type, attack_interval, avg_dx, observations FROM enemy_patterns')
+        patterns = {str(row[0]): {"attack_interval": row[1], "avg_dx": row[2], "observations": row[3]} for row in c.fetchall()}
+        conn.close()
+        return patterns
+
+    def _save_patterns(self):
+        """Save updated enemy patterns to the SQLite database."""
+        conn = sqlite3.connect(self.patterns_db)
+        c = conn.cursor()
+        for et, data in self.stored_patterns.items():
+            c.execute('''
+                UPDATE enemy_patterns
+                SET attack_interval = ?, avg_dx = ?, observations = ?
+                WHERE enemy_type = ?
+            ''', (data["attack_interval"], data["avg_dx"], data["observations"], int(et)))
+        conn.commit()
+        conn.close()
 
     def reset(self, **kwargs):
         self.current_step = 0
@@ -137,10 +251,17 @@ class KungFuWrapper(Wrapper):
         self.last_hp = self.env.get_ram()[0x04A6]
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
-        self.last_enemies = [0] * 4
+        self.last_enemies = [0] * self.max_enemies
         self.last_projectile_positions = []
         self.was_hit_by_projectile = False
         self.prev_frame = None
+        self.enemy_history = np.zeros((self.max_enemies, self.history_length, 2), dtype=np.float32)
+        self.enemy_positions = np.zeros((self.max_enemies, 2), dtype=np.float32)
+        self.enemy_types = np.zeros(self.max_enemies, dtype=np.float32)
+        self.enemy_timers = np.zeros(self.max_enemies, dtype=np.float32)
+        self.boss_info = np.zeros(3, dtype=np.float32)
+        self.enemy_patterns = np.zeros((self.max_enemies, self.patterns_length), dtype=np.float32)
+        self.last_attack_steps = [-1] * self.max_enemies
         return self._get_obs(obs)
 
     def step(self, action):
@@ -154,38 +275,54 @@ class KungFuWrapper(Wrapper):
         curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
         enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
         hp_loss = max(0, int(self.last_hp) - int(hp))
-        hp_change_rate = (hp - self.last_hp) / 255.0  # Normalized HP change rate
+        hp_change_rate = (hp - self.last_hp) / 255.0
         
-        # Detect if enemies are very close
         hero_x = int(ram[0x0094])
         enemy_distances = [abs(enemy_x - hero_x) for enemy_x in curr_enemies if enemy_x != 0]
-        enemy_very_close = 1.0 if any(dist <= 20 for dist in enemy_distances) else 0.0  # Threshold of 20 units
+        enemy_very_close = 1.0 if any(dist <= 20 for dist in enemy_distances) else 0.0
+        
+        # Update enemy info and track patterns
+        self._update_enemy_info(obs, ram)
+        
+        # Update boss info
+        self._update_boss_info(ram)
         
         # Detect projectiles
-        projectile_info = self._detect_projectiles(obs) if self.current_step > 50 else [0, 0, 0, 0]  # Ignore projectiles in early steps
+        projectile_info = self._detect_projectiles(obs)
         projectile_hit = self._check_projectile_hit(hp_loss)
         projectile_avoided = len(projectile_info) > 0 and not projectile_hit
         
         # Adjusted reward structure
         raw_reward = (
             enemy_hit * 500.0 +
-            -hp_loss * 100.0 +  # Increased penalty for HP loss
+            -hp_loss * 100.0 +
             (1.0 if enemy_hit > 0 else -0.5) +
             (100.0 if projectile_avoided else 0.0) +
             (-200.0 if projectile_hit else 0.0)
         )
         
-        # Additional penalty for inaction during rapid HP loss or when enemies are close
-        if hp_loss > 5 and action == 0:  # No-op during significant HP loss
+        # Penalty for inaction
+        if hp_loss > 5 and action == 0:
             raw_reward -= 50.0
-        if enemy_very_close and action == 0:  # No-op when enemies are very close
+        if enemy_very_close and action == 0:
             raw_reward -= 30.0
         
-        # Diversity penalty (relaxed in early steps or during rapid HP loss)
+        # Reward for dodging projectiles based on enemy type
+        if projectile_avoided:
+            for enemy_type in self.enemy_types:
+                if enemy_type in [1, 4]:  # Knife Thrower or Dragon
+                    raw_reward += 150.0
+                    break
+        
+        # Reward for damaging the boss
+        if self.boss_info[2] > 0 and enemy_hit > 0:
+            raw_reward += 200.0
+        
+        # Diversity penalty
         action_percentages = self.action_counts / (self.total_steps + 1e-6)
         dominant_action_percentage = np.max(action_percentages)
         diversity_penalty = 0.0
-        if self.current_step > 50 and hp_loss < 5:  # Only apply diversity penalty after early steps and if HP loss isn't rapid
+        if self.current_step > 50 and hp_loss < 5:
             if dominant_action_percentage > 0.4:
                 diversity_penalty = -10.0 * (dominant_action_percentage - 0.4)
                 raw_reward += diversity_penalty
@@ -212,10 +349,144 @@ class KungFuWrapper(Wrapper):
             "projectile_hit": projectile_hit,
             "projectile_avoided": projectile_avoided,
             "dominant_action_percentage": dominant_action_percentage,
-            "enemy_very_close": enemy_very_close
+            "enemy_very_close": enemy_very_close,
+            "enemy_types": self.enemy_types,
+            "enemy_timers": self.enemy_timers,
+            "enemy_patterns": self.enemy_patterns,
+            "boss_info": self.boss_info
         })
         
         return self._get_obs(obs), normalized_reward, done, info
+
+    def _update_enemy_info(self, obs, ram):
+        hero_x = int(ram[0x0094])
+        new_positions = np.zeros((self.max_enemies, 2), dtype=np.float32)
+        new_types = np.zeros(self.max_enemies, dtype=np.float32)
+        new_timers = np.zeros(self.max_enemies, dtype=np.float32)
+        
+        stage = int(ram[0x0058])
+        
+        for i, (pos_addr, action_addr, timer_addr) in enumerate([
+            (0x008E, 0x0080, 0x002B),
+            (0x008F, 0x0081, 0x002C),
+            (0x0090, 0x0082, 0x002D),
+            (0x0091, 0x0083, 0x002E)
+        ]):
+            enemy_x = int(ram[pos_addr])
+            enemy_action = int(ram[action_addr])
+            enemy_timer = int(ram[timer_addr])
+            
+            if enemy_x != 0:
+                if stage == 1:
+                    if enemy_action in [0x01, 0x02]:
+                        new_types[i] = 1
+                    else:
+                        new_types[i] = 2
+                elif stage == 2:
+                    new_types[i] = 3
+                elif stage == 3:
+                    if enemy_action in [0x03, 0x04]:
+                        new_types[i] = 4
+                    else:
+                        new_types[i] = 2
+                elif stage in [4, 5]:
+                    new_types[i] = 0
+                new_positions[i] = [enemy_x, 50]
+                new_timers[i] = enemy_timer / 255.0
+                
+                # Track attack patterns
+                if enemy_action in [0x01, 0x02, 0x03, 0x04]:  # Attack actions
+                    if self.last_attack_steps[i] != -1:
+                        interval = self.current_step - self.last_attack_steps[i]
+                        self.attack_intervals[int(new_types[i])].append(interval)
+                    self.last_attack_steps[i] = self.current_step
+                else:
+                    self.last_attack_steps[i] = -1
+                
+                # Track movement patterns (dx)
+                dx = new_positions[i][0] - self.enemy_positions[i][0]
+                self.dx_history[int(new_types[i])].append(dx)
+                
+                # Increment observation count
+                self.observation_counts[int(new_types[i])] += 1
+            else:
+                new_types[i] = 0
+                new_timers[i] = 0
+                self.last_attack_steps[i] = -1
+        
+        # Update enemy history
+        for i in range(self.max_enemies):
+            if new_types[i] != 0:
+                dx = new_positions[i][0] - self.enemy_positions[i][0]
+                dy = new_positions[i][1] - self.enemy_positions[i][1]
+                self.enemy_history[i, :-1] = self.enemy_history[i, 1:]
+                self.enemy_history[i, -1] = [dx, dy]
+            else:
+                self.enemy_history[i] = np.zeros((self.history_length, 2), dtype=np.float32)
+        
+        # Update stored patterns every 100 steps
+        if self.current_step % 100 == 0:
+            for et in range(self.max_enemy_types):
+                if et in [0, 5]:  # Skip "None" and "Boss"
+                    continue
+                current_data = self.stored_patterns.get(str(et), {"attack_interval": 0, "avg_dx": 0, "observations": 0})
+                current_interval = current_data["attack_interval"]
+                current_dx = current_data["avg_dx"]
+                current_obs = current_data["observations"]
+                
+                # Update attack interval
+                if len(self.attack_intervals[et]) > 0:
+                    new_intervals = self.attack_intervals[et]
+                    total_obs = current_obs + len(new_intervals)
+                    avg_interval = ((current_interval * current_obs) + sum(new_intervals)) / total_obs if total_obs > 0 else 0
+                    self.stored_patterns[str(et)]["attack_interval"] = avg_interval
+                    self.stored_patterns[str(et)]["observations"] = total_obs
+                    self.attack_intervals[et] = []
+                else:
+                    self.stored_patterns[str(et)]["attack_interval"] = current_interval
+                    self.stored_patterns[str(et)]["observations"] = current_obs
+                
+                # Update avg_dx
+                if len(self.dx_history[et]) > 0:
+                    new_dx = self.dx_history[et]
+                    total_obs = current_obs + len(new_dx)
+                    avg_dx = ((current_dx * current_obs) + sum(new_dx)) / total_obs if total_obs > 0 else 0
+                    self.stored_patterns[str(et)]["avg_dx"] = avg_dx
+                    self.stored_patterns[str(et)]["observations"] = total_obs
+                    self.dx_history[et] = []
+                else:
+                    self.stored_patterns[str(et)]["avg_dx"] = current_dx
+                
+                # Ensure observations are cumulative
+                self.stored_patterns[str(et)]["observations"] = max(current_obs, self.observation_counts[et])
+            
+            self._save_patterns()
+        
+        # Update enemy patterns in observation
+        for i in range(self.max_enemies):
+            et = int(new_types[i])
+            self.enemy_patterns[i] = [
+                self.stored_patterns[str(et)]["attack_interval"],
+                self.stored_patterns[str(et)]["avg_dx"]
+            ]
+        
+        self.enemy_positions = new_positions
+        self.enemy_types = new_types
+        self.enemy_timers = new_timers
+
+    def _update_boss_info(self, ram):
+        stage = int(ram[0x0058])
+        if stage == 5:
+            boss_pos_x = int(ram[0x0093])
+            boss_action = int(ram[0x004E])
+            boss_hp = int(ram[0x04A5])
+            self.boss_info = np.array([
+                boss_pos_x - int(ram[0x0094]),
+                boss_action / 255.0,
+                boss_hp / 255.0
+            ], dtype=np.float32)
+        else:
+            self.boss_info = np.zeros(3, dtype=np.float32)
 
     def _detect_projectiles(self, obs):
         gray = np.dot(obs[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
@@ -233,7 +504,7 @@ class KungFuWrapper(Wrapper):
             
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if 5 < area < 100:
+                if 5 < area < 150:
                     x, y, w, h = cv2.boundingRect(contour)
                     proj_x = x + w // 2
                     proj_y = y + h // 2
@@ -241,30 +512,31 @@ class KungFuWrapper(Wrapper):
                     dx, dy = 0, 0
                     for prev_pos in self.last_projectile_positions:
                         prev_x, prev_y = prev_pos
-                        if abs(proj_x - prev_x) < 15 and abs(proj_y - prev_y) < 15:
+                        if abs(proj_x - prev_x) < 20 and abs(proj_y - prev_y) < 20:
                             dx = proj_x - prev_x
                             dy = proj_y - prev_y
                             speed = np.sqrt(dx**2 + dy**2)
-                            if speed < 3 or speed > 20:
+                            if speed < 2 or speed > 25:
                                 dx, dy = 0, 0
                             break
                     
-                    if abs(dx) > 2:
+                    if dx != 0 or dy != 0:
                         game_width = 256
                         proj_x_game = (proj_x / self.viewport_size[0]) * game_width
                         distance = proj_x_game - hero_x
                         projectile_info.extend([distance, proj_y, dx, dy])
                         current_projectile_positions.append((proj_x, proj_y))
             
-            while len(projectile_info) < 4:
+            projectile_info = projectile_info[:self.max_projectiles * 4]
+            while len(projectile_info) < self.max_projectiles * 4:
                 projectile_info.append(0)
             
-            self.last_projectile_positions = current_projectile_positions[-2:]
+            self.last_projectile_positions = current_projectile_positions[:self.max_projectiles]
             self.prev_frame = gray
-            return projectile_info[:4]
+            return projectile_info
         
         self.prev_frame = gray
-        return [0, 0, 0, 0]
+        return [0] * (self.max_projectiles * 4)
 
     def _check_projectile_hit(self, hp_loss):
         if hp_loss > 0 and len(self.last_projectile_positions) > 0:
@@ -288,16 +560,26 @@ class KungFuWrapper(Wrapper):
                 enemy_info.extend([0, 0])
         
         enemy_vector = np.array(enemy_info, dtype=np.float32)
+        enemy_types = self.enemy_types
+        enemy_history = self.enemy_history.reshape(-1)
+        enemy_timers = self.enemy_timers
+        enemy_patterns = self.enemy_patterns.reshape(-1)
         combat_status = np.array([self.last_hp/255.0, self.last_hp_change], dtype=np.float32)
-        projectile_vector = np.array(self._detect_projectiles(obs) if self.current_step > 50 else [0, 0, 0, 0], dtype=np.float32)
+        projectile_vectors = np.array(self._detect_projectiles(obs), dtype=np.float32)
         enemy_proximity = np.array([1.0 if any(abs(enemy_x - hero_x) <= 20 for enemy_x in [int(ram[addr]) for addr in [0x008E, 0x008F, 0x0090, 0x0091]] if enemy_x != 0) else 0.0], dtype=np.float32)
+        boss_info = self.boss_info
         
         return {
             "viewport": viewport.astype(np.uint8),
             "enemy_vector": enemy_vector,
+            "enemy_types": enemy_types,
+            "enemy_history": enemy_history,
+            "enemy_timers": enemy_timers,
+            "enemy_patterns": enemy_patterns,
             "combat_status": combat_status,
-            "projectile_vector": projectile_vector,
-            "enemy_proximity": enemy_proximity
+            "projectile_vectors": projectile_vectors,
+            "enemy_proximity": enemy_proximity,
+            "boss_info": boss_info
         }
 
 class CombatTrainingCallback(BaseCallback):
@@ -345,6 +627,24 @@ class CombatTrainingCallback(BaseCallback):
             self.logger.record("combat/projectile_hits", self.projectile_hits)
             self.logger.record("combat/projectile_avoids", self.projectile_avoids)
             
+            enemy_types = info.get("enemy_types", [0] * 4)
+            for i, et in enumerate(enemy_types):
+                self.logger.record(f"enemy_types/enemy_{i}", et)
+            
+            enemy_timers = info.get("enemy_timers", [0] * 4)
+            for i, timer in enumerate(enemy_timers):
+                self.logger.record(f"enemy_timers/enemy_{i}", timer)
+            
+            enemy_patterns = info.get("enemy_patterns", np.zeros((4, 2))).reshape(-1)
+            for i in range(len(enemy_types)):
+                self.logger.record(f"enemy_patterns/enemy_{i}_attack_interval", enemy_patterns[i * 2])
+                self.logger.record(f"enemy_patterns/enemy_{i}_avg_dx", enemy_patterns[i * 2 + 1])
+            
+            boss_info = info.get("boss_info", [0, 0, 0])
+            self.logger.record("boss/pos_x", boss_info[0])
+            self.logger.record("boss/action", boss_info[1])
+            self.logger.record("boss/hp", boss_info[2])
+            
             action_percentages = info.get("action_percentages", np.zeros(9))
             action_names = info.get("action_names", [])
             for name, percentage in zip(action_names, action_percentages):
@@ -367,7 +667,11 @@ class CombatTrainingCallback(BaseCallback):
                 f"Enemy Very Close={info.get('enemy_very_close', 0)}, "
                 f"Projectile Hits={self.projectile_hits}, "
                 f"Projectile Avoids={self.projectile_avoids}, "
-                f"Dominant Action %={info.get('dominant_action_percentage', 0):.2%}"
+                f"Dominant Action %={info.get('dominant_action_percentage', 0):.2%}, "
+                f"Enemy Types={info.get('enemy_types', [0] * 4)}, "
+                f"Enemy Timers={info.get('enemy_timers', [0] * 4)}, "
+                f"Enemy Patterns={info.get('enemy_patterns', np.zeros((4, 2)))}, "
+                f"Boss Info={info.get('boss_info', [0, 0, 0])}"
             )
             self.last_log_time = current_time
         
@@ -457,18 +761,18 @@ def save_model_on_exit():
             logger.error(f"Emergency save failed: {str(e)}")
     sys.exit(0)
 
-def make_env(render=False):
+def make_env(render=False, patterns_db="enemy_patterns.db"):
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     if render:
         env.render_mode = 'human'
-    return KungFuWrapper(env)
+    return KungFuWrapper(env, patterns_db=patterns_db)
 
-def make_vec_env(num_envs, render=False):
+def make_vec_env(num_envs, render=False, patterns_db="enemy_patterns.db"):
     logger.info(f"Creating vectorized environment with {num_envs} subprocesses")
     if num_envs > 1:
-        env = SubprocVecEnv([lambda: make_env(render) for _ in range(num_envs)])
+        env = SubprocVecEnv([lambda: make_env(render, patterns_db) for _ in range(num_envs)])
     else:
-        env = DummyVecEnv([lambda: make_env(render)])
+        env = DummyVecEnv([lambda: make_env(render, patterns_db)])
     return VecFrameStack(env, n_stack=4)
 
 def objective(trial, args, env):
@@ -536,7 +840,8 @@ def train(args):
     signal.signal(signal.SIGINT, signal_handler)
     atexit.register(save_model_on_exit)
     
-    env = make_vec_env(args.num_envs, render=args.render)
+    patterns_db = os.path.join(args.log_dir, "enemy_patterns.db")
+    env = make_vec_env(args.num_envs, render=args.render, patterns_db=patterns_db)
     
     model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
     os.makedirs(model_path, exist_ok=True)
