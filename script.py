@@ -95,15 +95,8 @@ class KungFuWrapper(Wrapper):
             [0,0,1,0,0,0,1,0,0,0,0,0]   # Crouch+Punch
         ]
         self.action_names = [
-            "No-op",
-            "Punch",
-            "Kick",
-            "Right+Punch", 
-            "Left+Punch",
-            "Jump",
-            "Crouch",
-            "Jump+Punch",
-            "Crouch+Punch"
+            "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
+            "Jump", "Crouch", "Jump+Punch", "Crouch+Punch"
         ]
         
         self.action_space = spaces.Discrete(len(self.actions))
@@ -252,7 +245,7 @@ class CombatTrainingCallback(BaseCallback):
         self.episode_rewards.append(self.current_episode_reward)
         hit_rate = self.episode_hits / (self.total_steps + 1e-6)
         
-        self.logger.record(" combat/episode_reward", self.current_episode_reward)
+        self.logger.record("combat/episode_reward", self.current_episode_reward)
         self.logger.record("combat/episode_hits", self.episode_hits)
         self.logger.record("combat/episode_hit_rate", hit_rate)
         
@@ -432,104 +425,20 @@ def train(args):
     env.close()
     logger.info("Training session ended")
 
-def play(args):
-    global logger
-    logger = setup_logging(args.log_dir)
-    logger.info("Starting play session")
-    
-    model_file = os.path.join(args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path), "kungfu_ppo_best")
-    if not os.path.exists(model_file + ".zip"):
-        logger.error(f"No trained model found at {model_file}.zip")
-        sys.exit(1)
-
-    # Create a single vectorized environment
-    env = DummyVecEnv([lambda: make_env(render=args.render)])
-    env = VecFrameStack(env, n_stack=4)
-    
-    model = PPO.load(model_file, env=env, device="cuda" if args.cuda else "cpu")
-    
-    obs = env.reset()
-    total_reward = 0
-    total_hits = 0
-    done = False
-    step_count = 0
-
-    try:
-        logger.info("Starting gameplay...")
-        while not done:
-            action, _states = model.predict(obs, deterministic=True)
-            obs, reward, done, info = env.step(action)
-            total_reward += reward[0]
-            total_hits += info[0]['enemy_hit']
-            step_count += 1
-            
-            if step_count % 10 == 0 or info[0]['enemy_hit'] > 0:
-                hit_rate = total_hits / step_count
-                action_pct = env.envs[0].action_counts / (sum(env.envs[0].action_counts) + 1e-6)
-                action_names = env.envs[0].action_names
-                logger.info(
-                    f"Step: {step_count}, "
-                    f"Reward: {reward[0]:.2f}, "
-                    f"Total: {total_reward:.2f}, "
-                    f"Hits: {total_hits}, "
-                    f"Hit Rate: {hit_rate:.2%}, "
-                    f"HP: {info[0]['hp']}, "
-                    f"Actions: {[f'{name}:{pct:.1%}' for name, pct in zip(action_names, action_pct)]}"
-                )
-                if info[0]['enemy_hit'] > 0:
-                    print(">>> ENEMY HIT! <<<")
-            
-            if args.render:
-                try:
-                    env.render(mode='human')
-                    logger.debug("Rendering frame")
-                except Exception as e:
-                    logger.warning(f"Rendering failed: {str(e)}")
-                    break
-
-    except KeyboardInterrupt:
-        logger.info("\nPlay interrupted by user.")
-    finally:
-        hit_rate = total_hits / (step_count + 1e-6)
-        logger.info(f"Play ended. Steps: {step_count}, Hits: {total_hits}, Hit Rate: {hit_rate:.2%}")
-        
-        if args.render:
-            try:
-                env.render(mode='human')
-                base_env = env.envs[0]
-                if hasattr(base_env, 'viewer') and base_env.viewer is not None:
-                    base_env.viewer.close()
-                    base_env.viewer = None
-            except Exception as e:
-                logger.warning(f"Render cleanup error: {str(e)}")
-        
-        try:
-            env.close()
-        except Exception as e:
-            logger.warning(f"Environment close error: {str(e)}")
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train or play Kung Fu with PPO and Optuna.")
-    parser.add_argument("--train", action="store_true", help="Train the model with Optuna")
-    parser.add_argument("--play", action="store_true", help="Play with trained model")
-    parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save/load model")
+    parser = argparse.ArgumentParser(description="Train Kung Fu with PPO and Optuna.")
+    parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save model")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps per trial")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
-    parser.add_argument("--render", action="store_true", help="Render during training/play")
+    parser.add_argument("--render", action="store_true", help="Render during training")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
     parser.add_argument("--n_trials", type=int, default=3, help="Number of Optuna trials")
     parser.add_argument("--resume", action="store_true", help="Resume training from saved study and models")
     
     args = parser.parse_args()
-
-    if args.train:
-        os.makedirs(args.log_dir, exist_ok=True)
-        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
-        train(args)
-    elif args.play:
-        play(args)
-    else:
-        print("Please specify a mode: --train or --play")
-        parser.print_help()
+    
+    os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+    train(args)

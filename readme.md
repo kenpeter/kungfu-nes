@@ -1,18 +1,10 @@
-
-
-
-python script.py --train --num_envs 16 --cuda --progress_bar --resume --timesteps 10000
-
-
-
-
-python script.py --train --render --enable_file_logging --num_envs 1 --resume
+python script.py --num_envs 16 --cuda --progress_bar --resume --timesteps 10000
 
 
 
 
 
-python script.py --play --render
+python play.py --render
 
 
 
