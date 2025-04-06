@@ -44,11 +44,12 @@ class SimpleCNN(BaseFeaturesExtractor):
             n_flatten = self.cnn(sample_input).shape[1]
         
         enemy_vec_size = observation_space["enemy_vector"].shape[0]
-        combat_status_size = observation_space["combat_status"].shape[0]
-        projectile_vec_size = observation_space["projectile_vector"].shape[0]  # Updated to projectile_vector
+        combat_status_size = observation_space["combat_status"].shape[0]  # Now 2 elements
+        projectile_vec_size = observation_space["projectile_vector"].shape[0]
+        enemy_proximity_size = observation_space["enemy_proximity"].shape[0]  # New field
         
         self.linear = nn.Sequential(
-            nn.Linear(n_flatten + enemy_vec_size + combat_status_size + projectile_vec_size, features_dim),
+            nn.Linear(n_flatten + enemy_vec_size + combat_status_size + projectile_vec_size + enemy_proximity_size, features_dim),
             nn.ReLU()
         )
     
@@ -56,7 +57,8 @@ class SimpleCNN(BaseFeaturesExtractor):
         viewport = observations["viewport"]
         enemy_vector = observations["enemy_vector"]
         combat_status = observations["combat_status"]
-        projectile_vector = observations["projectile_vector"]  # Updated to projectile_vector
+        projectile_vector = observations["projectile_vector"]
+        enemy_proximity = observations["enemy_proximity"]  # New field
         
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport)
@@ -66,6 +68,8 @@ class SimpleCNN(BaseFeaturesExtractor):
             combat_status = torch.from_numpy(combat_status)
         if isinstance(projectile_vector, np.ndarray):
             projectile_vector = torch.from_numpy(projectile_vector)
+        if isinstance(enemy_proximity, np.ndarray):
+            enemy_proximity = torch.from_numpy(enemy_proximity)
             
         if len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0)
@@ -80,8 +84,10 @@ class SimpleCNN(BaseFeaturesExtractor):
             combat_status = combat_status.unsqueeze(0)
         if len(projectile_vector.shape) == 1:
             projectile_vector = projectile_vector.unsqueeze(0)
+        if len(enemy_proximity.shape) == 1:
+            enemy_proximity = enemy_proximity.unsqueeze(0)
             
-        combined = torch.cat([cnn_output, enemy_vector, combat_status, projectile_vector], dim=1)
+        combined = torch.cat([cnn_output, enemy_vector, combat_status, projectile_vector, enemy_proximity], dim=1)
         return self.linear(combined)
 
 class KungFuWrapper(Wrapper):
@@ -109,24 +115,27 @@ class KungFuWrapper(Wrapper):
         self.observation_space = spaces.Dict({
             "viewport": spaces.Box(0, 255, (*self.viewport_size, 1), np.uint8),
             "enemy_vector": spaces.Box(-255, 255, (8,), np.float32),
-            "combat_status": spaces.Box(0, 1, (1,), np.float32),
-            "projectile_vector": spaces.Box(-255, 255, (4,), np.float32)  # Updated to projectile_vector (x, y, dx, dy)
+            "combat_status": spaces.Box(-1, 1, (2,), np.float32),  # [HP, HP_change_rate]
+            "projectile_vector": spaces.Box(-255, 255, (4,), np.float32),
+            "enemy_proximity": spaces.Box(0, 1, (1,), np.float32)  # 1 if enemy is very close, 0 otherwise
         })
         
         self.last_hp = 0
+        self.last_hp_change = 0  # Track HP change rate
         self.action_counts = np.zeros(len(self.actions))
         self.last_enemies = [0] * 4
         self.max_steps = 1000
         self.current_step = 0
         self.total_steps = 0
-        self.last_projectile_positions = []  # Track projectile positions for trajectory
+        self.last_projectile_positions = []
         self.was_hit_by_projectile = False
-        self.prev_frame = None  # For frame differencing
+        self.prev_frame = None
 
     def reset(self, **kwargs):
         self.current_step = 0
         obs = self.env.reset(**kwargs)
         self.last_hp = self.env.get_ram()[0x04A6]
+        self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
         self.last_enemies = [0] * 4
         self.last_projectile_positions = []
@@ -145,29 +154,44 @@ class KungFuWrapper(Wrapper):
         curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
         enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
         hp_loss = max(0, int(self.last_hp) - int(hp))
+        hp_change_rate = (hp - self.last_hp) / 255.0  # Normalized HP change rate
         
-        # Detect projectiles using computer vision
-        projectile_info = self._detect_projectiles(obs)
+        # Detect if enemies are very close
+        hero_x = int(ram[0x0094])
+        enemy_distances = [abs(enemy_x - hero_x) for enemy_x in curr_enemies if enemy_x != 0]
+        enemy_very_close = 1.0 if any(dist <= 20 for dist in enemy_distances) else 0.0  # Threshold of 20 units
+        
+        # Detect projectiles
+        projectile_info = self._detect_projectiles(obs) if self.current_step > 50 else [0, 0, 0, 0]  # Ignore projectiles in early steps
         projectile_hit = self._check_projectile_hit(hp_loss)
         projectile_avoided = len(projectile_info) > 0 and not projectile_hit
         
         # Adjusted reward structure
         raw_reward = (
             enemy_hit * 500.0 +
-            -hp_loss * 50.0 +
+            -hp_loss * 100.0 +  # Increased penalty for HP loss
             (1.0 if enemy_hit > 0 else -0.5) +
-            (100.0 if projectile_avoided else 0.0) +  # Updated to projectile_avoided
-            (-200.0 if projectile_hit else 0.0)  # Updated to projectile_hit
+            (100.0 if projectile_avoided else 0.0) +
+            (-200.0 if projectile_hit else 0.0)
         )
         
-        # Diversity penalty
+        # Additional penalty for inaction during rapid HP loss or when enemies are close
+        if hp_loss > 5 and action == 0:  # No-op during significant HP loss
+            raw_reward -= 50.0
+        if enemy_very_close and action == 0:  # No-op when enemies are very close
+            raw_reward -= 30.0
+        
+        # Diversity penalty (relaxed in early steps or during rapid HP loss)
         action_percentages = self.action_counts / (self.total_steps + 1e-6)
         dominant_action_percentage = np.max(action_percentages)
-        if dominant_action_percentage > 0.4:
-            diversity_penalty = -10.0 * (dominant_action_percentage - 0.4)
-            raw_reward += diversity_penalty
+        diversity_penalty = 0.0
+        if self.current_step > 50 and hp_loss < 5:  # Only apply diversity penalty after early steps and if HP loss isn't rapid
+            if dominant_action_percentage > 0.4:
+                diversity_penalty = -10.0 * (dominant_action_percentage - 0.4)
+                raw_reward += diversity_penalty
         
         self.last_hp = hp
+        self.last_hp_change = hp_change_rate
         self.last_enemies = curr_enemies
         self.was_hit_by_projectile = projectile_hit
         
@@ -179,86 +203,68 @@ class KungFuWrapper(Wrapper):
         
         info.update({
             "hp": hp,
+            "hp_change_rate": hp_change_rate,
             "raw_reward": raw_reward,
             "normalized_reward": normalized_reward,
             "action_percentages": self.action_counts / (self.total_steps + 1e-6),
             "action_names": self.action_names,
             "enemy_hit": enemy_hit,
-            "projectile_hit": projectile_hit,  # Updated to projectile_hit
-            "projectile_avoided": projectile_avoided,  # Updated to projectile_avoided
-            "dominant_action_percentage": dominant_action_percentage
+            "projectile_hit": projectile_hit,
+            "projectile_avoided": projectile_avoided,
+            "dominant_action_percentage": dominant_action_percentage,
+            "enemy_very_close": enemy_very_close
         })
         
         return self._get_obs(obs), normalized_reward, done, info
 
     def _detect_projectiles(self, obs):
-        # Convert the observation (RGB) to grayscale
         gray = np.dot(obs[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
-        
-        # Resize to match viewport size
         gray = cv2.resize(gray, self.viewport_size, interpolation=cv2.INTER_AREA)
         
-        # Use frame differencing to detect moving objects
         if self.prev_frame is not None:
-            # Compute the absolute difference between the current and previous frame
             frame_diff = cv2.absdiff(gray, self.prev_frame)
-            
-            # Apply a threshold to highlight significant changes (moving objects)
-            _, thresh = cv2.threshold(frame_diff, 30, 255, cv2.THRESH_BINARY)  # Adjust threshold as needed
-            
-            # Dilate to connect nearby changes (helps with small objects)
+            _, thresh = cv2.threshold(frame_diff, 30, 255, cv2.THRESH_BINARY)
             thresh = cv2.dilate(thresh, None, iterations=2)
-            
-            # Find contours of moving objects
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             projectile_info = []
             current_projectile_positions = []
-            hero_x = int(self.env.get_ram()[0x0094])  # Hero's X position from RAM
+            hero_x = int(self.env.get_ram()[0x0094])
             
             for contour in contours:
-                # Filter contours by size (projectiles are typically small)
                 area = cv2.contourArea(contour)
-                if 5 < area < 100:  # Adjusted range to account for various projectile sizes
+                if 5 < area < 100:
                     x, y, w, h = cv2.boundingRect(contour)
-                    
-                    # Calculate center of the projectile
                     proj_x = x + w // 2
                     proj_y = y + h // 2
                     
-                    # Estimate trajectory by comparing with previous positions
                     dx, dy = 0, 0
                     for prev_pos in self.last_projectile_positions:
                         prev_x, prev_y = prev_pos
-                        if abs(proj_x - prev_x) < 15 and abs(proj_y - prev_y) < 15:  # Likely the same projectile
+                        if abs(proj_x - prev_x) < 15 and abs(proj_y - prev_y) < 15:
                             dx = proj_x - prev_x
                             dy = proj_y - prev_y
-                            # Filter by speed (projectiles move fast)
                             speed = np.sqrt(dx**2 + dy**2)
-                            if speed < 3 or speed > 20:  # Adjust speed range for projectiles
+                            if speed < 3 or speed > 20:
                                 dx, dy = 0, 0
                             break
                     
-                    # Only consider projectiles with significant horizontal movement (typical for thrown objects)
-                    if abs(dx) > 2:  # Projectiles typically move horizontally
-                        # Calculate distance relative to hero
-                        game_width = 256  # Typical NES game width
+                    if abs(dx) > 2:
+                        game_width = 256
                         proj_x_game = (proj_x / self.viewport_size[0]) * game_width
                         distance = proj_x_game - hero_x
-                        
                         projectile_info.extend([distance, proj_y, dx, dy])
                         current_projectile_positions.append((proj_x, proj_y))
             
-            # Pad projectile_info to ensure consistent length (4 elements for 1 projectile: distance, y, dx, dy)
             while len(projectile_info) < 4:
                 projectile_info.append(0)
             
-            self.last_projectile_positions = current_projectile_positions[-2:]  # Track up to 2 projectiles
-            self.prev_frame = gray  # Update previous frame
+            self.last_projectile_positions = current_projectile_positions[-2:]
+            self.prev_frame = gray
             return projectile_info[:4]
         
-        self.prev_frame = gray  # Store current frame for next step
-        return [0, 0, 0, 0]  # Return empty vector if no previous frame
+        self.prev_frame = gray
+        return [0, 0, 0, 0]
 
     def _check_projectile_hit(self, hp_loss):
         if hp_loss > 0 and len(self.last_projectile_positions) > 0:
@@ -282,14 +288,16 @@ class KungFuWrapper(Wrapper):
                 enemy_info.extend([0, 0])
         
         enemy_vector = np.array(enemy_info, dtype=np.float32)
-        combat_status = np.array([self.last_hp/255.0], dtype=np.float32)
-        projectile_vector = np.array(self._detect_projectiles(obs), dtype=np.float32)  # Updated to projectile_vector
+        combat_status = np.array([self.last_hp/255.0, self.last_hp_change], dtype=np.float32)
+        projectile_vector = np.array(self._detect_projectiles(obs) if self.current_step > 50 else [0, 0, 0, 0], dtype=np.float32)
+        enemy_proximity = np.array([1.0 if any(abs(enemy_x - hero_x) <= 20 for enemy_x in [int(ram[addr]) for addr in [0x008E, 0x008F, 0x0090, 0x0091]] if enemy_x != 0) else 0.0], dtype=np.float32)
         
         return {
             "viewport": viewport.astype(np.uint8),
             "enemy_vector": enemy_vector,
             "combat_status": combat_status,
-            "projectile_vector": projectile_vector  # Updated to projectile_vector
+            "projectile_vector": projectile_vector,
+            "enemy_proximity": enemy_proximity
         }
 
 class CombatTrainingCallback(BaseCallback):
@@ -304,8 +312,8 @@ class CombatTrainingCallback(BaseCallback):
         self.current_episode_reward = 0
         self.episode_hits = 0
         self.total_hits = 0
-        self.projectile_hits = 0  # Updated to projectile_hits
-        self.projectile_avoids = 0  # Updated to projectile_avoids
+        self.projectile_hits = 0
+        self.projectile_avoids = 0
         
         if progress_bar:
             self.pbar = tqdm(total=10000, desc="Training")
@@ -314,8 +322,8 @@ class CombatTrainingCallback(BaseCallback):
         self.total_steps += 1
         self.current_episode_reward += self.locals["rewards"][0]
         hit_count = self.locals["infos"][0]["enemy_hit"]
-        projectile_hit = self.locals["infos"][0]["projectile_hit"]  # Updated to projectile_hit
-        projectile_avoided = self.locals["infos"][0]["projectile_avoided"]  # Updated to projectile_avoided
+        projectile_hit = self.locals["infos"][0]["projectile_hit"]
+        projectile_avoided = self.locals["infos"][0]["projectile_avoided"]
         self.episode_hits += hit_count
         self.total_hits += hit_count
         self.projectile_hits += projectile_hit
@@ -331,9 +339,11 @@ class CombatTrainingCallback(BaseCallback):
             self.logger.record("combat/total_hits", self.total_hits)
             self.logger.record("combat/hit_rate", hit_rate)
             self.logger.record("game/hp", info.get("hp", 0))
+            self.logger.record("game/hp_change_rate", info.get("hp_change_rate", 0))
+            self.logger.record("game/enemy_very_close", info.get("enemy_very_close", 0))
             self.logger.record("game/dominant_action_percentage", info.get("dominant_action_percentage", 0))
-            self.logger.record("combat/projectile_hits", self.projectile_hits)  # Updated to projectile_hits
-            self.logger.record("combat/projectile_avoids", self.projectile_avoids)  # Updated to projectile_avoids
+            self.logger.record("combat/projectile_hits", self.projectile_hits)
+            self.logger.record("combat/projectile_avoids", self.projectile_avoids)
             
             action_percentages = info.get("action_percentages", np.zeros(9))
             action_names = info.get("action_names", [])
@@ -353,8 +363,10 @@ class CombatTrainingCallback(BaseCallback):
                 f"Hits={self.total_hits}, "
                 f"Hit Rate={hit_rate:.2%}, "
                 f"HP={info.get('hp', 0)}, "
-                f"Projectile Hits={self.projectile_hits}, "  # Updated to projectile_hits
-                f"Projectile Avoids={self.projectile_avoids}, "  # Updated to projectile_avoids
+                f"HP Change Rate={info.get('hp_change_rate', 0):.4f}, "
+                f"Enemy Very Close={info.get('enemy_very_close', 0)}, "
+                f"Projectile Hits={self.projectile_hits}, "
+                f"Projectile Avoids={self.projectile_avoids}, "
                 f"Dominant Action %={info.get('dominant_action_percentage', 0):.2%}"
             )
             self.last_log_time = current_time
@@ -370,8 +382,8 @@ class CombatTrainingCallback(BaseCallback):
         self.logger.record("combat/episode_reward", self.current_episode_reward)
         self.logger.record("combat/episode_hits", self.episode_hits)
         self.logger.record("combat/episode_hit_rate", hit_rate)
-        self.logger.record("combat/episode_projectile_hits", self.projectile_hits)  # Updated to projectile_hits
-        self.logger.record("combat/episode_projectile_avoids", self.projectile_avoids)  # Updated to projectile_avoids
+        self.logger.record("combat/episode_projectile_hits", self.projectile_hits)
+        self.logger.record("combat/episode_projectile_avoids", self.projectile_avoids)
         
         info = self.locals["infos"][0]
         action_percentages = info.get("action_percentages", np.zeros(9))
@@ -384,8 +396,8 @@ class CombatTrainingCallback(BaseCallback):
             f"Total Reward={self.current_episode_reward:.2f}, "
             f"Hits={self.episode_hits}, "
             f"Hit Rate={hit_rate:.2%}, "
-            f"Projectile Hits={self.projectile_hits}, "  # Updated to projectile_hits
-            f"Projectile Avoids={self.projectile_avoids}"  # Updated to projectile_avoids
+            f"Projectile Hits={self.projectile_hits}, "
+            f"Projectile Avoids={self.projectile_avoids}"
         )
         
         self.current_episode_reward = 0
@@ -402,8 +414,8 @@ class CombatTrainingCallback(BaseCallback):
             f"Training completed. Total steps: {self.total_steps}, "
             f"Total hits: {self.total_hits}, "
             f"Final hit rate: {final_hit_rate:.2%}, "
-            f"Projectile Hits: {self.projectile_hits}, "  # Updated to projectile_hits
-            f"Projectile Avoids: {self.projectile_avoids}, "  # Updated to projectile_avoids
+            f"Projectile Hits: {self.projectile_hits}, "
+            f"Projectile Avoids: {self.projectile_avoids}, "
             f"Duration: {training_duration:.2f} seconds"
         )
 
