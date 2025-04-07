@@ -265,7 +265,7 @@ class KungFuWrapper(Wrapper):
         curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
         enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
         hp_loss = max(0, int(self.last_hp) - int(hp))
-        hp_change_rate = (hp - self.last_hp) / 255.0
+        hp_change_rate = (int(hp) - int(self.last_hp)) / 255.0
         
         hero_x = int(ram[0x0094])
         enemy_distances = [abs(enemy_x - hero_x) for enemy_x in curr_enemies if enemy_x != 0]
