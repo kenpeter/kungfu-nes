@@ -33,7 +33,6 @@ logger = None
 GOOD_ENOUGH_THRESHOLD = 100
 MAX_TIMESTEPS = 90000
 
-# [SimpleCNN class remains unchanged from the last corrected version]
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
         super(SimpleCNN, self).__init__(observation_space, features_dim)
@@ -129,7 +128,6 @@ class SimpleCNN(BaseFeaturesExtractor):
         ], dim=1)
         return self.linear(combined)
 
-# [KungFuWrapper class remains unchanged]
 class KungFuWrapper(Wrapper):
     def __init__(self, env, patterns_db="enemy_patterns.db"):
         super().__init__(env)
@@ -141,10 +139,10 @@ class KungFuWrapper(Wrapper):
             [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick
             [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch
             [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch
-            [0,0,0,0,1,0,0,0,0,0,0,0],  # Jump
-            [0,0,0,0,0,1,0,0,0,0,0,0],  # Crouch
-            [0,0,0,0,1,0,1,0,0,0,0,0],  # Jump+Punch
-            [0,0,0,0,0,1,1,0,0,0,0,0]   # Crouch+Punch
+            [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump
+            [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch
+            [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch
+            [0,0,1,0,0,0,1,0,0,0,0,0]   # Crouch+Punch
         ]
         self.action_names = [
             "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
@@ -275,46 +273,41 @@ class KungFuWrapper(Wrapper):
         projectile_hit = self._check_projectile_hit(hp_loss)
         projectile_avoided = len(projectile_info) > 0 and not projectile_hit
         
+        # Adjusted reward structure
         raw_reward = (
-            enemy_hit * 5.0 +
-            -hp_loss * 1.0 +
-            (0.1 if enemy_hit > 0 else -0.05) +
-            (3.0 if projectile_avoided else 0.0) +
-            (-5.0 if projectile_hit else 0.0)
+            enemy_hit * 10.0 +
+            -hp_loss * 2.0 +
+            (1.0 if enemy_hit > 0 else -0.1) +
+            (5.0 if projectile_avoided else 0.0) +
+            (-10.0 if projectile_hit else 0.0)
         )
         
         if len(projectile_info) > 0:
             if action in [5, 6, 7, 8]:
-                raw_reward += 0.5
+                raw_reward += 1.0
             for i in range(0, len(projectile_info), 4):
                 distance = projectile_info[i]
                 proj_y = projectile_info[i + 1]
                 if abs(distance) < 50 and 40 < proj_y < 60:
                     if action in [5, 7]:
-                        raw_reward += 1.0
+                        raw_reward += 2.0
                     elif action in [6, 8]:
-                        raw_reward += 1.0
+                        raw_reward += 2.0
         
-        if hp_loss > 5 and action == 0:
-            raw_reward -= 0.5
-        if enemy_very_close and action == 0:
-            raw_reward -= 0.3
-        
-        if projectile_avoided:
-            for enemy_type in self.enemy_types:
-                if enemy_type in [1, 4]:
-                    raw_reward += 1.5
-                    break
-        
-        if self.boss_info[2] > 0 and enemy_hit > 0:
-            raw_reward += 2.0
+        if action == 0:
+            if hp_loss > 5:
+                raw_reward -= 1.0
+            if enemy_very_close:
+                raw_reward -= 0.8
+            if len(projectile_info) > 0:
+                raw_reward -= 0.5
         
         action_percentages = self.action_counts / (self.total_steps + 1e-6)
         dominant_action_percentage = np.max(action_percentages)
         diversity_penalty = 0.0
         if self.current_step > 50 and hp_loss < 5:
-            if dominant_action_percentage > 0.3:
-                diversity_penalty = -0.2 * (dominant_action_percentage - 0.3)
+            if dominant_action_percentage > 0.5:
+                diversity_penalty = -0.5 * (dominant_action_percentage - 0.5)
                 raw_reward += diversity_penalty
         
         self.last_hp = hp
@@ -324,16 +317,16 @@ class KungFuWrapper(Wrapper):
         
         if self.current_step > 50 and enemy_hit == 0:
             done = True
-            raw_reward -= 1.0
+            raw_reward -= 2.0
         
-        normalized_reward = np.clip(raw_reward, -1, 1)
+        normalized_reward = np.clip(raw_reward, -2, 2)
         
         info.update({
             "hp": hp,
             "hp_change_rate": hp_change_rate,
             "raw_reward": raw_reward,
             "normalized_reward": normalized_reward,
-            "action_percentages": self.action_counts / (self.total_steps + 1e-6),
+            "action_percentages": action_percentages,
             "action_names": self.action_names,
             "enemy_hit": enemy_hit,
             "projectile_hit": projectile_hit,
@@ -586,7 +579,6 @@ class KungFuWrapper(Wrapper):
         except Exception as e:
             logger.error(f"Error closing environment: {e}")
 
-# [CombatTrainingCallback remains unchanged]
 class CombatTrainingCallback(BaseCallback):
     def __init__(self, progress_bar=False, logger=None, total_timesteps=10000):
         super().__init__()
@@ -787,7 +779,6 @@ def make_vec_env(num_envs, render=False, patterns_db="enemy_patterns.db"):
         raise
 
 def save_best_params_to_db(db_path, best_params, best_value):
-    """Save the best parameters and their value to the database."""
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     c.execute('''
@@ -822,11 +813,9 @@ def save_best_params_to_db(db_path, best_params, best_value):
     logger.info(f"Saved best parameters to {db_path} with value {best_value}")
 
 def load_best_params_from_db(db_path):
-    """Load the best parameters from the database, if they exist and meet the threshold."""
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     
-    # Create the table if it doesn't exist
     c.execute('''
         CREATE TABLE IF NOT EXISTS best_params (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -844,7 +833,6 @@ def load_best_params_from_db(db_path):
         )
     ''')
     
-    # Query the best parameters
     c.execute('''
         SELECT learning_rate, n_steps, batch_size, n_epochs, gamma,
                clip_range, ent_coef, vf_coef, max_grad_norm, best_value
@@ -855,7 +843,7 @@ def load_best_params_from_db(db_path):
     row = c.fetchone()
     conn.close()
     
-    if row and row[9] >= GOOD_ENOUGH_THRESHOLD:  # row[9] is best_value
+    if row and row[9] >= GOOD_ENOUGH_THRESHOLD:
         params = {
             'learning_rate': row[0],
             'n_steps': row[1],
@@ -886,7 +874,7 @@ def objective(trial, args, env):
         'n_epochs': trial.suggest_int('n_epochs', 3, 20),
         'gamma': trial.suggest_uniform('gamma', 0.9, 0.999),
         'clip_range': trial.suggest_uniform('clip_range', 0.1, 0.4),
-        'ent_coef': trial.suggest_loguniform('ent_coef', 1e-2, 1.0),
+        'ent_coef': trial.suggest_loguniform('ent_coef', 1e-3, 0.1),
         'vf_coef': trial.suggest_uniform('vf_coef', 0.1, 1.0),
         'max_grad_norm': trial.suggest_uniform('max_grad_norm', 0.1, 1.0)
     }
@@ -904,7 +892,7 @@ def objective(trial, args, env):
             env=env,
             policy_kwargs={
                 "features_extractor_class": SimpleCNN,
-                "net_arch": [dict(pi=[128, 128], vf=[128, 128])]
+                "net_arch": [dict(pi=[256, 256, 128], vf=[256, 256, 128])]
             },
             **combat_params,
             tensorboard_log=args.log_dir,
@@ -955,7 +943,7 @@ def train_with_best_params(args, env, best_params):
             env=env,
             policy_kwargs={
                 "features_extractor_class": SimpleCNN,
-                "net_arch": [dict(pi=[128, 128], vf=[128, 128])]
+                "net_arch": [dict(pi=[256, 256, 128], vf=[256, 256, 128])]
             },
             **best_params,
             tensorboard_log=args.log_dir,
@@ -969,7 +957,7 @@ def train_with_best_params(args, env, best_params):
     
     try:
         model.learn(
-            total_timesteps=args.timesteps,  # Changed from MAX_TIMESTEPS
+            total_timesteps=args.timesteps,
             callback=callback,
             tb_log_name="PPO_KungFu_best",
             reset_num_timesteps=not args.resume
@@ -1000,7 +988,6 @@ def train(args):
         model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
         os.makedirs(model_path, exist_ok=True)
         
-        # Default parameters in case Optuna is disabled and no best params are found
         default_params = {
             'learning_rate': 3e-4,
             'n_steps': 2048,
@@ -1015,7 +1002,6 @@ def train(args):
         
         if args.no_optuna:
             logger.info("Optuna optimization disabled via --no-optuna flag")
-            # Check for existing best parameters
             best_params, best_value = load_best_params_from_db(best_params_db)
             if best_params is not None:
                 logger.info(f"Using pre-loaded best parameters from database with value {best_value}")
@@ -1024,7 +1010,6 @@ def train(args):
                 logger.info("No best parameters found in database. Using default parameters.")
                 train_with_best_params(args, env, default_params)
         else:
-            # Check for existing best parameters
             best_params, best_value = load_best_params_from_db(best_params_db)
             
             if best_params is not None and best_value >= GOOD_ENOUGH_THRESHOLD:
@@ -1051,13 +1036,11 @@ def train(args):
                 logger.info(f"Best parameters: {best_trial.params}")
                 logger.info(f"Best value (total hits): {best_trial.value}")
                 
-                # Save the best model from Optuna trials
                 best_model_file = os.path.join(model_path, "kungfu_ppo_best")
                 global_model_file = best_model_file
                 best_model = PPO.load(f"{model_path}/kungfu_ppo_trial_{best_trial.number}", env=env)
                 save_model_with_logging(best_model, best_model_file, logger)
                 
-                # Save best parameters to database
                 save_best_params_to_db(best_params_db, best_trial.params, best_trial.value)
                 
                 if best_trial.value >= GOOD_ENOUGH_THRESHOLD:
@@ -1075,12 +1058,12 @@ def train(args):
             env.close()
     
     logger.info("Training session ended")
-    
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Kung Fu with PPO and Optuna.")
     parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save model")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
-    parser.add_argument("--timesteps", type=int, default=10000, help="Total timesteps per trial")
+    parser.add_argument("--timesteps", type=int, default=50000, help="Total timesteps per trial")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--render", action="store_true", help="Render during training")
