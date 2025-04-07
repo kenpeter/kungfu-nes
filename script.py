@@ -26,22 +26,25 @@ global_model_file = None
 logger = None
 
 class SimpleCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=256):
+    def __init__(self, observation_space, features_dim=512):
         super(SimpleCNN, self).__init__(observation_space, features_dim)
         assert isinstance(observation_space, spaces.Dict), "Observation space must be a Dict"
         
+        # Expect 36 channels: 12 frames * 3 RGB channels
         self.cnn = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=8, stride=4),
+            nn.Conv2d(36, 64, kernel_size=8, stride=4),  # 36 channels for 12 frames * 3 RGB
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.Flatten(),
         )
         
         with torch.no_grad():
-            sample_input = torch.zeros(1, 4, 84, 84)
+            sample_input = torch.zeros(1, 36, 84, 84)
             n_flatten = self.cnn(sample_input).shape[1]
         
         enemy_vec_size = observation_space["enemy_vector"].shape[0]
@@ -59,8 +62,10 @@ class SimpleCNN(BaseFeaturesExtractor):
                 n_flatten + enemy_vec_size + enemy_types_size + enemy_history_size +
                 enemy_timers_size + enemy_patterns_size + combat_status_size +
                 projectile_vec_size + enemy_proximity_size + boss_info_size,
-                features_dim
+                512
             ),
+            nn.ReLU(),
+            nn.Linear(512, features_dim),
             nn.ReLU()
         )
     
@@ -76,52 +81,42 @@ class SimpleCNN(BaseFeaturesExtractor):
         enemy_proximity = observations["enemy_proximity"]
         boss_info = observations["boss_info"]
         
+        # Convert numpy arrays to torch tensors
         if isinstance(viewport, np.ndarray):
-            viewport = torch.from_numpy(viewport)
+            viewport = torch.from_numpy(viewport).float()
         if isinstance(enemy_vector, np.ndarray):
-            enemy_vector = torch.from_numpy(enemy_vector)
+            enemy_vector = torch.from_numpy(enemy_vector).float()
         if isinstance(enemy_types, np.ndarray):
-            enemy_types = torch.from_numpy(enemy_types)
+            enemy_types = torch.from_numpy(enemy_types).float()
         if isinstance(enemy_history, np.ndarray):
-            enemy_history = torch.from_numpy(enemy_history)
+            enemy_history = torch.from_numpy(enemy_history).float()
         if isinstance(enemy_timers, np.ndarray):
-            enemy_timers = torch.from_numpy(enemy_timers)
+            enemy_timers = torch.from_numpy(enemy_timers).float()
         if isinstance(enemy_patterns, np.ndarray):
-            enemy_patterns = torch.from_numpy(enemy_patterns)
+            enemy_patterns = torch.from_numpy(enemy_patterns).float()
         if isinstance(combat_status, np.ndarray):
-            combat_status = torch.from_numpy(combat_status)
+            combat_status = torch.from_numpy(combat_status).float()
         if isinstance(projectile_vectors, np.ndarray):
-            projectile_vectors = torch.from_numpy(projectile_vectors)
+            projectile_vectors = torch.from_numpy(projectile_vectors).float()
         if isinstance(enemy_proximity, np.ndarray):
-            enemy_proximity = torch.from_numpy(enemy_proximity)
+            enemy_proximity = torch.from_numpy(enemy_proximity).float()
         if isinstance(boss_info, np.ndarray):
-            boss_info = torch.from_numpy(boss_info)
+            boss_info = torch.from_numpy(boss_info).float()
             
+        # Adjust viewport dimensions: (batch, height, width, channels) -> (batch, channels, height, width)
         if len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0)
-        if len(viewport.shape) == 4 and (viewport.shape[3] == 4 or viewport.shape[3] == 1):
-            viewport = viewport.permute(0, 3, 1, 2)
+        if len(viewport.shape) == 4 and viewport.shape[-1] == 3:
+            viewport = viewport.permute(0, 3, 1, 2)  # (batch, height, width, 3) -> (batch, 3, height, width)
         
         cnn_output = self.cnn(viewport)
         
-        if len(enemy_vector.shape) == 1:
-            enemy_vector = enemy_vector.unsqueeze(0)
-        if len(enemy_types.shape) == 1:
-            enemy_types = enemy_types.unsqueeze(0)
-        if len(enemy_history.shape) == 1:
-            enemy_history = enemy_history.unsqueeze(0)
-        if len(enemy_timers.shape) == 1:
-            enemy_timers = enemy_timers.unsqueeze(0)
-        if len(enemy_patterns.shape) == 1:
-            enemy_patterns = enemy_patterns.unsqueeze(0)
-        if len(combat_status.shape) == 1:
-            combat_status = combat_status.unsqueeze(0)
-        if len(projectile_vectors.shape) == 1:
-            projectile_vectors = projectile_vectors.unsqueeze(0)
-        if len(enemy_proximity.shape) == 1:
-            enemy_proximity = enemy_proximity.unsqueeze(0)
-        if len(boss_info.shape) == 1:
-            boss_info = boss_info.unsqueeze(0)
+        # Ensure other inputs have the correct shape
+        for tensor in [enemy_vector, enemy_types, enemy_history, enemy_timers,
+                       enemy_patterns, combat_status, projectile_vectors,
+                       enemy_proximity, boss_info]:
+            if len(tensor.shape) == 1:
+                tensor = tensor.unsqueeze(0)
             
         combined = torch.cat([
             cnn_output, enemy_vector, enemy_types, enemy_history, enemy_timers,
@@ -166,11 +161,11 @@ class KungFuWrapper(Wrapper):
         self.patterns_length = 2  # [avg_attack_interval, avg_dx] per enemy type
         
         self.observation_space = spaces.Dict({
-            "viewport": spaces.Box(0, 255, (*self.viewport_size, 1), np.uint8),
+            "viewport": spaces.Box(0, 255, (*self.viewport_size, 3), np.uint8),  # RGB channels
             "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
             "enemy_types": spaces.Box(0, self.max_enemy_types - 1, (self.max_enemies,), np.float32),
             "enemy_history": spaces.Box(-255, 255, (self.max_enemies * self.history_length * 2,), np.float32),
-            "enemy_timers": spaces.Box(0, 255, (self.max_enemies,), np.float32),
+            "enemy_timers": spaces.Box(0, 1, (self.max_enemies,), np.float32),
             "enemy_patterns": spaces.Box(-255, 255, (self.max_enemies * self.patterns_length,), np.float32),
             "combat_status": spaces.Box(-1, 1, (2,), np.float32),
             "projectile_vectors": spaces.Box(-255, 255, (self.max_projectiles * 4,), np.float32),
@@ -199,14 +194,12 @@ class KungFuWrapper(Wrapper):
         self.patterns_db = patterns_db
         self._init_db()
         self.stored_patterns = self._load_patterns()
-        # Track observations for updating patterns
         self.attack_intervals = {et: [] for et in range(self.max_enemy_types)}
         self.dx_history = {et: [] for et in range(self.max_enemy_types)}
         self.last_attack_steps = [-1] * self.max_enemies
-        self.observation_counts = {et: 0 for et in range(self.max_enemy_types)}  # Track total observations
+        self.observation_counts = {et: 0 for et in range(self.max_enemy_types)}
 
     def _init_db(self):
-        """Initialize the SQLite database and create the enemy_patterns table if it doesn't exist."""
         conn = sqlite3.connect(self.patterns_db)
         c = conn.cursor()
         c.execute('''
@@ -217,14 +210,12 @@ class KungFuWrapper(Wrapper):
                 observations INTEGER
             )
         ''')
-        # Initialize entries for each enemy type
         for et in range(self.max_enemy_types):
             c.execute('INSERT OR IGNORE INTO enemy_patterns (enemy_type, attack_interval, avg_dx, observations) VALUES (?, 0, 0, 0)', (et,))
         conn.commit()
         conn.close()
 
     def _load_patterns(self):
-        """Load enemy patterns from the SQLite database into a dictionary."""
         conn = sqlite3.connect(self.patterns_db)
         c = conn.cursor()
         c.execute('SELECT enemy_type, attack_interval, avg_dx, observations FROM enemy_patterns')
@@ -233,7 +224,6 @@ class KungFuWrapper(Wrapper):
         return patterns
 
     def _save_patterns(self):
-        """Save updated enemy patterns to the SQLite database."""
         conn = sqlite3.connect(self.patterns_db)
         c = conn.cursor()
         for et, data in self.stored_patterns.items():
@@ -281,50 +271,56 @@ class KungFuWrapper(Wrapper):
         enemy_distances = [abs(enemy_x - hero_x) for enemy_x in curr_enemies if enemy_x != 0]
         enemy_very_close = 1.0 if any(dist <= 20 for dist in enemy_distances) else 0.0
         
-        # Update enemy info and track patterns
         self._update_enemy_info(obs, ram)
-        
-        # Update boss info
         self._update_boss_info(ram)
-        
-        # Detect projectiles
         projectile_info = self._detect_projectiles(obs)
         projectile_hit = self._check_projectile_hit(hp_loss)
         projectile_avoided = len(projectile_info) > 0 and not projectile_hit
         
-        # Adjusted reward structure
+        # Base reward structure
         raw_reward = (
-            enemy_hit * 500.0 +
-            -hp_loss * 100.0 +
-            (1.0 if enemy_hit > 0 else -0.5) +
-            (100.0 if projectile_avoided else 0.0) +
-            (-200.0 if projectile_hit else 0.0)
+            enemy_hit * 5.0 +
+            -hp_loss * 1.0 +
+            (0.1 if enemy_hit > 0 else -0.05) +
+            (3.0 if projectile_avoided else 0.0) +
+            (-5.0 if projectile_hit else 0.0)
         )
         
-        # Penalty for inaction
-        if hp_loss > 5 and action == 0:
-            raw_reward -= 50.0
-        if enemy_very_close and action == 0:
-            raw_reward -= 30.0
+        # Shaping reward: Encourage defensive actions when a projectile is detected
+        if len(projectile_info) > 0:
+            if action in [5, 6, 7, 8]:  # Jump, Crouch, Jump+Punch, Crouch+Punch
+                raw_reward += 0.5
+            # Proximity-based shaping: Reward for being in a safe position
+            for i in range(0, len(projectile_info), 4):
+                distance = projectile_info[i]  # Distance to projectile
+                proj_y = projectile_info[i + 1]  # Y position of projectile
+                if abs(distance) < 50 and 40 < proj_y < 60:  # Knife is close and at player height
+                    if action in [5, 7]:  # Jump or Jump+Punch
+                        raw_reward += 1.0  # Reward for jumping over a close knife
+                    elif action in [6, 8]:  # Crouch or Crouch+Punch
+                        raw_reward += 1.0  # Reward for crouching under a close knife
         
-        # Reward for dodging projectiles based on enemy type
+        if hp_loss > 5 and action == 0:
+            raw_reward -= 0.5
+        if enemy_very_close and action == 0:
+            raw_reward -= 0.3
+        
         if projectile_avoided:
             for enemy_type in self.enemy_types:
-                if enemy_type in [1, 4]:  # Knife Thrower or Dragon
-                    raw_reward += 150.0
+                if enemy_type in [1, 4]:
+                    raw_reward += 1.5
                     break
         
-        # Reward for damaging the boss
         if self.boss_info[2] > 0 and enemy_hit > 0:
-            raw_reward += 200.0
+            raw_reward += 2.0
         
         # Diversity penalty
         action_percentages = self.action_counts / (self.total_steps + 1e-6)
         dominant_action_percentage = np.max(action_percentages)
         diversity_penalty = 0.0
         if self.current_step > 50 and hp_loss < 5:
-            if dominant_action_percentage > 0.4:
-                diversity_penalty = -10.0 * (dominant_action_percentage - 0.4)
+            if dominant_action_percentage > 0.3:
+                diversity_penalty = -0.2 * (dominant_action_percentage - 0.3)
                 raw_reward += diversity_penalty
         
         self.last_hp = hp
@@ -334,9 +330,9 @@ class KungFuWrapper(Wrapper):
         
         if self.current_step > 50 and enemy_hit == 0:
             done = True
-            raw_reward -= 100.0
+            raw_reward -= 1.0
         
-        normalized_reward = np.clip(raw_reward / 500.0, -1, 1)
+        normalized_reward = np.clip(raw_reward, -1, 1)
         
         info.update({
             "hp": hp,
@@ -365,6 +361,7 @@ class KungFuWrapper(Wrapper):
         new_timers = np.zeros(self.max_enemies, dtype=np.float32)
         
         stage = int(ram[0x0058])
+        logger.debug(f"Current stage: {stage}")
         
         for i, (pos_addr, action_addr, timer_addr) in enumerate([
             (0x008E, 0x0080, 0x002B),
@@ -379,42 +376,42 @@ class KungFuWrapper(Wrapper):
             if enemy_x != 0:
                 if stage == 1:
                     if enemy_action in [0x01, 0x02]:
-                        new_types[i] = 1
+                        new_types[i] = 1  # Knife Thrower
                     else:
-                        new_types[i] = 2
+                        new_types[i] = 2  # Midget
                 elif stage == 2:
-                    new_types[i] = 3
+                    new_types[i] = 3  # Snake
                 elif stage == 3:
                     if enemy_action in [0x03, 0x04]:
-                        new_types[i] = 4
+                        new_types[i] = 4  # Dragon
                     else:
-                        new_types[i] = 2
+                        new_types[i] = 2  # Midget
                 elif stage in [4, 5]:
-                    new_types[i] = 0
+                    new_types[i] = 5 if stage == 5 else 0  # Boss or None
                 new_positions[i] = [enemy_x, 50]
-                new_timers[i] = enemy_timer / 255.0
+                new_timers[i] = min(enemy_timer / 60.0, 1.0)
                 
-                # Track attack patterns
-                if enemy_action in [0x01, 0x02, 0x03, 0x04]:  # Attack actions
+                if enemy_action in [0x01, 0x02, 0x03, 0x04]:
                     if self.last_attack_steps[i] != -1:
                         interval = self.current_step - self.last_attack_steps[i]
-                        self.attack_intervals[int(new_types[i])].append(interval)
+                        if interval > 0:
+                            self.attack_intervals[int(new_types[i])].append(interval)
                     self.last_attack_steps[i] = self.current_step
                 else:
                     self.last_attack_steps[i] = -1
                 
-                # Track movement patterns (dx)
                 dx = new_positions[i][0] - self.enemy_positions[i][0]
-                self.dx_history[int(new_types[i])].append(dx)
+                if dx != 0:
+                    self.dx_history[int(new_types[i])].append(dx)
                 
-                # Increment observation count
                 self.observation_counts[int(new_types[i])] += 1
             else:
                 new_types[i] = 0
                 new_timers[i] = 0
                 self.last_attack_steps[i] = -1
         
-        # Update enemy history
+        logger.debug(f"Enemy types: {new_types}")
+        
         for i in range(self.max_enemies):
             if new_types[i] != 0:
                 dx = new_positions[i][0] - self.enemy_positions[i][0]
@@ -424,45 +421,37 @@ class KungFuWrapper(Wrapper):
             else:
                 self.enemy_history[i] = np.zeros((self.history_length, 2), dtype=np.float32)
         
-        # Update stored patterns every 100 steps
-        if self.current_step % 100 == 0:
+        if self.current_step % 50 == 0:
             for et in range(self.max_enemy_types):
-                if et in [0, 5]:  # Skip "None" and "Boss"
+                if et in [0, 5]:
                     continue
                 current_data = self.stored_patterns.get(str(et), {"attack_interval": 0, "avg_dx": 0, "observations": 0})
                 current_interval = current_data["attack_interval"]
                 current_dx = current_data["avg_dx"]
                 current_obs = current_data["observations"]
                 
-                # Update attack interval
                 if len(self.attack_intervals[et]) > 0:
-                    new_intervals = self.attack_intervals[et]
-                    total_obs = current_obs + len(new_intervals)
-                    avg_interval = ((current_interval * current_obs) + sum(new_intervals)) / total_obs if total_obs > 0 else 0
-                    self.stored_patterns[str(et)]["attack_interval"] = avg_interval
-                    self.stored_patterns[str(et)]["observations"] = total_obs
+                    new_intervals = [i for i in self.attack_intervals[et] if i > 0]
+                    if new_intervals:
+                        total_obs = current_obs + len(new_intervals)
+                        avg_interval = np.mean(new_intervals)
+                        self.stored_patterns[str(et)]["attack_interval"] = avg_interval
+                        self.stored_patterns[str(et)]["observations"] = total_obs
                     self.attack_intervals[et] = []
-                else:
-                    self.stored_patterns[str(et)]["attack_interval"] = current_interval
-                    self.stored_patterns[str(et)]["observations"] = current_obs
                 
-                # Update avg_dx
                 if len(self.dx_history[et]) > 0:
-                    new_dx = self.dx_history[et]
-                    total_obs = current_obs + len(new_dx)
-                    avg_dx = ((current_dx * current_obs) + sum(new_dx)) / total_obs if total_obs > 0 else 0
-                    self.stored_patterns[str(et)]["avg_dx"] = avg_dx
-                    self.stored_patterns[str(et)]["observations"] = total_obs
+                    new_dx = [dx for dx in self.dx_history[et] if dx != 0]
+                    if new_dx:
+                        total_obs = current_obs + len(new_dx)
+                        avg_dx = np.mean(new_dx)
+                        self.stored_patterns[str(et)]["avg_dx"] = avg_dx
+                        self.stored_patterns[str(et)]["observations"] = total_obs
                     self.dx_history[et] = []
-                else:
-                    self.stored_patterns[str(et)]["avg_dx"] = current_dx
                 
-                # Ensure observations are cumulative
                 self.stored_patterns[str(et)]["observations"] = max(current_obs, self.observation_counts[et])
             
             self._save_patterns()
         
-        # Update enemy patterns in observation
         for i in range(self.max_enemies):
             et = int(new_types[i])
             self.enemy_patterns[i] = [
@@ -489,53 +478,89 @@ class KungFuWrapper(Wrapper):
             self.boss_info = np.zeros(3, dtype=np.float32)
 
     def _detect_projectiles(self, obs):
-        gray = np.dot(obs[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
-        gray = cv2.resize(gray, self.viewport_size, interpolation=cv2.INTER_AREA)
+        # Keep the frame in RGB and resize it
+        frame = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
         
         if self.prev_frame is not None:
-            frame_diff = cv2.absdiff(gray, self.prev_frame)
-            _, thresh = cv2.threshold(frame_diff, 30, 255, cv2.THRESH_BINARY)
-            thresh = cv2.dilate(thresh, None, iterations=2)
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Step 1: Frame differencing in RGB to detect motion
+            frame_diff = cv2.absdiff(frame, self.prev_frame)
+            # Sum the differences across RGB channels
+            diff_sum = np.sum(frame_diff, axis=2).astype(np.uint8)
+            _, motion_mask = cv2.threshold(diff_sum, 20, 255, cv2.THRESH_BINARY)
+            motion_mask = cv2.dilate(motion_mask, None, iterations=4)
+            
+            # Step 2: Color-based detection in RGB
+            # Define color ranges for projectiles (e.g., white knives, green dragon fire)
+            # White (knives): High R, G, B values
+            lower_white = np.array([180, 180, 180])
+            upper_white = np.array([255, 255, 255])
+            # Green (dragon fire): High G, lower R and B
+            lower_green = np.array([0, 100, 0])
+            upper_green = np.array([100, 255, 100])
+            
+            # Create color masks
+            white_mask = cv2.inRange(frame, lower_white, upper_white)
+            green_mask = cv2.inRange(frame, lower_green, upper_green)
+            color_mask = cv2.bitwise_or(white_mask, green_mask)
+            color_mask = cv2.dilate(color_mask, None, iterations=2)
+            
+            # Step 3: Combine motion and color masks
+            combined_mask = cv2.bitwise_and(motion_mask, color_mask)
+            contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             projectile_info = []
             current_projectile_positions = []
             hero_x = int(self.env.get_ram()[0x0094])
             
+            # Step 4: Filter contours based on size, shape, and motion consistency
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if 5 < area < 150:
+                if 5 < area < 50:  # Small area for projectiles
                     x, y, w, h = cv2.boundingRect(contour)
                     proj_x = x + w // 2
                     proj_y = y + h // 2
                     
-                    dx, dy = 0, 0
-                    for prev_pos in self.last_projectile_positions:
-                        prev_x, prev_y = prev_pos
-                        if abs(proj_x - prev_x) < 20 and abs(proj_y - prev_y) < 20:
-                            dx = proj_x - prev_x
-                            dy = proj_y - prev_y
-                            speed = np.sqrt(dx**2 + dy**2)
-                            if speed < 2 or speed > 25:
-                                dx, dy = 0, 0
-                            break
-                    
-                    if dx != 0 or dy != 0:
-                        game_width = 256
-                        proj_x_game = (proj_x / self.viewport_size[0]) * game_width
-                        distance = proj_x_game - hero_x
-                        projectile_info.extend([distance, proj_y, dx, dy])
-                        current_projectile_positions.append((proj_x, proj_y))
+                    # Shape filter: Projectiles are often elongated
+                    aspect_ratio = w / h if h > 0 else 1
+                    if 0.5 < aspect_ratio < 3.0:
+                        # Motion consistency check
+                        dx, dy = 0, 0
+                        for prev_pos in self.last_projectile_positions:
+                            prev_x, prev_y = prev_pos
+                            if abs(proj_x - prev_x) < 20 and abs(proj_y - prev_y) < 20:
+                                dx = proj_x - prev_x
+                                dy = proj_y - prev_y
+                                speed = np.sqrt(dx**2 + dy**2)
+                                if speed < 5 or speed > 25:
+                                    dx, dy = 0, 0
+                                if abs(dx) < 2:  # Require horizontal motion
+                                    dx, dy = 0, 0
+                                break
+                        
+                        if dx != 0 or dy != 0:
+                            # Log the average RGB values of the detected object
+                            roi = frame[y:y+h, x:x+w]
+                            avg_rgb = np.mean(roi, axis=(0, 1)) if roi.size > 0 else np.zeros(3)
+                            is_white = np.all(avg_rgb > 180)
+                            is_green = (avg_rgb[1] > 100) and (avg_rgb[0] < 100) and (avg_rgb[2] < 100)
+                            
+                            game_width = 256
+                            proj_x_game = (proj_x / self.viewport_size[0]) * game_width
+                            distance = proj_x_game - hero_x
+                            projectile_info.extend([distance, proj_y, dx, dy])
+                            current_projectile_positions.append((proj_x, proj_y))
+                            logger.debug(f"Detected projectile: pos=({proj_x}, {proj_y}), area={area}, aspect_ratio={aspect_ratio:.2f}, speed={speed:.2f}, avg_rgb={avg_rgb}, is_white={is_white}, is_green={is_green}")
             
             projectile_info = projectile_info[:self.max_projectiles * 4]
             while len(projectile_info) < self.max_projectiles * 4:
                 projectile_info.append(0)
             
             self.last_projectile_positions = current_projectile_positions[:self.max_projectiles]
-            self.prev_frame = gray
+            self.prev_frame = frame
+            logger.debug(f"Total detected projectiles: {len(current_projectile_positions)}")
             return projectile_info
         
-        self.prev_frame = gray
+        self.prev_frame = frame
         return [0] * (self.max_projectiles * 4)
 
     def _check_projectile_hit(self, hp_loss):
@@ -544,8 +569,7 @@ class KungFuWrapper(Wrapper):
         return False
 
     def _get_obs(self, obs):
-        gray = np.dot(obs[..., :3], [0.299, 0.587, 0.114])
-        viewport = cv2.resize(gray, self.viewport_size)[..., np.newaxis]
+        viewport = cv2.resize(obs, self.viewport_size)  # Keep in RGB
         ram = self.env.get_ram()
         
         hero_x = int(ram[0x0094])
@@ -583,7 +607,7 @@ class KungFuWrapper(Wrapper):
         }
 
 class CombatTrainingCallback(BaseCallback):
-    def __init__(self, progress_bar=False, logger=None):
+    def __init__(self, progress_bar=False, logger=None, total_timesteps=10000):
         super().__init__()
         self.logger = logger or logging.getLogger()
         self.progress_bar = progress_bar
@@ -598,7 +622,7 @@ class CombatTrainingCallback(BaseCallback):
         self.projectile_avoids = 0
         
         if progress_bar:
-            self.pbar = tqdm(total=10000, desc="Training")
+            self.pbar = tqdm(total=total_timesteps, desc="Training")
 
     def _on_step(self):
         self.total_steps += 1
@@ -725,11 +749,14 @@ class CombatTrainingCallback(BaseCallback):
 
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    log_file = os.path.join(log_dir, f'run_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file)
+        ]
     )
     return logging.getLogger()
 
@@ -773,7 +800,7 @@ def make_vec_env(num_envs, render=False, patterns_db="enemy_patterns.db"):
         env = SubprocVecEnv([lambda: make_env(render, patterns_db) for _ in range(num_envs)])
     else:
         env = DummyVecEnv([lambda: make_env(render, patterns_db)])
-    return VecFrameStack(env, n_stack=4)
+    return VecFrameStack(env, n_stack=12)  # 12 frames
 
 def objective(trial, args, env):
     global global_model, global_model_file, logger
@@ -813,9 +840,7 @@ def objective(trial, args, env):
     global_model = model
     global_model_file = model_file
     
-    callback = CombatTrainingCallback(progress_bar=args.progress_bar, logger=logger)
-    if args.progress_bar:
-        callback.pbar.total = args.timesteps
+    callback = CombatTrainingCallback(progress_bar=args.progress_bar, logger=logger, total_timesteps=args.timesteps)
     
     model.learn(
         total_timesteps=args.timesteps,
