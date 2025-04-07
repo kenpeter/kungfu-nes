@@ -11,15 +11,16 @@ import sys
 import time
 from gym import spaces, Wrapper
 import cv2
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 # Define SimpleCNN to match the training model's feature extractor
-class SimpleCNN(nn.Module):
-    def __init__(self, observation_space, features_dim=512):  # Match training features_dim
-        super(SimpleCNN, self).__init__()
+class SimpleCNN(BaseFeaturesExtractor):
+    def __init__(self, observation_space, features_dim=512):
+        super(SimpleCNN, self).__init__(observation_space, features_dim)
         assert isinstance(observation_space, spaces.Dict), "Observation space must be a Dict"
         
         self.cnn = nn.Sequential(
-            nn.Conv2d(36, 64, kernel_size=8, stride=4),  # 36 channels from VecFrameStack n_stack=12
+            nn.Conv2d(36, 64, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(64, 128, kernel_size=4, stride=2),
             nn.ReLU(),
@@ -91,7 +92,7 @@ class SimpleCNN(nn.Module):
             
         if len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0)
-        if len(viewport.shape) == 4 and viewport.shape[-1] in (3, 36):  # Handle 3 or 36 channels
+        if len(viewport.shape) == 4 and viewport.shape[-1] in (3, 36):
             viewport = viewport.permute(0, 3, 1, 2)
         
         cnn_output = self.cnn(viewport)
@@ -114,20 +115,21 @@ class KungFuWrapper(Wrapper):
         super().__init__(env)
         self.viewport_size = (84, 84)
         
+        # Fixed: Swap Jump and Crouch to match training script's mapping
         self.actions = [
             [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op
             [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch
             [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick
             [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch
             [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch
-            [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump (fixed to match play.py)
-            [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch (fixed to match play.py)
-            [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch (fixed)
-            [0,0,1,0,0,0,1,0,0,0,0,0]   # Crouch+Punch (fixed)
+            [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch (index 5, swapped to match training)
+            [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump (index 6, swapped to match training)
+            [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch
+            [0,0,1,0,0,0,1,0,0,0,0,0]   # Crouch+Punch
         ]
         self.action_names = [
             "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
-            "Jump", "Crouch", "Jump+Punch", "Crouch+Punch"
+            "Crouch", "Jump", "Jump+Punch", "Crouch+Punch"
         ]
         
         self.action_space = spaces.Discrete(len(self.actions))
@@ -136,9 +138,8 @@ class KungFuWrapper(Wrapper):
         self.max_projectiles = 2
         self.patterns_length = 2
         
-        # Match training observation space exactly
         self.observation_space = spaces.Dict({
-            "viewport": spaces.Box(0, 255, (*self.viewport_size, 3), np.uint8),  # 3 channels before stacking
+            "viewport": spaces.Box(0, 255, (*self.viewport_size, 3), np.uint8),
             "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
             "enemy_types": spaces.Box(0, 5, (self.max_enemies,), np.float32),
             "enemy_history": spaces.Box(-255, 255, (self.max_enemies * self.history_length * 2,), np.float32),
@@ -313,7 +314,7 @@ class KungFuWrapper(Wrapper):
         return [0] * (self.max_projectiles * 4)
 
     def _get_obs(self, obs):
-        viewport = cv2.resize(obs, self.viewport_size)  # Keep RGB channels
+        viewport = cv2.resize(obs, self.viewport_size)
         ram = self.env.get_ram()
         
         hero_x = int(ram[0x0094])
@@ -368,17 +369,21 @@ def play(args):
         logger.error(f"No trained model found at {model_file}.zip")
         sys.exit(1)
 
-    # Create environment matching training setup
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuWrapper(env)
     env = DummyVecEnv([lambda: env])
-    env = VecFrameStack(env, n_stack=12)  # Match training n_stack=12
+    env = VecFrameStack(env, n_stack=12)
         
     if args.render:
         env.envs[0].env.render_mode = 'human'
     
-    # Load model
-    model = PPO.load(model_file, env=env, device="cuda" if args.cuda else "cpu")
+    custom_objects = {
+        "policy_kwargs": {
+            "features_extractor_class": SimpleCNN,
+            "net_arch": [dict(pi=[256, 256, 128], vf=[512, 512, 256])]
+        }
+    }
+    model = PPO.load(model_file, env=env, device="cuda" if args.cuda else "cpu", custom_objects=custom_objects)
     
     obs = env.reset()
     total_hits = 0
