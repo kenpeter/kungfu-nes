@@ -130,15 +130,15 @@ class KungFuWrapper(Wrapper):
         self.viewport_size = (84, 84)
         
         self.actions = [
-            [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op
-            [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch
-            [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick
-            [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch
-            [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch
-            [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump
-            [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch
-            [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch
-            [0,0,1,0,0,0,1,0,0,0,0,0]   # Crouch+Punch
+            [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (index 0)
+            [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (index 1)
+            [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick (index 2)
+            [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch (index 3)
+            [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch (index 4)
+            [0,0,0,0,1,0,0,0,0,0,0,0],  # Jump (index 5) - Fixed: Press UP
+            [0,0,0,0,0,1,0,0,0,0,0,0],  # Crouch (index 6) - Fixed: Press DOWN
+            [0,0,0,0,1,0,1,0,0,0,0,0],  # Jump+Punch (index 7) - Updated to use UP
+            [0,0,0,0,0,1,1,0,0,0,0,0]   # Crouch+Punch (index 8) - Updated to use DOWN
         ]
         self.action_names = [
             "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
@@ -671,31 +671,25 @@ class CombatTrainingCallback(BaseCallback):
             
             action_percentages = info.get("action_percentages", np.zeros(9))
             action_names = info.get("action_names", [])
-            for name, percentage in zip(action_names, action_percentages):
-                self.logger.record(f"actions/{name.replace('+', '_')}", percentage)
+            actions_log = [f"{name}:{percentage:.1%}" for name, percentage in zip(action_names, action_percentages)]
+            self.logger.record("actions", actions_log)
             
             steps_per_second = self.total_steps / (time.time() - self.start_time)
             self.logger.record("time/steps_per_second", steps_per_second)
         
         current_time = time.time()
-        if current_time - self.last_log_time > 30 or self.total_steps % 100 == 0:
+        if current_time - self.last_log_time > 30 or self.total_steps % 10 == 0:
             info = self.locals["infos"][0]
             hit_rate = self.total_hits / (self.total_steps + 1e-6)
+            action_percentages = info.get("action_percentages", np.zeros(9))
+            action_names = info.get("action_names", [])
+            actions_log = [f"{name}:{percentage:.1%}" for name, percentage in zip(action_names, action_percentages)]
             self.logger.info(
-                f"Step {self.total_steps}: "
-                f"Reward={self.locals['rewards'][0]:.2f}, "
-                f"Hits={self.total_hits}, "
-                f"Hit Rate={hit_rate:.2%}, "
-                f"HP={info.get('hp', 0)}, "
-                f"HP Change Rate={info.get('hp_change_rate', 0):.4f}, "
-                f"Enemy Very Close={info.get('enemy_very_close', 0)}, "
-                f"Projectile Hits={self.projectile_hits}, "
-                f"Projectile Avoids={self.projectile_avoids}, "
-                f"Dominant Action %={info.get('dominant_action_percentage', 0):.2%}, "
-                f"Enemy Types={info.get('enemy_types', [0] * 4)}, "
-                f"Enemy Timers={info.get('enemy_timers', [0] * 4)}, "
-                f"Enemy Patterns={info.get('enemy_patterns', np.zeros((4, 2)))}, "
-                f"Boss Info={info.get('boss_info', [0, 0, 0])}"
+                f"Step: {self.total_steps}, "
+                f"Hits: {self.total_hits}, "
+                f"Hit Rate: {hit_rate:.2%}, "
+                f"HP: {info.get('hp', 0)}, "
+                f"Actions: {actions_log}"
             )
             self.last_log_time = current_time
         
