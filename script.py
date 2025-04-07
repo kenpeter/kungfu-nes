@@ -31,7 +31,7 @@ logger = None
 
 # Thresholds
 GOOD_ENOUGH_THRESHOLD = 100
-MAX_TIMESTEPS = 1000000
+MAX_TIMESTEPS = 90000
 
 # [SimpleCNN class remains unchanged from the last corrected version]
 class SimpleCNN(BaseFeaturesExtractor):
@@ -965,11 +965,11 @@ def train_with_best_params(args, env, best_params):
     global_model = model
     global_model_file = model_file
     
-    callback = CombatTrainingCallback(progress_bar=args.progress_bar, logger=logger, total_timesteps=MAX_TIMESTEPS)
+    callback = CombatTrainingCallback(progress_bar=args.progress_bar, logger=logger, total_timesteps=args.timesteps)
     
     try:
         model.learn(
-            total_timesteps=MAX_TIMESTEPS,
+            total_timesteps=args.timesteps,  # Changed from MAX_TIMESTEPS
             callback=callback,
             tb_log_name="PPO_KungFu_best",
             reset_num_timesteps=not args.resume
@@ -1000,47 +1000,71 @@ def train(args):
         model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
         os.makedirs(model_path, exist_ok=True)
         
-        # Check for existing best parameters
-        best_params, best_value = load_best_params_from_db(best_params_db)
+        # Default parameters in case Optuna is disabled and no best params are found
+        default_params = {
+            'learning_rate': 3e-4,
+            'n_steps': 2048,
+            'batch_size': 64,
+            'n_epochs': 10,
+            'gamma': 0.99,
+            'clip_range': 0.2,
+            'ent_coef': 0.01,
+            'vf_coef': 0.5,
+            'max_grad_norm': 0.5
+        }
         
-        if best_params is not None and best_value >= GOOD_ENOUGH_THRESHOLD:
-            logger.info(f"Found good enough parameters (value: {best_value}) in database. Skipping Optuna search.")
-            train_with_best_params(args, env, best_params)
+        if args.no_optuna:
+            logger.info("Optuna optimization disabled via --no-optuna flag")
+            # Check for existing best parameters
+            best_params, best_value = load_best_params_from_db(best_params_db)
+            if best_params is not None:
+                logger.info(f"Using pre-loaded best parameters from database with value {best_value}")
+                train_with_best_params(args, env, best_params)
+            else:
+                logger.info("No best parameters found in database. Using default parameters.")
+                train_with_best_params(args, env, default_params)
         else:
-            logger.info("Starting or resuming Optuna optimization.")
-            study_name = "kungfu_ppo_study"
-            storage_name = f"sqlite:///{os.path.join(args.log_dir, 'optuna_study.db')}"
+            # Check for existing best parameters
+            best_params, best_value = load_best_params_from_db(best_params_db)
             
-            if args.resume and os.path.exists(os.path.join(args.log_dir, 'optuna_study.db')):
-                logger.info(f"Resuming existing Optuna study from {storage_name}")
-                study = optuna.load_study(study_name=study_name, storage=storage_name)
+            if best_params is not None and best_value >= GOOD_ENOUGH_THRESHOLD:
+                logger.info(f"Found good enough parameters (value: {best_value}) in database. Skipping Optuna search.")
+                train_with_best_params(args, env, best_params)
             else:
-                logger.info("Creating new Optuna study")
-                study = optuna.create_study(study_name=study_name, storage=storage_name, direction="maximize")
-            
-            n_trials = args.n_trials
-            logger.info(f"Running Optuna optimization with {n_trials} trials or until threshold ({GOOD_ENOUGH_THRESHOLD}) is reached")
-            study.optimize(lambda trial: objective(trial, args, env), n_trials=n_trials)
-            
-            best_trial = study.best_trial
-            logger.info(f"Best trial: {best_trial.number}")
-            logger.info(f"Best parameters: {best_trial.params}")
-            logger.info(f"Best value (total hits): {best_trial.value}")
-            
-            # Save the best model from Optuna trials
-            best_model_file = os.path.join(model_path, "kungfu_ppo_best")
-            global_model_file = best_model_file
-            best_model = PPO.load(f"{model_path}/kungfu_ppo_trial_{best_trial.number}", env=env)
-            save_model_with_logging(best_model, best_model_file, logger)
-            
-            # Save best parameters to database
-            save_best_params_to_db(best_params_db, best_trial.params, best_trial.value)
-            
-            if best_trial.value >= GOOD_ENOUGH_THRESHOLD:
-                logger.info(f"Best trial ({best_trial.value} hits) meets threshold. Proceeding to full training.")
-                train_with_best_params(args, env, best_trial.params)
-            else:
-                logger.info(f"No trial met the threshold ({GOOD_ENOUGH_THRESHOLD} hits). Saved parameters for future improvement.")
+                logger.info("Starting or resuming Optuna optimization.")
+                study_name = "kungfu_ppo_study"
+                storage_name = f"sqlite:///{os.path.join(args.log_dir, 'optuna_study.db')}"
+                
+                if args.resume and os.path.exists(os.path.join(args.log_dir, 'optuna_study.db')):
+                    logger.info(f"Resuming existing Optuna study from {storage_name}")
+                    study = optuna.load_study(study_name=study_name, storage=storage_name)
+                else:
+                    logger.info("Creating new Optuna study")
+                    study = optuna.create_study(study_name=study_name, storage=storage_name, direction="maximize")
+                
+                n_trials = args.n_trials
+                logger.info(f"Running Optuna optimization with {n_trials} trials or until threshold ({GOOD_ENOUGH_THRESHOLD}) is reached")
+                study.optimize(lambda trial: objective(trial, args, env), n_trials=n_trials)
+                
+                best_trial = study.best_trial
+                logger.info(f"Best trial: {best_trial.number}")
+                logger.info(f"Best parameters: {best_trial.params}")
+                logger.info(f"Best value (total hits): {best_trial.value}")
+                
+                # Save the best model from Optuna trials
+                best_model_file = os.path.join(model_path, "kungfu_ppo_best")
+                global_model_file = best_model_file
+                best_model = PPO.load(f"{model_path}/kungfu_ppo_trial_{best_trial.number}", env=env)
+                save_model_with_logging(best_model, best_model_file, logger)
+                
+                # Save best parameters to database
+                save_best_params_to_db(best_params_db, best_trial.params, best_trial.value)
+                
+                if best_trial.value >= GOOD_ENOUGH_THRESHOLD:
+                    logger.info(f"Best trial ({best_trial.value} hits) meets threshold. Proceeding to full training.")
+                    train_with_best_params(args, env, best_trial.params)
+                else:
+                    logger.info(f"No trial met the threshold ({GOOD_ENOUGH_THRESHOLD} hits). Saved parameters for future improvement.")
     
     except Exception as e:
         logger.error(f"Training session failed: {e}")
@@ -1063,9 +1087,10 @@ if __name__ == "__main__":
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar")
     parser.add_argument("--n_trials", type=int, default=3, help="Number of Optuna trials")
     parser.add_argument("--resume", action="store_true", help="Resume training from saved study and models")
-    
+    parser.add_argument("--no-optuna", action="store_true", help="Disable Optuna optimization and use default or loaded parameters")
+
     args = parser.parse_args()
-    
+
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
     train(args)
