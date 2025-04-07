@@ -21,7 +21,6 @@ import optuna
 import sqlite3
 from multiprocessing import set_start_method
 
-# Ensure proper multiprocessing start method for Windows
 if sys.platform == "win32":
     set_start_method("spawn", force=True)
 
@@ -30,10 +29,11 @@ global_model = None
 global_model_file = None
 logger = None
 
-# Thresholds for stopping Optuna and switching to full training
-GOOD_ENOUGH_THRESHOLD = 100  # Stop Optuna if total_hits exceeds this in a trial
-MAX_TIMESTEPS = 1000000  # Maximum timesteps for final training after good params are found
+# Thresholds
+GOOD_ENOUGH_THRESHOLD = 100
+MAX_TIMESTEPS = 1000000
 
+# [SimpleCNN class remains unchanged from the last corrected version]
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
         super(SimpleCNN, self).__init__(observation_space, features_dim)
@@ -95,7 +95,7 @@ class SimpleCNN(BaseFeaturesExtractor):
             enemy_vector = torch.from_numpy(enemy_vector).float()
         if isinstance(enemy_types, np.ndarray):
             enemy_types = torch.from_numpy(enemy_types).float()
-        if isinstance(enemy_history, np.ndarray):  # Fixed typo here
+        if isinstance(enemy_history, np.ndarray):
             enemy_history = torch.from_numpy(enemy_history).float()
         if isinstance(enemy_timers, np.ndarray):
             enemy_timers = torch.from_numpy(enemy_timers).float()
@@ -128,7 +128,8 @@ class SimpleCNN(BaseFeaturesExtractor):
             enemy_patterns, combat_status, projectile_vectors, enemy_proximity, boss_info
         ], dim=1)
         return self.linear(combined)
-    
+
+# [KungFuWrapper class remains unchanged]
 class KungFuWrapper(Wrapper):
     def __init__(self, env, patterns_db="enemy_patterns.db"):
         super().__init__(env)
@@ -580,12 +581,12 @@ class KungFuWrapper(Wrapper):
         }
 
     def close(self):
-        """Ensure proper cleanup of the environment."""
         try:
             self.env.close()
         except Exception as e:
             logger.error(f"Error closing environment: {e}")
 
+# [CombatTrainingCallback remains unchanged]
 class CombatTrainingCallback(BaseCallback):
     def __init__(self, progress_bar=False, logger=None, total_timesteps=10000):
         super().__init__()
@@ -785,6 +786,96 @@ def make_vec_env(num_envs, render=False, patterns_db="enemy_patterns.db"):
         logger.error(f"Failed to create vectorized environment: {e}")
         raise
 
+def save_best_params_to_db(db_path, best_params, best_value):
+    """Save the best parameters and their value to the database."""
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS best_params (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            learning_rate REAL,
+            n_steps INTEGER,
+            batch_size INTEGER,
+            n_epochs INTEGER,
+            gamma REAL,
+            clip_range REAL,
+            ent_coef REAL,
+            vf_coef REAL,
+            max_grad_norm REAL,
+            best_value REAL,
+            timestamp TEXT
+        )
+    ''')
+    c.execute('''
+        INSERT INTO best_params (
+            learning_rate, n_steps, batch_size, n_epochs, gamma,
+            clip_range, ent_coef, vf_coef, max_grad_norm, best_value, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        best_params['learning_rate'], best_params['n_steps'], best_params['batch_size'],
+        best_params['n_epochs'], best_params['gamma'], best_params['clip_range'],
+        best_params['ent_coef'], best_params['vf_coef'], best_params['max_grad_norm'],
+        best_value, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    conn.commit()
+    conn.close()
+    logger.info(f"Saved best parameters to {db_path} with value {best_value}")
+
+def load_best_params_from_db(db_path):
+    """Load the best parameters from the database, if they exist and meet the threshold."""
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    # Create the table if it doesn't exist
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS best_params (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            learning_rate REAL,
+            n_steps INTEGER,
+            batch_size INTEGER,
+            n_epochs INTEGER,
+            gamma REAL,
+            clip_range REAL,
+            ent_coef REAL,
+            vf_coef REAL,
+            max_grad_norm REAL,
+            best_value REAL,
+            timestamp TEXT
+        )
+    ''')
+    
+    # Query the best parameters
+    c.execute('''
+        SELECT learning_rate, n_steps, batch_size, n_epochs, gamma,
+               clip_range, ent_coef, vf_coef, max_grad_norm, best_value
+        FROM best_params
+        ORDER BY best_value DESC
+        LIMIT 1
+    ''')
+    row = c.fetchone()
+    conn.close()
+    
+    if row and row[9] >= GOOD_ENOUGH_THRESHOLD:  # row[9] is best_value
+        params = {
+            'learning_rate': row[0],
+            'n_steps': row[1],
+            'batch_size': row[2],
+            'n_epochs': row[3],
+            'gamma': row[4],
+            'clip_range': row[5],
+            'ent_coef': row[6],
+            'vf_coef': row[7],
+            'max_grad_norm': row[8]
+        }
+        logger.info(f"Loaded best parameters from {db_path} with value {row[9]}")
+        return params, row[9]
+    else:
+        if row is None:
+            logger.info(f"No parameters found in {db_path}. Proceeding with Optuna search.")
+        else:
+            logger.info(f"Best parameters found in {db_path} with value {row[9]}, below threshold {GOOD_ENOUGH_THRESHOLD}. Proceeding with Optuna search.")
+        return None, None
+    
 def objective(trial, args, env):
     global global_model, global_model_file, logger
     
@@ -893,49 +984,63 @@ def train_with_best_params(args, env, best_params):
 def train(args):
     global logger
     logger = setup_logging(args.log_dir)
-    logger.info("Starting training session with Optuna optimization")
+    logger.info("Starting training session")
     logger.info(f"Command line arguments: {vars(args)}")
     
     signal.signal(signal.SIGINT, signal_handler)
     atexit.register(save_model_on_exit)
     
     patterns_db = os.path.join(args.log_dir, "enemy_patterns.db")
+    best_params_db = os.path.join(args.log_dir, "best_params.db")
     env = None
+    
     try:
         env = make_vec_env(args.num_envs, render=args.render, patterns_db=patterns_db)
         
         model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
         os.makedirs(model_path, exist_ok=True)
         
-        study_name = "kungfu_ppo_study"
-        storage_name = f"sqlite:///{os.path.join(args.log_dir, 'optuna_study.db')}"
+        # Check for existing best parameters
+        best_params, best_value = load_best_params_from_db(best_params_db)
         
-        if args.resume and os.path.exists(os.path.join(args.log_dir, 'optuna_study.db')):
-            logger.info(f"Resuming existing Optuna study from {storage_name}")
-            study = optuna.load_study(study_name=study_name, storage=storage_name)
+        if best_params is not None and best_value >= GOOD_ENOUGH_THRESHOLD:
+            logger.info(f"Found good enough parameters (value: {best_value}) in database. Skipping Optuna search.")
+            train_with_best_params(args, env, best_params)
         else:
-            logger.info("Creating new Optuna study")
-            study = optuna.create_study(study_name=study_name, storage=storage_name, direction="maximize")
-        
-        n_trials = args.n_trials
-        logger.info(f"Starting Optuna optimization with {n_trials} trials or until threshold ({GOOD_ENOUGH_THRESHOLD}) is reached")
-        study.optimize(lambda trial: objective(trial, args, env), n_trials=n_trials)
-        
-        best_trial = study.best_trial
-        logger.info(f"Best trial: {best_trial.number}")
-        logger.info(f"Best parameters: {best_trial.params}")
-        logger.info(f"Best value (total hits): {best_trial.value}")
-        
-        best_model_file = os.path.join(model_path, "kungfu_ppo_best")
-        global_model_file = best_model_file
-        best_model = PPO.load(f"{model_path}/kungfu_ppo_trial_{best_trial.number}", env=env)
-        save_model_with_logging(best_model, best_model_file, logger)
-        
-        if best_trial.value >= GOOD_ENOUGH_THRESHOLD:
-            logger.info(f"Best trial ({best_trial.value} hits) meets threshold. Proceeding to full training.")
-            train_with_best_params(args, env, best_trial.params)
-        else:
-            logger.info(f"No trial met the threshold ({GOOD_ENOUGH_THRESHOLD} hits). Consider increasing n_trials or adjusting the threshold.")
+            logger.info("Starting or resuming Optuna optimization.")
+            study_name = "kungfu_ppo_study"
+            storage_name = f"sqlite:///{os.path.join(args.log_dir, 'optuna_study.db')}"
+            
+            if args.resume and os.path.exists(os.path.join(args.log_dir, 'optuna_study.db')):
+                logger.info(f"Resuming existing Optuna study from {storage_name}")
+                study = optuna.load_study(study_name=study_name, storage=storage_name)
+            else:
+                logger.info("Creating new Optuna study")
+                study = optuna.create_study(study_name=study_name, storage=storage_name, direction="maximize")
+            
+            n_trials = args.n_trials
+            logger.info(f"Running Optuna optimization with {n_trials} trials or until threshold ({GOOD_ENOUGH_THRESHOLD}) is reached")
+            study.optimize(lambda trial: objective(trial, args, env), n_trials=n_trials)
+            
+            best_trial = study.best_trial
+            logger.info(f"Best trial: {best_trial.number}")
+            logger.info(f"Best parameters: {best_trial.params}")
+            logger.info(f"Best value (total hits): {best_trial.value}")
+            
+            # Save the best model from Optuna trials
+            best_model_file = os.path.join(model_path, "kungfu_ppo_best")
+            global_model_file = best_model_file
+            best_model = PPO.load(f"{model_path}/kungfu_ppo_trial_{best_trial.number}", env=env)
+            save_model_with_logging(best_model, best_model_file, logger)
+            
+            # Save best parameters to database
+            save_best_params_to_db(best_params_db, best_trial.params, best_trial.value)
+            
+            if best_trial.value >= GOOD_ENOUGH_THRESHOLD:
+                logger.info(f"Best trial ({best_trial.value} hits) meets threshold. Proceeding to full training.")
+                train_with_best_params(args, env, best_trial.params)
+            else:
+                logger.info(f"No trial met the threshold ({GOOD_ENOUGH_THRESHOLD} hits). Saved parameters for future improvement.")
     
     except Exception as e:
         logger.error(f"Training session failed: {e}")
@@ -946,7 +1051,7 @@ def train(args):
             env.close()
     
     logger.info("Training session ended")
-
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Kung Fu with PPO and Optuna.")
     parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save model")
