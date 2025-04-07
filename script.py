@@ -19,20 +19,28 @@ from datetime import datetime
 from tqdm import tqdm
 import optuna
 import sqlite3
+from multiprocessing import set_start_method
+
+# Ensure proper multiprocessing start method for Windows
+if sys.platform == "win32":
+    set_start_method("spawn", force=True)
 
 # Global variables
 global_model = None
 global_model_file = None
 logger = None
 
+# Thresholds for stopping Optuna and switching to full training
+GOOD_ENOUGH_THRESHOLD = 100  # Stop Optuna if total_hits exceeds this in a trial
+MAX_TIMESTEPS = 1000000  # Maximum timesteps for final training after good params are found
+
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
         super(SimpleCNN, self).__init__(observation_space, features_dim)
         assert isinstance(observation_space, spaces.Dict), "Observation space must be a Dict"
         
-        # Expect 36 channels: 12 frames * 3 RGB channels
         self.cnn = nn.Sequential(
-            nn.Conv2d(36, 64, kernel_size=8, stride=4),  # 36 channels for 12 frames * 3 RGB
+            nn.Conv2d(36, 64, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(64, 128, kernel_size=4, stride=2),
             nn.ReLU(),
@@ -81,14 +89,13 @@ class SimpleCNN(BaseFeaturesExtractor):
         enemy_proximity = observations["enemy_proximity"]
         boss_info = observations["boss_info"]
         
-        # Convert numpy arrays to torch tensors
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport).float()
         if isinstance(enemy_vector, np.ndarray):
             enemy_vector = torch.from_numpy(enemy_vector).float()
         if isinstance(enemy_types, np.ndarray):
             enemy_types = torch.from_numpy(enemy_types).float()
-        if isinstance(enemy_history, np.ndarray):
+        if isinstance(enemy_history, np.ndarray):  # Fixed typo here
             enemy_history = torch.from_numpy(enemy_history).float()
         if isinstance(enemy_timers, np.ndarray):
             enemy_timers = torch.from_numpy(enemy_timers).float()
@@ -103,15 +110,13 @@ class SimpleCNN(BaseFeaturesExtractor):
         if isinstance(boss_info, np.ndarray):
             boss_info = torch.from_numpy(boss_info).float()
             
-        # Adjust viewport dimensions: (batch, height, width, channels) -> (batch, channels, height, width)
         if len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0)
         if len(viewport.shape) == 4 and viewport.shape[-1] == 3:
-            viewport = viewport.permute(0, 3, 1, 2)  # (batch, height, width, 3) -> (batch, 3, height, width)
+            viewport = viewport.permute(0, 3, 1, 2)
         
         cnn_output = self.cnn(viewport)
         
-        # Ensure other inputs have the correct shape
         for tensor in [enemy_vector, enemy_types, enemy_history, enemy_timers,
                        enemy_patterns, combat_status, projectile_vectors,
                        enemy_proximity, boss_info]:
@@ -123,22 +128,22 @@ class SimpleCNN(BaseFeaturesExtractor):
             enemy_patterns, combat_status, projectile_vectors, enemy_proximity, boss_info
         ], dim=1)
         return self.linear(combined)
-
+    
 class KungFuWrapper(Wrapper):
     def __init__(self, env, patterns_db="enemy_patterns.db"):
         super().__init__(env)
         self.viewport_size = (84, 84)
         
         self.actions = [
-            [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (index 0)
-            [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (index 1)
-            [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick (index 2)
-            [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch (index 3)
-            [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch (index 4)
-            [0,0,0,0,1,0,0,0,0,0,0,0],  # Jump (index 5) - Fixed: Press UP
-            [0,0,0,0,0,1,0,0,0,0,0,0],  # Crouch (index 6) - Fixed: Press DOWN
-            [0,0,0,0,1,0,1,0,0,0,0,0],  # Jump+Punch (index 7) - Updated to use UP
-            [0,0,0,0,0,1,1,0,0,0,0,0]   # Crouch+Punch (index 8) - Updated to use DOWN
+            [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op
+            [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch
+            [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick
+            [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch
+            [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch
+            [0,0,0,0,1,0,0,0,0,0,0,0],  # Jump
+            [0,0,0,0,0,1,0,0,0,0,0,0],  # Crouch
+            [0,0,0,0,1,0,1,0,0,0,0,0],  # Jump+Punch
+            [0,0,0,0,0,1,1,0,0,0,0,0]   # Crouch+Punch
         ]
         self.action_names = [
             "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
@@ -146,22 +151,15 @@ class KungFuWrapper(Wrapper):
         ]
         
         self.action_space = spaces.Discrete(len(self.actions))
-        self.enemy_types_map = {
-            0: "None",
-            1: "Knife Thrower",
-            2: "Midget",
-            3: "Snake",
-            4: "Dragon",
-            5: "Boss"
-        }
+        self.enemy_types_map = {0: "None", 1: "Knife Thrower", 2: "Midget", 3: "Snake", 4: "Dragon", 5: "Boss"}
         self.max_enemy_types = len(self.enemy_types_map)
         self.max_enemies = 4
         self.history_length = 5
         self.max_projectiles = 2
-        self.patterns_length = 2  # [avg_attack_interval, avg_dx] per enemy type
+        self.patterns_length = 2
         
         self.observation_space = spaces.Dict({
-            "viewport": spaces.Box(0, 255, (*self.viewport_size, 3), np.uint8),  # RGB channels
+            "viewport": spaces.Box(0, 255, (*self.viewport_size, 3), np.uint8),
             "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
             "enemy_types": spaces.Box(0, self.max_enemy_types - 1, (self.max_enemies,), np.float32),
             "enemy_history": spaces.Box(-255, 255, (self.max_enemies * self.history_length * 2,), np.float32),
@@ -190,7 +188,6 @@ class KungFuWrapper(Wrapper):
         self.boss_info = np.zeros(3, dtype=np.float32)
         self.enemy_patterns = np.zeros((self.max_enemies, self.patterns_length), dtype=np.float32)
         
-        # Initialize SQLite database for enemy patterns
         self.patterns_db = patterns_db
         self._init_db()
         self.stored_patterns = self._load_patterns()
@@ -277,7 +274,6 @@ class KungFuWrapper(Wrapper):
         projectile_hit = self._check_projectile_hit(hp_loss)
         projectile_avoided = len(projectile_info) > 0 and not projectile_hit
         
-        # Base reward structure
         raw_reward = (
             enemy_hit * 5.0 +
             -hp_loss * 1.0 +
@@ -286,19 +282,17 @@ class KungFuWrapper(Wrapper):
             (-5.0 if projectile_hit else 0.0)
         )
         
-        # Shaping reward: Encourage defensive actions when a projectile is detected
         if len(projectile_info) > 0:
-            if action in [5, 6, 7, 8]:  # Jump, Crouch, Jump+Punch, Crouch+Punch
+            if action in [5, 6, 7, 8]:
                 raw_reward += 0.5
-            # Proximity-based shaping: Reward for being in a safe position
             for i in range(0, len(projectile_info), 4):
-                distance = projectile_info[i]  # Distance to projectile
-                proj_y = projectile_info[i + 1]  # Y position of projectile
-                if abs(distance) < 50 and 40 < proj_y < 60:  # Knife is close and at player height
-                    if action in [5, 7]:  # Jump or Jump+Punch
-                        raw_reward += 1.0  # Reward for jumping over a close knife
-                    elif action in [6, 8]:  # Crouch or Crouch+Punch
-                        raw_reward += 1.0  # Reward for crouching under a close knife
+                distance = projectile_info[i]
+                proj_y = projectile_info[i + 1]
+                if abs(distance) < 50 and 40 < proj_y < 60:
+                    if action in [5, 7]:
+                        raw_reward += 1.0
+                    elif action in [6, 8]:
+                        raw_reward += 1.0
         
         if hp_loss > 5 and action == 0:
             raw_reward -= 0.5
@@ -314,7 +308,6 @@ class KungFuWrapper(Wrapper):
         if self.boss_info[2] > 0 and enemy_hit > 0:
             raw_reward += 2.0
         
-        # Diversity penalty
         action_percentages = self.action_counts / (self.total_steps + 1e-6)
         dominant_action_percentage = np.max(action_percentages)
         diversity_penalty = 0.0
@@ -376,18 +369,18 @@ class KungFuWrapper(Wrapper):
             if enemy_x != 0:
                 if stage == 1:
                     if enemy_action in [0x01, 0x02]:
-                        new_types[i] = 1  # Knife Thrower
+                        new_types[i] = 1
                     else:
-                        new_types[i] = 2  # Midget
+                        new_types[i] = 2
                 elif stage == 2:
-                    new_types[i] = 3  # Snake
+                    new_types[i] = 3
                 elif stage == 3:
                     if enemy_action in [0x03, 0x04]:
-                        new_types[i] = 4  # Dragon
+                        new_types[i] = 4
                     else:
-                        new_types[i] = 2  # Midget
+                        new_types[i] = 2
                 elif stage in [4, 5]:
-                    new_types[i] = 5 if stage == 5 else 0  # Boss or None
+                    new_types[i] = 5 if stage == 5 else 0
                 new_positions[i] = [enemy_x, 50]
                 new_timers[i] = min(enemy_timer / 60.0, 1.0)
                 
@@ -478,33 +471,24 @@ class KungFuWrapper(Wrapper):
             self.boss_info = np.zeros(3, dtype=np.float32)
 
     def _detect_projectiles(self, obs):
-        # Keep the frame in RGB and resize it
         frame = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
         
         if self.prev_frame is not None:
-            # Step 1: Frame differencing in RGB to detect motion
             frame_diff = cv2.absdiff(frame, self.prev_frame)
-            # Sum the differences across RGB channels
             diff_sum = np.sum(frame_diff, axis=2).astype(np.uint8)
             _, motion_mask = cv2.threshold(diff_sum, 20, 255, cv2.THRESH_BINARY)
             motion_mask = cv2.dilate(motion_mask, None, iterations=4)
             
-            # Step 2: Color-based detection in RGB
-            # Define color ranges for projectiles (e.g., white knives, green dragon fire)
-            # White (knives): High R, G, B values
             lower_white = np.array([180, 180, 180])
             upper_white = np.array([255, 255, 255])
-            # Green (dragon fire): High G, lower R and B
             lower_green = np.array([0, 100, 0])
             upper_green = np.array([100, 255, 100])
             
-            # Create color masks
             white_mask = cv2.inRange(frame, lower_white, upper_white)
             green_mask = cv2.inRange(frame, lower_green, upper_green)
             color_mask = cv2.bitwise_or(white_mask, green_mask)
             color_mask = cv2.dilate(color_mask, None, iterations=2)
             
-            # Step 3: Combine motion and color masks
             combined_mask = cv2.bitwise_and(motion_mask, color_mask)
             contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
@@ -512,18 +496,15 @@ class KungFuWrapper(Wrapper):
             current_projectile_positions = []
             hero_x = int(self.env.get_ram()[0x0094])
             
-            # Step 4: Filter contours based on size, shape, and motion consistency
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if 5 < area < 50:  # Small area for projectiles
+                if 5 < area < 50:
                     x, y, w, h = cv2.boundingRect(contour)
                     proj_x = x + w // 2
                     proj_y = y + h // 2
                     
-                    # Shape filter: Projectiles are often elongated
                     aspect_ratio = w / h if h > 0 else 1
                     if 0.5 < aspect_ratio < 3.0:
-                        # Motion consistency check
                         dx, dy = 0, 0
                         for prev_pos in self.last_projectile_positions:
                             prev_x, prev_y = prev_pos
@@ -533,23 +514,16 @@ class KungFuWrapper(Wrapper):
                                 speed = np.sqrt(dx**2 + dy**2)
                                 if speed < 5 or speed > 25:
                                     dx, dy = 0, 0
-                                if abs(dx) < 2:  # Require horizontal motion
+                                if abs(dx) < 2:
                                     dx, dy = 0, 0
                                 break
                         
                         if dx != 0 or dy != 0:
-                            # Log the average RGB values of the detected object
-                            roi = frame[y:y+h, x:x+w]
-                            avg_rgb = np.mean(roi, axis=(0, 1)) if roi.size > 0 else np.zeros(3)
-                            is_white = np.all(avg_rgb > 180)
-                            is_green = (avg_rgb[1] > 100) and (avg_rgb[0] < 100) and (avg_rgb[2] < 100)
-                            
                             game_width = 256
                             proj_x_game = (proj_x / self.viewport_size[0]) * game_width
                             distance = proj_x_game - hero_x
                             projectile_info.extend([distance, proj_y, dx, dy])
                             current_projectile_positions.append((proj_x, proj_y))
-                            logger.debug(f"Detected projectile: pos=({proj_x}, {proj_y}), area={area}, aspect_ratio={aspect_ratio:.2f}, speed={speed:.2f}, avg_rgb={avg_rgb}, is_white={is_white}, is_green={is_green}")
             
             projectile_info = projectile_info[:self.max_projectiles * 4]
             while len(projectile_info) < self.max_projectiles * 4:
@@ -557,7 +531,6 @@ class KungFuWrapper(Wrapper):
             
             self.last_projectile_positions = current_projectile_positions[:self.max_projectiles]
             self.prev_frame = frame
-            logger.debug(f"Total detected projectiles: {len(current_projectile_positions)}")
             return projectile_info
         
         self.prev_frame = frame
@@ -569,7 +542,7 @@ class KungFuWrapper(Wrapper):
         return False
 
     def _get_obs(self, obs):
-        viewport = cv2.resize(obs, self.viewport_size)  # Keep in RGB
+        viewport = cv2.resize(obs, self.viewport_size)
         ram = self.env.get_ram()
         
         hero_x = int(ram[0x0094])
@@ -605,6 +578,13 @@ class KungFuWrapper(Wrapper):
             "enemy_proximity": enemy_proximity,
             "boss_info": boss_info
         }
+
+    def close(self):
+        """Ensure proper cleanup of the environment."""
+        try:
+            self.env.close()
+        except Exception as e:
+            logger.error(f"Error closing environment: {e}")
 
 class CombatTrainingCallback(BaseCallback):
     def __init__(self, progress_bar=False, logger=None, total_timesteps=10000):
@@ -783,18 +763,27 @@ def save_model_on_exit():
     sys.exit(0)
 
 def make_env(render=False, patterns_db="enemy_patterns.db"):
-    env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
-    if render:
-        env.render_mode = 'human'
-    return KungFuWrapper(env, patterns_db=patterns_db)
+    try:
+        env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
+        if render:
+            env.render_mode = 'human'
+        return KungFuWrapper(env, patterns_db=patterns_db)
+    except Exception as e:
+        logger.error(f"Failed to create environment: {e}")
+        raise
 
 def make_vec_env(num_envs, render=False, patterns_db="enemy_patterns.db"):
     logger.info(f"Creating vectorized environment with {num_envs} subprocesses")
-    if num_envs > 1:
-        env = SubprocVecEnv([lambda: make_env(render, patterns_db) for _ in range(num_envs)])
-    else:
-        env = DummyVecEnv([lambda: make_env(render, patterns_db)])
-    return VecFrameStack(env, n_stack=12)  # 12 frames
+    try:
+        if num_envs > 1:
+            env_fns = [lambda: make_env(render, patterns_db) for _ in range(num_envs)]
+            env = SubprocVecEnv(env_fns, start_method="spawn")
+        else:
+            env = DummyVecEnv([lambda: make_env(render, patterns_db)])
+        return VecFrameStack(env, n_stack=12)
+    except Exception as e:
+        logger.error(f"Failed to create vectorized environment: {e}")
+        raise
 
 def objective(trial, args, env):
     global global_model, global_model_file, logger
@@ -836,19 +825,70 @@ def objective(trial, args, env):
     
     callback = CombatTrainingCallback(progress_bar=args.progress_bar, logger=logger, total_timesteps=args.timesteps)
     
-    model.learn(
-        total_timesteps=args.timesteps,
-        callback=callback,
-        tb_log_name=f"PPO_KungFu_trial_{trial.number}",
-        reset_num_timesteps=not args.resume
-    )
+    try:
+        model.learn(
+            total_timesteps=args.timesteps,
+            callback=callback,
+            tb_log_name=f"PPO_KungFu_trial_{trial.number}",
+            reset_num_timesteps=not args.resume
+        )
+    except Exception as e:
+        logger.error(f"Training failed for trial {trial.number}: {e}")
+        raise
     
     total_hits = callback.total_hits
     logger.info(f"Trial {trial.number} completed with total_hits: {total_hits}")
     
     save_model_with_logging(model, global_model_file, logger)
     
+    if total_hits >= GOOD_ENOUGH_THRESHOLD:
+        logger.info(f"Trial {trial.number} exceeded threshold ({GOOD_ENOUGH_THRESHOLD} hits). Stopping Optuna optimization.")
+        trial.study.stop()
+        return total_hits
+    
     return total_hits
+
+def train_with_best_params(args, env, best_params):
+    global global_model, global_model_file, logger
+    
+    logger.info(f"Starting full training with best parameters: {best_params}")
+    
+    model_file = os.path.join(args.model_path, "kungfu_ppo_best")
+    if args.resume and os.path.exists(model_file + ".zip"):
+        logger.info(f"Resuming best model from {model_file}.zip")
+        model = PPO.load(model_file, env=env, device="cuda" if args.cuda else "cpu")
+    else:
+        logger.info("Creating new model with best parameters")
+        model = PPO(
+            policy="MultiInputPolicy",
+            env=env,
+            policy_kwargs={
+                "features_extractor_class": SimpleCNN,
+                "net_arch": [dict(pi=[128, 128], vf=[128, 128])]
+            },
+            **best_params,
+            tensorboard_log=args.log_dir,
+            device="cuda" if args.cuda else "cpu"
+        )
+    
+    global_model = model
+    global_model_file = model_file
+    
+    callback = CombatTrainingCallback(progress_bar=args.progress_bar, logger=logger, total_timesteps=MAX_TIMESTEPS)
+    
+    try:
+        model.learn(
+            total_timesteps=MAX_TIMESTEPS,
+            callback=callback,
+            tb_log_name="PPO_KungFu_best",
+            reset_num_timesteps=not args.resume
+        )
+    except Exception as e:
+        logger.error(f"Full training failed: {e}")
+        raise
+    
+    save_model_with_logging(model, global_model_file, logger)
+    logger.info(f"Full training completed with total hits: {callback.total_hits}")
 
 def train(args):
     global logger
@@ -860,35 +900,51 @@ def train(args):
     atexit.register(save_model_on_exit)
     
     patterns_db = os.path.join(args.log_dir, "enemy_patterns.db")
-    env = make_vec_env(args.num_envs, render=args.render, patterns_db=patterns_db)
+    env = None
+    try:
+        env = make_vec_env(args.num_envs, render=args.render, patterns_db=patterns_db)
+        
+        model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
+        os.makedirs(model_path, exist_ok=True)
+        
+        study_name = "kungfu_ppo_study"
+        storage_name = f"sqlite:///{os.path.join(args.log_dir, 'optuna_study.db')}"
+        
+        if args.resume and os.path.exists(os.path.join(args.log_dir, 'optuna_study.db')):
+            logger.info(f"Resuming existing Optuna study from {storage_name}")
+            study = optuna.load_study(study_name=study_name, storage=storage_name)
+        else:
+            logger.info("Creating new Optuna study")
+            study = optuna.create_study(study_name=study_name, storage=storage_name, direction="maximize")
+        
+        n_trials = args.n_trials
+        logger.info(f"Starting Optuna optimization with {n_trials} trials or until threshold ({GOOD_ENOUGH_THRESHOLD}) is reached")
+        study.optimize(lambda trial: objective(trial, args, env), n_trials=n_trials)
+        
+        best_trial = study.best_trial
+        logger.info(f"Best trial: {best_trial.number}")
+        logger.info(f"Best parameters: {best_trial.params}")
+        logger.info(f"Best value (total hits): {best_trial.value}")
+        
+        best_model_file = os.path.join(model_path, "kungfu_ppo_best")
+        global_model_file = best_model_file
+        best_model = PPO.load(f"{model_path}/kungfu_ppo_trial_{best_trial.number}", env=env)
+        save_model_with_logging(best_model, best_model_file, logger)
+        
+        if best_trial.value >= GOOD_ENOUGH_THRESHOLD:
+            logger.info(f"Best trial ({best_trial.value} hits) meets threshold. Proceeding to full training.")
+            train_with_best_params(args, env, best_trial.params)
+        else:
+            logger.info(f"No trial met the threshold ({GOOD_ENOUGH_THRESHOLD} hits). Consider increasing n_trials or adjusting the threshold.")
     
-    model_path = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(args.model_path)
-    os.makedirs(model_path, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Training session failed: {e}")
+        raise
+    finally:
+        if env is not None:
+            logger.info("Closing environment")
+            env.close()
     
-    study_name = "kungfu_ppo_study"
-    storage_name = f"sqlite:///{os.path.join(args.log_dir, 'optuna_study.db')}"
-    
-    if args.resume and os.path.exists(os.path.join(args.log_dir, 'optuna_study.db')):
-        logger.info(f"Resuming existing Optuna study from {storage_name}")
-        study = optuna.load_study(study_name=study_name, storage=storage_name)
-    else:
-        logger.info("Creating new Optuna study")
-        study = optuna.create_study(study_name=study_name, storage=storage_name, direction="maximize")
-    
-    n_trials = args.n_trials
-    logger.info(f"Starting Optuna optimization with {n_trials} trials")
-    study.optimize(lambda trial: objective(trial, args, env), n_trials=n_trials)
-    
-    logger.info(f"Best trial: {study.best_trial.number}")
-    logger.info(f"Best parameters: {study.best_params}")
-    logger.info(f"Best value (total hits): {study.best_value}")
-    
-    best_model_file = os.path.join(model_path, "kungfu_ppo_best")
-    global_model_file = best_model_file
-    best_model = PPO.load(f"{model_path}/kungfu_ppo_trial_{study.best_trial.number}", env=env)
-    save_model_with_logging(best_model, best_model_file, logger)
-    
-    env.close()
     logger.info("Training session ended")
 
 if __name__ == "__main__":
