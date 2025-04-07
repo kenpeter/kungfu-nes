@@ -273,7 +273,6 @@ class KungFuWrapper(Wrapper):
         projectile_hit = self._check_projectile_hit(hp_loss)
         projectile_avoided = len(projectile_info) > 0 and not projectile_hit
         
-        # Adjusted reward structure
         raw_reward = (
             enemy_hit * 10.0 +
             -hp_loss * 2.0 +
@@ -874,8 +873,8 @@ def objective(trial, args, env):
         'n_epochs': trial.suggest_int('n_epochs', 3, 20),
         'gamma': trial.suggest_uniform('gamma', 0.9, 0.999),
         'clip_range': trial.suggest_uniform('clip_range', 0.1, 0.4),
-        'ent_coef': trial.suggest_loguniform('ent_coef', 1e-3, 0.1),
-        'vf_coef': trial.suggest_uniform('vf_coef', 0.1, 1.0),
+        'ent_coef': trial.suggest_loguniform('ent_coef', 1e-2, 0.5),
+        'vf_coef': trial.suggest_uniform('vf_coef', 0.5, 1.0),
         'max_grad_norm': trial.suggest_uniform('max_grad_norm', 0.1, 1.0)
     }
     
@@ -892,7 +891,7 @@ def objective(trial, args, env):
             env=env,
             policy_kwargs={
                 "features_extractor_class": SimpleCNN,
-                "net_arch": [dict(pi=[256, 256, 128], vf=[256, 256, 128])]
+                "net_arch": [dict(pi=[256, 256, 128], vf=[512, 512, 256])]
             },
             **combat_params,
             tensorboard_log=args.log_dir,
@@ -943,7 +942,7 @@ def train_with_best_params(args, env, best_params):
             env=env,
             policy_kwargs={
                 "features_extractor_class": SimpleCNN,
-                "net_arch": [dict(pi=[256, 256, 128], vf=[256, 256, 128])]
+                "net_arch": [dict(pi=[256, 256, 128], vf=[512, 512, 256])]
             },
             **best_params,
             tensorboard_log=args.log_dir,
@@ -994,9 +993,9 @@ def train(args):
             'batch_size': 64,
             'n_epochs': 10,
             'gamma': 0.99,
-            'clip_range': 0.2,
-            'ent_coef': 0.01,
-            'vf_coef': 0.5,
+            'clip_range': 0.3,
+            'ent_coef': 0.1,
+            'vf_coef': 0.7,
             'max_grad_norm': 0.5
         }
         
@@ -1036,10 +1035,20 @@ def train(args):
                 logger.info(f"Best parameters: {best_trial.params}")
                 logger.info(f"Best value (total hits): {best_trial.value}")
                 
-                best_model_file = os.path.join(model_path, "kungfu_ppo_best")
-                global_model_file = best_model_file
-                best_model = PPO.load(f"{model_path}/kungfu_ppo_trial_{best_trial.number}", env=env)
-                save_model_with_logging(best_model, best_model_file, logger)
+                # Correct the path for loading the best model
+                best_model_file = os.path.join(model_path, f"kungfu_ppo_trial_{best_trial.number}")
+                best_model_file = os.path.normpath(best_model_file)  # Normalize the path
+                global_model_file = os.path.join(model_path, "kungfu_ppo_best")
+                global_model_file = os.path.normpath(global_model_file)
+                
+                # Check if the file exists before loading
+                if not os.path.exists(best_model_file + ".zip"):
+                    logger.error(f"Best model file {best_model_file}.zip does not exist. Cannot proceed with loading.")
+                    raise FileNotFoundError(f"Best model file {best_model_file}.zip not found.")
+                
+                logger.info(f"Loading best model from {best_model_file}")
+                best_model = PPO.load(best_model_file, env=env, device="cuda" if args.cuda else "cpu")
+                save_model_with_logging(best_model, global_model_file, logger)
                 
                 save_best_params_to_db(best_params_db, best_trial.params, best_trial.value)
                 
@@ -1058,12 +1067,12 @@ def train(args):
             env.close()
     
     logger.info("Training session ended")
-
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Kung Fu with PPO and Optuna.")
     parser.add_argument("--model_path", default="models/kungfu_ppo", help="Path to save model")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
-    parser.add_argument("--timesteps", type=int, default=50000, help="Total timesteps per trial")
+    parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps per trial")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--render", action="store_true", help="Render during training")
