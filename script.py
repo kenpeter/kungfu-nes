@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFrameStack
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import logging
@@ -495,14 +495,14 @@ def train(args):
     if args.resume and os.path.exists(args.model_path + ".zip"):
         logger.info(f"Resuming training from {args.model_path}")
         model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
-        # Update model with best params from DB
+        # Update only compatible parameters, avoid overriding clip_range directly
         model.learning_rate = best_params["learning_rate"]
-        model.clip_range = best_params["clip_range"]
         model.ent_coef = best_params["ent_coef"]
         model.n_steps = best_params["n_steps"]
         model.batch_size = best_params["batch_size"]
         model.n_epochs = best_params["n_epochs"]
         model.tensorboard_log = args.tensorboard_log
+        # Note: We don't set model.clip_range here to preserve the loaded model's configuration
     else:
         logger.info("Starting new training session")
         # Run Optuna optimization with specified trials
@@ -523,7 +523,7 @@ def train(args):
             n_epochs=best_params["n_epochs"],
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=best_params["clip_range"],
+            clip_range=best_params["clip_range"],  # Set as static float here
             ent_coef=best_params["ent_coef"],
             verbose=1,
             tensorboard_log=args.tensorboard_log,
