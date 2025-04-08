@@ -546,7 +546,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model (used without Optuna)")
     parser.add_argument("--tensorboard_log", default="tensorboard_logs", help="Directory for TensorBoard logs")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
-    parser.add_argument("--n_trials", type=int, default=20, help="Number of Optuna trials for hyperparameter tuning")
+    parser.add_argument("--n_trials", type=int, default=3, help="Number of Optuna trials for hyperparameter tuning")
     parser.add_argument("--no_optuna", action="store_true", help="Disable Optuna and use provided/default hyperparameters")
     
     args = parser.parse_args()
