@@ -13,9 +13,8 @@ import sys
 from gym import spaces, Wrapper
 import cv2
 from tqdm import tqdm
-import optuna  # Optuna import
+import optuna
 
-# [SimpleCNN class remains unchanged]
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
         super(SimpleCNN, self).__init__(observation_space, features_dim)
@@ -111,7 +110,6 @@ class SimpleCNN(BaseFeaturesExtractor):
         ], dim=1)
         return self.linear(combined)
 
-# [KungFuWrapper class remains unchanged]
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -169,7 +167,7 @@ class KungFuWrapper(Wrapper):
 
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
-        self.last_hp = float(self.env.get_ram()[0x04A6])  # Cast to float to avoid uint8 issues
+        self.last_hp = float(self.env.get_ram()[0x04A6])
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
         self.last_enemies = [0] * self.max_enemies
@@ -191,7 +189,7 @@ class KungFuWrapper(Wrapper):
         obs, _, done, info = self.env.step(self.actions[action])
         ram = self.env.get_ram()
         
-        hp = float(ram[0x04A6])  # Cast to float to avoid uint8 overflow
+        hp = float(ram[0x04A6])
         curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
         
         enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
@@ -377,7 +375,6 @@ class KungFuWrapper(Wrapper):
             "boss_info": boss_info
         }
 
-# [SaveBestModelCallback class remains unchanged]
 class SaveBestModelCallback(BaseCallback):
     def __init__(self, save_path, verbose=1):
         super(SaveBestModelCallback, self).__init__(verbose)
@@ -409,7 +406,6 @@ def make_env():
     env = KungFuWrapper(env)
     return env
 
-# Modified train function with Optuna, --no_optuna, and --resume
 def train(args):
     logger = setup_logging(args.log_dir)
     logger.info("Starting training session")
@@ -426,128 +422,137 @@ def train(args):
         )
     }
 
-    if args.no_optuna:
-        # Training without Optuna, with optional resume
-        logger.info("Training without Optuna optimization")
-        if args.resume and os.path.exists(args.model_path + ".zip"):
-            logger.info(f"Resuming training from {args.model_path}")
-            model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
-            model.learning_rate = args.learning_rate
-            model.clip_range = args.clip_range
-            model.ent_coef = args.ent_coef
-            model.tensorboard_log = args.tensorboard_log
-        else:
-            logger.info("Starting new training session")
-            model = PPO(
-                "MultiInputPolicy",
-                env,
-                learning_rate=args.learning_rate,
-                n_steps=2048,
-                batch_size=64,
-                n_epochs=10,
-                gamma=0.99,
-                gae_lambda=0.95,
-                clip_range=args.clip_range,
-                ent_coef=args.ent_coef,
-                verbose=1,
-                tensorboard_log=args.tensorboard_log,
-                policy_kwargs=policy_kwargs,
-                device="cuda" if args.cuda else "cpu"
-            )
-        
-        callback = SaveBestModelCallback(save_path=args.model_path)
+    # Optuna study configuration
+    study_name = "kungfu_ppo_study"
+    storage_name = f"sqlite:///{args.log_dir}/optuna_study.db"
+
+    # Function to load or create study
+    def get_study():
+        try:
+            study = optuna.load_study(study_name=study_name, storage=storage_name)
+            logger.info(f"Loaded existing study '{study_name}' from database with {len(study.trials)} trials")
+            return study
+        except KeyError:
+            logger.info(f"Study '{study_name}' not found. Creating new study.")
+            return optuna.create_study(study_name=study_name, storage=storage_name, direction="maximize")
+
+    # Function to get best hyperparameters with fallback to defaults
+    def get_best_params(study=None):
+        default_params = {
+            "learning_rate": args.learning_rate,
+            "clip_range": args.clip_range,
+            "ent_coef": args.ent_coef,
+            "n_steps": 2048,
+            "batch_size": 64,
+            "n_epochs": 10
+        }
+        if study and len(study.trials) > 0 and study.best_trial is not None:
+            logger.info(f"Using best parameters from study with value {study.best_value}")
+            return study.best_params
+        logger.info("No previous trials found in study, using defaults")
+        return default_params
+
+    # Optuna objective function
+    def objective(trial):
+        params = {
+            "learning_rate": trial.suggest_loguniform("learning_rate", 1e-5, 1e-2),
+            "clip_range": trial.suggest_uniform("clip_range", 0.1, 0.3),
+            "ent_coef": trial.suggest_loguniform("ent_coef", 1e-8, 1e-1),
+            "n_steps": trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096]),
+            "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
+            "n_epochs": trial.suggest_int("n_epochs", 3, 10)
+        }
+
+        trial_env = SubprocVecEnv([make_env for _ in range(args.num_envs)])
+        trial_env = VecFrameStack(trial_env, n_stack=12)
+
+        model = PPO(
+            "MultiInputPolicy",
+            trial_env,
+            **params,
+            gamma=0.99,
+            gae_lambda=0.95,
+            verbose=0,
+            tensorboard_log=args.tensorboard_log,
+            policy_kwargs=policy_kwargs,
+            device="cuda" if args.cuda else "cpu"
+        )
+
+        callback = SaveBestModelCallback(save_path=f"{args.model_path}_trial_{trial.number}")
         model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
-        model.save(args.model_path)
-        logger.info(f"Training completed. Model saved at {args.model_path}")
-    
+
+        total_hits = callback.best_hits
+        logger.info(f"Trial {trial.number} finished with {total_hits} enemy hits")
+        trial_env.close()
+
+        return total_hits
+
+    # Load or create study
+    study = get_study()
+    best_params = get_best_params(study)
+
+    # Check if resuming or starting fresh
+    if args.resume and os.path.exists(args.model_path + ".zip"):
+        logger.info(f"Resuming training from {args.model_path}")
+        model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
+        # Update model with best params from DB
+        model.learning_rate = best_params["learning_rate"]
+        model.clip_range = best_params["clip_range"]
+        model.ent_coef = best_params["ent_coef"]
+        model.n_steps = best_params["n_steps"]
+        model.batch_size = best_params["batch_size"]
+        model.n_epochs = best_params["n_epochs"]
+        model.tensorboard_log = args.tensorboard_log
     else:
-        # Training with Optuna optimization
-        logger.info("Starting training with Optuna optimization")
-
-        def objective(trial):
-            learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-2)
-            clip_range = trial.suggest_uniform("clip_range", 0.1, 0.3)
-            ent_coef = trial.suggest_loguniform("ent_coef", 1e-8, 1e-1)
-            n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096])
-            batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
-            n_epochs = trial.suggest_int("n_epochs", 3, 10)
-
-            trial_env = SubprocVecEnv([make_env for _ in range(args.num_envs)])
-            trial_env = VecFrameStack(trial_env, n_stack=12)
-
-            model = PPO(
-                "MultiInputPolicy",
-                trial_env,
-                learning_rate=learning_rate,
-                n_steps=n_steps,
-                batch_size=batch_size,
-                n_epochs=n_epochs,
-                gamma=0.99,
-                gae_lambda=0.95,
-                clip_range=clip_range,
-                ent_coef=ent_coef,
-                verbose=0,
-                tensorboard_log=args.tensorboard_log,
-                policy_kwargs=policy_kwargs,
-                device="cuda" if args.cuda else "cpu"
-            )
-
-            callback = SaveBestModelCallback(save_path=f"{args.model_path}_trial_{trial.number}")
-            model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
-
-            total_hits = callback.best_hits
-            logger.info(f"Trial {trial.number} finished with {total_hits} enemy hits")
-            trial_env.close()
-
-            return total_hits
-
-        study = optuna.create_study(direction="maximize")
+        logger.info("Starting new training session")
+        # Run Optuna optimization with specified trials
+        logger.info(f"Running Optuna optimization with {args.n_trials} trials")
         study.optimize(objective, n_trials=args.n_trials)
-
+        best_params = get_best_params(study)  # Update best_params after optimization
         logger.info(f"Best trial: {study.best_trial.number}")
         logger.info(f"Best value (enemy hits): {study.best_value}")
         logger.info(f"Best hyperparameters: {study.best_params}")
 
-        logger.info("Training final model with best hyperparameters")
-        best_model = PPO(
+        # Create new model with best params
+        model = PPO(
             "MultiInputPolicy",
             env,
-            learning_rate=study.best_params["learning_rate"],
-            n_steps=study.best_params["n_steps"],
-            batch_size=study.best_params["batch_size"],
-            n_epochs=study.best_params["n_epochs"],
+            learning_rate=best_params["learning_rate"],
+            n_steps=best_params["n_steps"],
+            batch_size=best_params["batch_size"],
+            n_epochs=best_params["n_epochs"],
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=study.best_params["clip_range"],
-            ent_coef=study.best_params["ent_coef"],
+            clip_range=best_params["clip_range"],
+            ent_coef=best_params["ent_coef"],
             verbose=1,
             tensorboard_log=args.tensorboard_log,
             policy_kwargs=policy_kwargs,
             device="cuda" if args.cuda else "cpu"
         )
 
-        callback = SaveBestModelCallback(save_path=args.model_path)
-        best_model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
-        best_model.save(args.model_path)
-        logger.info(f"Final model saved at {args.model_path}")
+    # Train the model
+    callback = SaveBestModelCallback(save_path=args.model_path)
+    model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
+    model.save(args.model_path)
+    logger.info(f"Training completed. Model saved at {args.model_path}")
 
     env.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with optional Optuna optimization")
+    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with Optuna optimization")
     parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo_best", help="Path to save the trained model")
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps for training")
-    parser.add_argument("--learning_rate", type=float, default=2.5e-4, help="Learning rate for PPO (used without Optuna)")
-    parser.add_argument("--clip_range", type=float, default=0.2, help="Clip range for PPO (used without Optuna)")
-    parser.add_argument("--ent_coef", type=float, default=0.01, help="Entropy coefficient for PPO (used without Optuna)")
+    parser.add_argument("--learning_rate", type=float, default=2.5e-4, help="Default learning rate for PPO")
+    parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO")
+    parser.add_argument("--ent_coef", type=float, default=0.01, help="Default entropy coefficient for PPO")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
-    parser.add_argument("--resume", action="store_true", help="Resume training from the saved model (used without Optuna)")
+    parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--tensorboard_log", default="tensorboard_logs", help="Directory for TensorBoard logs")
-    parser.add_argument("--log_dir", default="logs", help="Directory for logs")
+    parser.add_argument("--log_dir", default="logs", help="Directory for logs and Optuna database")
     parser.add_argument("--n_trials", type=int, default=3, help="Number of Optuna trials for hyperparameter tuning")
-    parser.add_argument("--no_optuna", action="store_true", help="Disable Optuna and use provided/default hyperparameters")
     
     args = parser.parse_args()
     train(args)
