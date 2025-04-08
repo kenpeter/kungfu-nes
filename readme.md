@@ -10,7 +10,7 @@ python play.py --render
 
 
 
-tensorboard --logdir=logs
+tensorboard --logdir=tensorboard_logs
 
 
 

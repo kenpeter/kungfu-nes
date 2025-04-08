@@ -552,7 +552,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--tensorboard_log", default="tensorboard_logs", help="Directory for TensorBoard logs")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs and Optuna database")
-    parser.add_argument("--n_trials", type=int, default=3, help="Number of Optuna trials for hyperparameter tuning")
+    parser.add_argument("--n_trials", type=int, default=2, help="Number of Optuna trials for hyperparameter tuning")
     
     args = parser.parse_args()
     train(args)
