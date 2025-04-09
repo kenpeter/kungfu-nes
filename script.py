@@ -14,6 +14,33 @@ from gym import spaces, Wrapper
 import cv2
 from tqdm import tqdm
 import optuna
+import signal
+
+# Global variable for the model
+current_model = None
+global_logger = None  # We'll set this in train
+global_model_path = None  # We'll set this in train
+
+# Emergency save handler
+def emergency_save_handler(signum, frame):
+    global current_model, global_logger, global_model_path
+    if current_model is not None and global_model_path is not None:
+        current_model.save(global_model_path)
+        if global_logger is not None:
+            global_logger.info(f"Emergency save triggered by Ctrl+C. Model saved at {global_model_path}.zip")
+        else:
+            print(f"Emergency save triggered by Ctrl+C. Model saved at {global_model_path}.zip")
+    else:
+        if global_logger is not None:
+            global_logger.info("No model available for emergency save.")
+        else:
+            print("No model available for emergency save.")
+    # Note: We can't close env here because it's not globally accessible yet
+    sys.exit(0)
+
+# Register the signal handler at the start of the file
+signal.signal(signal.SIGINT, emergency_save_handler)
+
 
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
@@ -407,13 +434,22 @@ def make_env():
     return env
 
 def train(args):
+    global current_model, global_logger, global_model_path
+
+    global_logger = setup_logging(args.log_dir)
+    global_logger.info("Starting training session")
+    global_model_path = args.model_path
+    current_model = None  # Reset at start of training
+
     logger = setup_logging(args.log_dir)
     logger.info("Starting training session")
+
 
     # Common environment and policy setup
     env = SubprocVecEnv([make_env for _ in range(args.num_envs)])
     env = VecFrameStack(env, n_stack=12)
     
+    # policy set up
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
         "net_arch": dict(
@@ -454,6 +490,7 @@ def train(args):
 
     # Optuna objective function
     def objective(trial):
+        # obj best param
         params = {
             "learning_rate": trial.suggest_loguniform("learning_rate", 1e-5, 1e-2),
             "clip_range": trial.suggest_uniform("clip_range", 0.1, 0.3),
@@ -463,9 +500,11 @@ def train(args):
             "n_epochs": trial.suggest_int("n_epochs", 3, 10)
         }
 
+        # multi vec and frame stack
         trial_env = SubprocVecEnv([make_env for _ in range(args.num_envs)])
         trial_env = VecFrameStack(trial_env, n_stack=12)
 
+        # ppo model
         model = PPO(
             "MultiInputPolicy",
             trial_env,
@@ -478,7 +517,9 @@ def train(args):
             device="cuda" if args.cuda else "cpu"
         )
 
+        # save best model call back
         callback = SaveBestModelCallback(save_path=f"{args.model_path}_trial_{trial.number}")
+        # model learn
         model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
 
         total_hits = callback.best_hits
@@ -493,8 +534,14 @@ def train(args):
 
     # Check if resuming or starting fresh
     if args.resume and os.path.exists(args.model_path + ".zip"):
+ 
+        # resume
         logger.info(f"Resuming training from {args.model_path}")
+        # resume we load again
         model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
+        current_model = model
+
+        # all the best param
         # Update only compatible parameters, avoid overriding clip_range directly
         model.learning_rate = best_params["learning_rate"]
         model.ent_coef = best_params["ent_coef"]
@@ -531,6 +578,8 @@ def train(args):
             device="cuda" if args.cuda else "cpu"
         )
 
+        current_model = model
+
     # Train the model
     callback = SaveBestModelCallback(save_path=args.model_path)
     model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
@@ -552,7 +601,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--tensorboard_log", default="tensorboard_logs", help="Directory for TensorBoard logs")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs and Optuna database")
-    parser.add_argument("--n_trials", type=int, default=2, help="Number of Optuna trials for hyperparameter tuning")
+    parser.add_argument("--n_trials", type=int, default=1, help="Number of Optuna trials for hyperparameter tuning")
     
     args = parser.parse_args()
     train(args)

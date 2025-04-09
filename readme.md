@@ -2,8 +2,6 @@ python script.py --num_envs 8 --cuda --progress_bar --resume --timesteps 10000
 
 
 
-python script.py --num_envs 8 --cuda --progress_bar --no-optuna --resume --timesteps 10000 
-
 
 
 python play.py --render
