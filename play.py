@@ -42,13 +42,14 @@ class SimpleCNN(BaseFeaturesExtractor):
         enemy_proximity_size = observation_space["enemy_proximity"].shape[0]
         boss_info_size = observation_space["boss_info"].shape[0]
         enemy_attack_states_size = observation_space["enemy_attack_states"].shape[0]
+        level_size = observation_space["level"].shape[0]  # Add level size
         
         self.linear = nn.Sequential(
             nn.Linear(
                 n_flatten + enemy_vec_size + enemy_types_size + enemy_history_size +
                 enemy_timers_size + enemy_patterns_size + combat_status_size +
                 projectile_vec_size + enemy_proximity_size + boss_info_size +
-                enemy_attack_states_size,
+                enemy_attack_states_size + level_size,
                 512
             ),
             nn.ReLU(),
@@ -68,6 +69,7 @@ class SimpleCNN(BaseFeaturesExtractor):
         enemy_proximity = observations["enemy_proximity"]
         boss_info = observations["boss_info"]
         enemy_attack_states = observations["enemy_attack_states"]
+        level = observations["level"]
         
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport).float()
@@ -91,6 +93,8 @@ class SimpleCNN(BaseFeaturesExtractor):
             boss_info = torch.from_numpy(boss_info).float()
         if isinstance(enemy_attack_states, np.ndarray):
             enemy_attack_states = torch.from_numpy(enemy_attack_states).float()
+        if isinstance(level, np.ndarray):
+            level = torch.from_numpy(level).float()
             
         if len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0)
@@ -101,14 +105,14 @@ class SimpleCNN(BaseFeaturesExtractor):
         
         for tensor in [enemy_vector, enemy_types, enemy_history, enemy_timers,
                        enemy_patterns, combat_status, projectile_vectors,
-                       enemy_proximity, boss_info, enemy_attack_states]:
+                       enemy_proximity, boss_info, enemy_attack_states, level]:
             if len(tensor.shape) == 1:
                 tensor = tensor.unsqueeze(0)
             
         combined = torch.cat([
             cnn_output, enemy_vector, enemy_types, enemy_history, enemy_timers,
             enemy_patterns, combat_status, projectile_vectors, enemy_proximity,
-            boss_info, enemy_attack_states
+            boss_info, enemy_attack_states, level
         ], dim=1)
         return self.linear(combined)
 
@@ -151,7 +155,8 @@ class KungFuWrapper(Wrapper):
             "projectile_vectors": spaces.Box(-255, 255, (self.max_projectiles * 4,), np.float32),
             "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
             "boss_info": spaces.Box(-255, 255, (3,), np.float32),
-            "enemy_attack_states": spaces.Box(0, 1, (self.max_enemies,), np.float32)
+            "enemy_attack_states": spaces.Box(0, 1, (self.max_enemies,), np.float32),
+            "level": spaces.Box(0, 1, (1,), np.float32)
         })
         
         self.last_hp = 0
@@ -366,6 +371,9 @@ class KungFuWrapper(Wrapper):
         ram = self.env.get_ram()
         
         hero_x = int(ram[0x0094])
+        stage = int(ram[0x0058])
+        level = np.array([stage / 5.0], dtype=np.float32)
+        
         enemy_info = []
         for addr in [0x008E, 0x008F, 0x0090, 0x0091]:
             enemy_x = int(ram[addr])
@@ -398,7 +406,8 @@ class KungFuWrapper(Wrapper):
             "projectile_vectors": projectile_vectors,
             "enemy_proximity": enemy_proximity,
             "boss_info": boss_info,
-            "enemy_attack_states": enemy_attack_states
+            "enemy_attack_states": enemy_attack_states,
+            "level": level
         }
 
 def play(args):
