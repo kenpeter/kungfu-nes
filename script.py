@@ -218,20 +218,26 @@ class KungFuWrapper(Wrapper):
         
         hp = float(ram[0x04A6])
         curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
-        
         enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
+
+        reward = 0
         hp_change_rate = (hp - self.last_hp) / 255.0
         
-        self._update_enemy_info(obs, ram)
-        self._update_boss_info(ram)
-        projectile_info = self._detect_projectiles(obs)
-        
-        reward = 0
+        # Apply HP penalty first
+        if hp_change_rate < 0:
+            reward += (hp_change_rate ** 2) * 100  # Quadratic penalty
+        else:
+            reward += hp_change_rate * 5  # Healing reward
+
         reward += enemy_hit * 10
         reward += hp_change_rate * 5
         if done:
             reward -= 50
-        
+
+        self._update_enemy_info(obs, ram)
+        self._update_boss_info(ram)
+        projectile_info = self._detect_projectiles(obs)
+
         projectile_distances = [projectile_info[i] for i in range(0, len(projectile_info), 4)]
         dodge_reward = 0
         for i, (curr_dist, last_dist) in enumerate(zip(projectile_distances, self.last_projectile_distances)):
