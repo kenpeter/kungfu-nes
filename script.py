@@ -13,27 +13,32 @@ import logging
 import sys
 from gym import spaces, Wrapper
 import cv2
-from tqdm import tqdm
-import optuna
 import signal
 import time
 import platform
 import multiprocessing as mp
-from stable_baselines3.common.vec_env.subproc_vec_env import SubprocVecEnv
+import zipfile
+from stable_baselines3.common.buffers import RolloutBuffer
 
 # Global variables for the model
 current_model = None
 global_logger = None
 global_model_path = None
+experience_data = []  # To store collected experience
 
 def emergency_save_handler(signum, frame):
-    global current_model, global_logger, global_model_path
+    global current_model, global_logger, global_model_path, experience_data
     if current_model is not None and global_model_path is not None:
+        # Save model with experience data
         current_model.save(global_model_path)
+        with zipfile.ZipFile(f"{global_model_path}.zip", 'a') as zipf:
+            zipf.writestr("experience_data.pkl", str(experience_data))
         if global_logger is not None:
-            global_logger.info(f"Emergency save triggered by Ctrl+C. Model saved at {global_model_path}.zip")
+            global_logger.info(f"Emergency save triggered by Ctrl+C. Model and experience saved at {global_model_path}.zip")
+            global_logger.info(f"Collected experience: {len(experience_data)} steps")
         else:
-            print(f"Emergency save triggered by Ctrl+C. Model saved at {global_model_path}.zip")
+            print(f"Emergency save triggered by Ctrl+C. Model and experience saved at {global_model_path}.zip")
+            print(f"Collected experience: {len(experience_data)} steps")
         
         # Clean up environment
         if hasattr(current_model, 'env'):
@@ -48,11 +53,6 @@ def emergency_save_handler(signum, frame):
         
         del current_model
         current_model = None
-    else:
-        if global_logger is not None:
-            global_logger.info("No model available for emergency save.")
-        else:
-            print("No model available for emergency save.")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, emergency_save_handler)
@@ -237,6 +237,7 @@ class KungFuWrapper(Wrapper):
         return self._get_obs(obs)
 
     def step(self, action):
+        global experience_data
         self.total_steps += 1
         self.action_counts[action] += 1
         obs, _, done, info = self.env.step(self.actions[action])
@@ -297,6 +298,16 @@ class KungFuWrapper(Wrapper):
             "dodge_reward": dodge_reward,
             "survival_reward_total": self.survival_reward_total
         })
+        
+        # Collect experience
+        experience = {
+            "observation": self._get_obs(obs),
+            "action": action,
+            "reward": reward,
+            "done": done,
+            "info": info
+        }
+        experience_data.append(experience)
         
         return self._get_obs(obs), reward, done, info
 
@@ -480,130 +491,84 @@ def make_env():
     return env
 
 def train(args):
-    global current_model, global_logger, global_model_path
-
+    global current_model, global_logger, global_model_path, experience_data
+    
+    # Reset experience data
+    experience_data = []
+    
     # Setup logging
     global_logger = setup_logging(args.log_dir)
-    global_logger.info("Starting training session")
+    global_logger.info(f"Starting training with {args.num_envs} envs and {args.timesteps} timesteps")
     global_model_path = args.model_path
     current_model = None
 
-    # Track subprocesses manually for proper cleanup
+    # Validate num_envs
+    if args.num_envs < 1:
+        raise ValueError("Number of environments must be at least 1")
+    
+    # Create environments
     env_fns = [make_env for _ in range(args.num_envs)]
     env = SubprocVecEnv(env_fns)
     env = VecFrameStack(env, n_stack=12)
     
-    # Policy setup (unchanged)
+    # Policy setup
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
         "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])
     }
     learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
 
-    # Optuna study configuration (unchanged)
-    study_name = "kungfu_ppo_study"
-    storage_name = f"sqlite:///{args.log_dir}/optuna_study.db"
-
-    def get_study():
-        try:
-            study = optuna.load_study(study_name=study_name, storage=storage_name)
-            global_logger.info(f"Loaded existing study '{study_name}' with {len(study.trials)} trials")
-            return study
-        except KeyError:
-            global_logger.info(f"Study '{study_name}' not found. Creating new study.")
-            return optuna.create_study(study_name=study_name, storage=storage_name, direction="maximize")
-
-    def get_best_params(study=None):
-        default_params = {
-            "learning_rate": learning_rate_schedule,
-            "clip_range": args.clip_range,
-            "ent_coef": 0.1,
-            "n_steps": min(2048, args.timesteps // args.num_envs),
-            "batch_size": 64,
-            "n_epochs": 10
-        }
-        if study and len(study.trials) > 0 and study.best_trial is not None:
-            global_logger.info(f"Using best parameters from study with value {study.best_value}")
-            best_params = study.best_params
-            best_params["learning_rate"] = learning_rate_schedule
-            best_params["ent_coef"] = 0.1
-            best_params["n_steps"] = min(best_params["n_steps"], args.timesteps // args.num_envs)
-            return best_params
-        global_logger.info("No previous trials found in study, using defaults")
-        return default_params
-
-    def objective(trial):
-        params = {
-            "learning_rate": learning_rate_schedule,
-            "clip_range": trial.suggest_uniform("clip_range", 0.1, 0.3),
-            "ent_coef": 0.1,
-            "n_steps": min(trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096]), args.timesteps // args.num_envs),
-            "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
-            "n_epochs": trial.suggest_int("n_epochs", 3, 10)
-        }
-
-        trial_env = SubprocVecEnv([make_env for _ in range(args.num_envs)])
-        trial_env = VecFrameStack(trial_env, n_stack=12)
-
-        model = PPO(
-            "MultiInputPolicy",
-            trial_env,
-            **params,
-            gamma=0.99,
-            gae_lambda=0.95,
-            verbose=0,
-            policy_kwargs=policy_kwargs,
-            device="cuda" if args.cuda else "cpu"
-        )
-
-        callback = SaveBestModelCallback(save_path=f"{args.model_path}_trial_{trial.number}")
-        model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
-
-        total_hits = callback.best_score
-        global_logger.info(f"Trial {trial.number} finished with score {total_hits}")
-        
-        # Clean up trial resources
-        trial_env.close()
-        del model
-        if args.cuda:
-            torch.cuda.empty_cache()
-        
-        return total_hits
-
-    # Load or create study
-    study = get_study()
-    best_params = get_best_params(study)
+    # Default parameters
+    params = {
+        "learning_rate": learning_rate_schedule,
+        "clip_range": args.clip_range,
+        "ent_coef": 0.1,
+        "n_steps": min(2048, args.timesteps // args.num_envs if args.num_envs > 0 else args.timesteps),
+        "batch_size": 64,
+        "n_epochs": 10
+    }
 
     # Training logic
     if args.resume and os.path.exists(args.model_path + ".zip"):
         global_logger.info(f"Resuming training from {args.model_path}")
-        model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
-        current_model = model
-        model.learning_rate = best_params["learning_rate"]
-        model.ent_coef = best_params["ent_coef"]
-        model.n_steps = best_params["n_steps"]
-        model.batch_size = best_params["batch_size"]
-        model.n_epochs = best_params["n_epochs"]
-    else:
-        global_logger.info("Starting new training session")
-        global_logger.info(f"Running Optuna optimization with {args.n_trials} trials")
-        study.optimize(objective, n_trials=args.n_trials)
-        best_params = get_best_params(study)
-        global_logger.info(f"Best trial: {study.best_trial.number}")
-        global_logger.info(f"Best value (score): {study.best_value}")
-        global_logger.info(f"Best hyperparameters: {study.best_params}")
-
+        # Load the old model just to get its weights
+        old_model = PPO.load(args.model_path, device="cuda" if args.cuda else "cpu")
+        
+        # Create a new model with the desired parameters
         model = PPO(
             "MultiInputPolicy",
             env,
-            learning_rate=best_params["learning_rate"],
-            n_steps=best_params["n_steps"],
-            batch_size=best_params["batch_size"],
-            n_epochs=best_params["n_epochs"],
+            learning_rate=params["learning_rate"],
+            n_steps=params["n_steps"],
+            batch_size=params["batch_size"],
+            n_epochs=params["n_epochs"],
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=best_params["clip_range"],
-            ent_coef=best_params["ent_coef"],
+            clip_range=params["clip_range"],
+            ent_coef=params["ent_coef"],
+            verbose=1,
+            policy_kwargs=policy_kwargs,
+            device="cuda" if args.cuda else "cpu"
+        )
+        
+        # Copy the weights from the old model to the new one
+        model.policy.load_state_dict(old_model.policy.state_dict())
+        
+        current_model = model
+        global_logger.info(f"Created new model with n_steps={params['n_steps']} and copied weights from saved model")
+    else:
+        global_logger.info("Starting new training session")
+        model = PPO(
+            "MultiInputPolicy",
+            env,
+            learning_rate=params["learning_rate"],
+            n_steps=params["n_steps"],
+            batch_size=params["batch_size"],
+            n_epochs=params["n_epochs"],
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=params["clip_range"],
+            ent_coef=params["ent_coef"],
             verbose=1,
             policy_kwargs=policy_kwargs,
             device="cuda" if args.cuda else "cpu"
@@ -612,100 +577,20 @@ def train(args):
 
     # Train the model
     callback = SaveBestModelCallback(save_path=args.model_path)
-    shutdown_start_time = time.time()
     model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
 
-    # Enhanced cleanup
-    global_logger.info("Training completed. Starting cleanup...")
-    try:
-        # Save the final model
-        model.save(args.model_path)
-        global_logger.info(f"Model saved to {args.model_path}.zip")
-
-        # Explicitly delete model and clear references
-        del model
-        current_model = None
-        global_logger.info("Model references cleared.")
-
-        # Close the environment and ensure subprocesses terminate
-        global_logger.info("Closing environment...")
-        env.close()
-        global_logger.info("Environment closed. Waiting for subprocesses to terminate...")
-
-        # Access the underlying processes (if available)
-        is_windows = platform.system() == "Windows"
-        timeout = 10  # seconds
-        start_time = time.time()
-
-        # Check if subprocesses are still alive
-        if hasattr(env, 'processes'):  # Only available in some implementations
-            processes = env.processes
-        else:
-            # Fallback: Reconstruct processes from env_fns if possible
-            processes = [p for p in mp.active_children() if p.is_alive()]
-
-        while processes and any(p.is_alive() for p in processes) and (time.time() - start_time) < timeout:
-            time.sleep(0.5)
-
-        if any(p.is_alive() for p in processes):
-            global_logger.warning("Some subprocesses did not terminate within timeout. Forcing closure...")
-            for p in processes:
-                if p.is_alive():
-                    if is_windows:
-                        # On Windows, use taskkill or close pipes gracefully
-                        try:
-                            p.terminate()
-                        except AttributeError:
-                            # If terminate fails, close pipes (less reliable but safer)
-                            for remote in env.remotes:
-                                remote.close()
-                    else:
-                        # On Unix, terminate or kill
-                        p.terminate()
-                        if p.is_alive():  # If still alive after terminate, kill
-                            p.kill()
-            # Final close attempt
-            env.close()
-
-        # Clean up GPU memory if CUDA is used
-        if args.cuda:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            global_logger.info("GPU memory cache cleared and synchronized.")
-
-        # Shutdown logging
-        global_logger.info("Shutting down logging...")
-        for handler in global_logger.handlers[:]:
-            handler.close()
-            global_logger.removeHandler(handler)
-        logging.shutdown()
-
-    except Exception as e:
-        global_logger.error(f"Error during cleanup: {str(e)}")
-        raise
-
-    finally:
-        shutdown_time = time.time() - shutdown_start_time
-        global_logger.info(f"Shutdown completed in {shutdown_time:.2f} seconds")
-        # Force garbage collection
-        import gc
-        gc.collect()
-        if args.cuda:
-            torch.cuda.empty_cache()
-            
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with Optuna optimization")
+    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu")
     parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo_best", help="Path to save the trained model")
     parser.add_argument("--timesteps", type=int, default=10000, help="Total timesteps for training")
     parser.add_argument("--learning_rate", type=float, default=2.5e-4, help="Default learning rate for PPO")
     parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO")
     parser.add_argument("--ent_coef", type=float, default=0.01, help="Default entropy coefficient for PPO")
-    parser.add_argument("--num_envs", type=int, default=8, help="Number of parallel environments")
+    parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments (1 or more)")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
-    parser.add_argument("--log_dir", default="logs", help="Directory for logs and Optuna database")
-    parser.add_argument("--n_trials", type=int, default=1, help="Number of Optuna trials for hyperparameter tuning")
+    parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     
     args = parser.parse_args()
     train(args)
