@@ -31,25 +31,39 @@ def emergency_save_handler(signum, frame):
     if current_model is not None and global_model_path is not None:
         # Save model with experience data
         current_model.save(global_model_path)
-        with zipfile.ZipFile(f"{global_model_path}.zip", 'a') as zipf:
-            zipf.writestr("experience_data.pkl", str(experience_data))
+        
+        # Log the amount of experience collected
+        experience_count = len(experience_data)
         if global_logger is not None:
-            global_logger.info(f"Emergency save triggered by Ctrl+C. Model and experience saved at {global_model_path}.zip")
-            global_logger.info(f"Collected experience: {len(experience_data)} steps")
+            global_logger.info(f"Emergency save triggered by Ctrl+C. Model saved at {global_model_path}")
+            global_logger.info(f"Collected experience: {experience_count} steps")
         else:
-            print(f"Emergency save triggered by Ctrl+C. Model and experience saved at {global_model_path}.zip")
-            print(f"Collected experience: {len(experience_data)} steps")
+            print(f"Emergency save triggered by Ctrl+C. Model saved at {global_model_path}")
+            print(f"Collected experience: {experience_count} steps")
+        
+        # Save experience data to file
+        try:
+            with open(f"{global_model_path}_experience_count.txt", "w") as f:
+                f.write(f"Total experience collected: {experience_count} steps\n")
+                f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        except Exception as e:
+            if global_logger is not None:
+                global_logger.error(f"Failed to save experience count: {e}")
+            else:
+                print(f"Failed to save experience count: {e}")
         
         # Clean up environment
         if hasattr(current_model, 'env'):
             current_model.env.close()
-            global_logger.info("Environment closed during emergency save.")
+            if global_logger is not None:
+                global_logger.info("Environment closed during emergency save.")
         
         # Clean up GPU
         if args.cuda:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            global_logger.info("GPU cleaned up during emergency save.")
+            if global_logger is not None:
+                global_logger.info("GPU cleaned up during emergency save.")
         
         del current_model
         current_model = None
@@ -578,6 +592,19 @@ def train(args):
     # Train the model
     callback = SaveBestModelCallback(save_path=args.model_path)
     model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
+
+     # Log the amount of experience collected at the end of training
+    experience_count = len(experience_data)
+    global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
+    
+    # Save experience count to file
+    try:
+        with open(f"{args.model_path}_experience_count.txt", "w") as f:
+            f.write(f"Total experience collected: {experience_count} steps\n")
+            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Training parameters: num_envs={args.num_envs}, timesteps={args.timesteps}\n")
+    except Exception as e:
+        global_logger.error(f"Failed to save experience count: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu")
