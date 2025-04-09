@@ -17,6 +17,9 @@ from tqdm import tqdm
 import optuna
 import signal
 import time
+import platform
+import multiprocessing as mp
+from stable_baselines3.common.vec_env.subproc_vec_env import SubprocVecEnv
 
 # Global variables for the model
 current_model = None
@@ -51,7 +54,7 @@ def emergency_save_handler(signum, frame):
         else:
             print("No model available for emergency save.")
     sys.exit(0)
-    
+
 signal.signal(signal.SIGINT, emergency_save_handler)
 
 class SimpleCNN(BaseFeaturesExtractor):
@@ -485,11 +488,12 @@ def train(args):
     global_model_path = args.model_path
     current_model = None
 
-    # Setup environment
-    env = SubprocVecEnv([make_env for _ in range(args.num_envs)])
+    # Track subprocesses manually for proper cleanup
+    env_fns = [make_env for _ in range(args.num_envs)]
+    env = SubprocVecEnv(env_fns)
     env = VecFrameStack(env, n_stack=12)
     
-    # Policy setup
+    # Policy setup (unchanged)
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
         "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])
@@ -627,26 +631,47 @@ def train(args):
         global_logger.info("Closing environment...")
         env.close()
         global_logger.info("Environment closed. Waiting for subprocesses to terminate...")
-        
-        # Forcefully terminate subprocesses if they don't close within a timeout
+
+        # Access the underlying processes (if available)
+        is_windows = platform.system() == "Windows"
         timeout = 10  # seconds
         start_time = time.time()
-        while env.num_envs > 0 and (time.time() - start_time) < timeout:
-            env.close()  # Repeated calls to ensure closure
+
+        # Check if subprocesses are still alive
+        if hasattr(env, 'processes'):  # Only available in some implementations
+            processes = env.processes
+        else:
+            # Fallback: Reconstruct processes from env_fns if possible
+            processes = [p for p in mp.active_children() if p.is_alive()]
+
+        while processes and any(p.is_alive() for p in processes) and (time.time() - start_time) < timeout:
             time.sleep(0.5)
-        if env.num_envs > 0:
+
+        if any(p.is_alive() for p in processes):
             global_logger.warning("Some subprocesses did not terminate within timeout. Forcing closure...")
-            for proc in env.remotes:
-                proc.terminate()
-            env.close()  # Final attempt
+            for p in processes:
+                if p.is_alive():
+                    if is_windows:
+                        # On Windows, use taskkill or close pipes gracefully
+                        try:
+                            p.terminate()
+                        except AttributeError:
+                            # If terminate fails, close pipes (less reliable but safer)
+                            for remote in env.remotes:
+                                remote.close()
+                    else:
+                        # On Unix, terminate or kill
+                        p.terminate()
+                        if p.is_alive():  # If still alive after terminate, kill
+                            p.kill()
+            # Final close attempt
+            env.close()
 
         # Clean up GPU memory if CUDA is used
         if args.cuda:
             torch.cuda.empty_cache()
-            global_logger.info("GPU memory cache cleared.")
-            # Optionally, reset the GPU device to ensure full cleanup
             torch.cuda.synchronize()
-            global_logger.info("GPU synchronized.")
+            global_logger.info("GPU memory cache cleared and synchronized.")
 
         # Shutdown logging
         global_logger.info("Shutting down logging...")
@@ -660,15 +685,14 @@ def train(args):
         raise
 
     finally:
-        # Ensure final cleanup steps are executed even if an error occurs
         shutdown_time = time.time() - shutdown_start_time
         global_logger.info(f"Shutdown completed in {shutdown_time:.2f} seconds")
-        # Force garbage collection to release any remaining memory
+        # Force garbage collection
         import gc
         gc.collect()
         if args.cuda:
-            torch.cuda.empty_cache()  # One last GPU cleanup
-
+            torch.cuda.empty_cache()
+            
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with Optuna optimization")
     parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo_best", help="Path to save the trained model")
