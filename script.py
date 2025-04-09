@@ -19,6 +19,7 @@ import platform
 import multiprocessing as mp
 import zipfile
 from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 
 # Global variables for the model
 current_model = None
@@ -71,6 +72,47 @@ def emergency_save_handler(signum, frame):
 
 signal.signal(signal.SIGINT, emergency_save_handler)
 
+
+class ExperienceCollectionCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super(ExperienceCollectionCallback, self).__init__(verbose)
+        self.experience_data = []
+        
+    def _on_step(self) -> bool:
+        # Get the most recent observations, actions, rewards, etc.
+        obs = self.locals.get('new_obs')
+        actions = self.locals.get('actions')
+        rewards = self.locals.get('rewards')
+        dones = self.locals.get('dones')
+        infos = self.locals.get('infos')
+        
+        if all(x is not None for x in [obs, actions, rewards, dones, infos]):
+            # For vectorized environments, we need to handle the structure differently
+            if isinstance(obs, dict):
+                # For dict observations (like in your case)
+                experience = {
+                    "observation": obs,  # Store the entire observation dictionary
+                    "action": actions,   # Store all actions
+                    "reward": rewards,   # Store all rewards
+                    "done": dones,       # Store all done flags
+                    "info": infos        # Store all info dictionaries
+                }
+                self.experience_data.append(experience)
+            else:
+                # For array-like observations, we can iterate
+                for i in range(len(rewards)):  # For each environment
+                    if i < len(obs):  # Make sure the index is valid
+                        experience = {
+                            "observation": obs[i] if isinstance(obs, (list, np.ndarray)) else obs,
+                            "action": actions[i] if isinstance(actions, (list, np.ndarray)) else actions,
+                            "reward": rewards[i] if isinstance(rewards, (list, np.ndarray)) else rewards,
+                            "done": dones[i] if isinstance(dones, (list, np.ndarray)) else dones,
+                            "info": infos[i] if i < len(infos) else {}
+                        }
+                        self.experience_data.append(experience)
+        
+        return True
+    
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
         super(SimpleCNN, self).__init__(observation_space, features_dim)
@@ -590,10 +632,16 @@ def train(args):
         current_model = model
 
     # Train the model
-    callback = SaveBestModelCallback(save_path=args.model_path)
+    save_callback = SaveBestModelCallback(save_path=args.model_path)
+    exp_callback = ExperienceCollectionCallback()
+    # Use both callbacks
+    callback = CallbackList([save_callback, exp_callback])
+    
     model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
-
-     # Log the amount of experience collected at the end of training
+    # Update the global experience_data from the callback
+    experience_data = exp_callback.experience_data
+    
+    # Log the amount of experience collected at the end of training
     experience_count = len(experience_data)
     global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
     
