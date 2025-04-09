@@ -23,7 +23,6 @@ current_model = None
 global_logger = None
 global_model_path = None
 
-# Emergency save handler
 def emergency_save_handler(signum, frame):
     global current_model, global_logger, global_model_path
     if current_model is not None and global_model_path is not None:
@@ -32,13 +31,27 @@ def emergency_save_handler(signum, frame):
             global_logger.info(f"Emergency save triggered by Ctrl+C. Model saved at {global_model_path}.zip")
         else:
             print(f"Emergency save triggered by Ctrl+C. Model saved at {global_model_path}.zip")
+        
+        # Clean up environment
+        if hasattr(current_model, 'env'):
+            current_model.env.close()
+            global_logger.info("Environment closed during emergency save.")
+        
+        # Clean up GPU
+        if args.cuda:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            global_logger.info("GPU cleaned up during emergency save.")
+        
+        del current_model
+        current_model = None
     else:
         if global_logger is not None:
             global_logger.info("No model available for emergency save.")
         else:
             print("No model available for emergency save.")
     sys.exit(0)
-
+    
 signal.signal(signal.SIGINT, emergency_save_handler)
 
 class SimpleCNN(BaseFeaturesExtractor):
@@ -466,6 +479,7 @@ def make_env():
 def train(args):
     global current_model, global_logger, global_model_path
 
+    # Setup logging
     global_logger = setup_logging(args.log_dir)
     global_logger.info("Starting training session")
     global_model_path = args.model_path
@@ -482,7 +496,7 @@ def train(args):
     }
     learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
 
-    # Optuna study configuration
+    # Optuna study configuration (unchanged)
     study_name = "kungfu_ppo_study"
     storage_name = f"sqlite:///{args.log_dir}/optuna_study.db"
 
@@ -500,7 +514,7 @@ def train(args):
             "learning_rate": learning_rate_schedule,
             "clip_range": args.clip_range,
             "ent_coef": 0.1,
-            "n_steps": min(2048, args.timesteps // args.num_envs),  # Adjust n_steps to respect timesteps
+            "n_steps": min(2048, args.timesteps // args.num_envs),
             "batch_size": 64,
             "n_epochs": 10
         }
@@ -544,7 +558,7 @@ def train(args):
         total_hits = callback.best_score
         global_logger.info(f"Trial {trial.number} finished with score {total_hits}")
         
-        # Clean up trial environment
+        # Clean up trial resources
         trial_env.close()
         del model
         if args.cuda:
@@ -597,27 +611,63 @@ def train(args):
     shutdown_start_time = time.time()
     model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
 
-    # Cleanup
+    # Enhanced cleanup
     global_logger.info("Training completed. Starting cleanup...")
-    model.save(args.model_path)
-    global_logger.info("Model saved.")
-    
-    del model
-    current_model = None
-    
-    global_logger.info("Closing environment...")
-    env.close()
-    time.sleep(1)  # Brief pause to ensure subprocesses terminate
-    
-    if args.cuda:
-        torch.cuda.empty_cache()
-        global_logger.info("GPU memory cleared.")
-    
-    global_logger.info("Shutdown complete.")
-    shutdown_time = time.time() - shutdown_start_time
-    global_logger.info(f"Shutdown took {shutdown_time:.2f} seconds")
-    
-    logging.shutdown()
+    try:
+        # Save the final model
+        model.save(args.model_path)
+        global_logger.info(f"Model saved to {args.model_path}.zip")
+
+        # Explicitly delete model and clear references
+        del model
+        current_model = None
+        global_logger.info("Model references cleared.")
+
+        # Close the environment and ensure subprocesses terminate
+        global_logger.info("Closing environment...")
+        env.close()
+        global_logger.info("Environment closed. Waiting for subprocesses to terminate...")
+        
+        # Forcefully terminate subprocesses if they don't close within a timeout
+        timeout = 10  # seconds
+        start_time = time.time()
+        while env.num_envs > 0 and (time.time() - start_time) < timeout:
+            env.close()  # Repeated calls to ensure closure
+            time.sleep(0.5)
+        if env.num_envs > 0:
+            global_logger.warning("Some subprocesses did not terminate within timeout. Forcing closure...")
+            for proc in env.remotes:
+                proc.terminate()
+            env.close()  # Final attempt
+
+        # Clean up GPU memory if CUDA is used
+        if args.cuda:
+            torch.cuda.empty_cache()
+            global_logger.info("GPU memory cache cleared.")
+            # Optionally, reset the GPU device to ensure full cleanup
+            torch.cuda.synchronize()
+            global_logger.info("GPU synchronized.")
+
+        # Shutdown logging
+        global_logger.info("Shutting down logging...")
+        for handler in global_logger.handlers[:]:
+            handler.close()
+            global_logger.removeHandler(handler)
+        logging.shutdown()
+
+    except Exception as e:
+        global_logger.error(f"Error during cleanup: {str(e)}")
+        raise
+
+    finally:
+        # Ensure final cleanup steps are executed even if an error occurs
+        shutdown_time = time.time() - shutdown_start_time
+        global_logger.info(f"Shutdown completed in {shutdown_time:.2f} seconds")
+        # Force garbage collection to release any remaining memory
+        import gc
+        gc.collect()
+        if args.cuda:
+            torch.cuda.empty_cache()  # One last GPU cleanup
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with Optuna optimization")
