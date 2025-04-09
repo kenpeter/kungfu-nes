@@ -8,6 +8,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.utils import get_linear_fn
 import logging
 import sys
 from gym import spaces, Wrapper
@@ -15,11 +16,12 @@ import cv2
 from tqdm import tqdm
 import optuna
 import signal
+import time
 
-# Global variable for the model
+# Global variables for the model
 current_model = None
-global_logger = None  # We'll set this in train
-global_model_path = None  # We'll set this in train
+global_logger = None
+global_model_path = None
 
 # Emergency save handler
 def emergency_save_handler(signum, frame):
@@ -35,12 +37,9 @@ def emergency_save_handler(signum, frame):
             global_logger.info("No model available for emergency save.")
         else:
             print("No model available for emergency save.")
-    # Note: We can't close env here because it's not globally accessible yet
     sys.exit(0)
 
-# Register the signal handler at the start of the file
 signal.signal(signal.SIGINT, emergency_save_handler)
-
 
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
@@ -72,12 +71,14 @@ class SimpleCNN(BaseFeaturesExtractor):
         projectile_vec_size = observation_space["projectile_vectors"].shape[0]
         enemy_proximity_size = observation_space["enemy_proximity"].shape[0]
         boss_info_size = observation_space["boss_info"].shape[0]
+        enemy_attack_states_size = observation_space["enemy_attack_states"].shape[0]
         
         self.linear = nn.Sequential(
             nn.Linear(
                 n_flatten + enemy_vec_size + enemy_types_size + enemy_history_size +
                 enemy_timers_size + enemy_patterns_size + combat_status_size +
-                projectile_vec_size + enemy_proximity_size + boss_info_size,
+                projectile_vec_size + enemy_proximity_size + boss_info_size +
+                enemy_attack_states_size,
                 512
             ),
             nn.ReLU(),
@@ -96,6 +97,7 @@ class SimpleCNN(BaseFeaturesExtractor):
         projectile_vectors = observations["projectile_vectors"]
         enemy_proximity = observations["enemy_proximity"]
         boss_info = observations["boss_info"]
+        enemy_attack_states = observations["enemy_attack_states"]
         
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport).float()
@@ -117,6 +119,8 @@ class SimpleCNN(BaseFeaturesExtractor):
             enemy_proximity = torch.from_numpy(enemy_proximity).float()
         if isinstance(boss_info, np.ndarray):
             boss_info = torch.from_numpy(boss_info).float()
+        if isinstance(enemy_attack_states, np.ndarray):
+            enemy_attack_states = torch.from_numpy(enemy_attack_states).float()
             
         if len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0)
@@ -127,13 +131,14 @@ class SimpleCNN(BaseFeaturesExtractor):
         
         for tensor in [enemy_vector, enemy_types, enemy_history, enemy_timers,
                        enemy_patterns, combat_status, projectile_vectors,
-                       enemy_proximity, boss_info]:
+                       enemy_proximity, boss_info, enemy_attack_states]:
             if len(tensor.shape) == 1:
                 tensor = tensor.unsqueeze(0)
             
         combined = torch.cat([
             cnn_output, enemy_vector, enemy_types, enemy_history, enemy_timers,
-            enemy_patterns, combat_status, projectile_vectors, enemy_proximity, boss_info
+            enemy_patterns, combat_status, projectile_vectors, enemy_proximity,
+            boss_info, enemy_attack_states
         ], dim=1)
         return self.linear(combined)
 
@@ -160,7 +165,7 @@ class KungFuWrapper(Wrapper):
         
         self.action_space = spaces.Discrete(len(self.actions))
         self.max_enemies = 4
-        self.history_length = 5
+        self.history_length = 10
         self.max_projectiles = 2
         self.patterns_length = 2
         
@@ -174,7 +179,8 @@ class KungFuWrapper(Wrapper):
             "combat_status": spaces.Box(-1, 1, (2,), np.float32),
             "projectile_vectors": spaces.Box(-255, 255, (self.max_projectiles * 4,), np.float32),
             "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
-            "boss_info": spaces.Box(-255, 255, (3,), np.float32)
+            "boss_info": spaces.Box(-255, 255, (3,), np.float32),
+            "enemy_attack_states": spaces.Box(0, 1, (self.max_enemies,), np.float32)
         })
         
         self.last_hp = 0
@@ -187,10 +193,12 @@ class KungFuWrapper(Wrapper):
         self.enemy_positions = np.zeros((self.max_enemies, 2), dtype=np.float32)
         self.enemy_types = np.zeros(self.max_enemies, dtype=np.float32)
         self.enemy_timers = np.zeros(self.max_enemies, dtype=np.float32)
+        self.enemy_attack_states = np.zeros(self.max_enemies, dtype=np.float32)
         self.boss_info = np.zeros(3, dtype=np.float32)
         self.enemy_patterns = np.zeros((self.max_enemies, self.patterns_length), dtype=np.float32)
         self.last_projectile_positions = []
         self.last_projectile_distances = [float('inf')] * self.max_projectiles
+        self.survival_reward_total = 0
 
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
@@ -204,10 +212,12 @@ class KungFuWrapper(Wrapper):
         self.enemy_positions = np.zeros((self.max_enemies, 2), dtype=np.float32)
         self.enemy_types = np.zeros(self.max_enemies, dtype=np.float32)
         self.enemy_timers = np.zeros(self.max_enemies, dtype=np.float32)
+        self.enemy_attack_states = np.zeros(self.max_enemies, dtype=np.float32)
         self.boss_info = np.zeros(3, dtype=np.float32)
         self.enemy_patterns = np.zeros((self.max_enemies, self.patterns_length), dtype=np.float32)
         self.last_projectile_positions = []
         self.last_projectile_distances = [float('inf')] * self.max_projectiles
+        self.survival_reward_total = 0
         return self._get_obs(obs)
 
     def step(self, action):
@@ -223,11 +233,10 @@ class KungFuWrapper(Wrapper):
         reward = 0
         hp_change_rate = (hp - self.last_hp) / 255.0
         
-        # Apply HP penalty first
         if hp_change_rate < 0:
-            reward += (hp_change_rate ** 2) * 100  # Quadratic penalty
+            reward += (hp_change_rate ** 2) * 500
         else:
-            reward += hp_change_rate * 5  # Healing reward
+            reward += hp_change_rate * 5
 
         reward += enemy_hit * 10
         reward += hp_change_rate * 5
@@ -249,10 +258,17 @@ class KungFuWrapper(Wrapper):
         reward += dodge_reward
         self.last_projectile_distances = projectile_distances
         
+        if hp_change_rate < 0 and action in [5, 6]:
+            reward += 5
+
         action_entropy = -np.sum((self.action_counts / (self.total_steps + 1e-6)) * 
                                  np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
-        reward += action_entropy * 0.1
+        reward += action_entropy * 1.0
         
+        if not done and hp > 0:
+            reward += 0.1
+            self.survival_reward_total += 0.1
+
         self.last_hp = hp
         self.last_hp_change = hp_change_rate
         self.last_enemies = curr_enemies
@@ -262,7 +278,8 @@ class KungFuWrapper(Wrapper):
             "enemy_hit": enemy_hit,
             "action_percentages": self.action_counts / (self.total_steps + 1e-6),
             "action_names": self.action_names,
-            "dodge_reward": dodge_reward
+            "dodge_reward": dodge_reward,
+            "survival_reward_total": self.survival_reward_total
         })
         
         return self._get_obs(obs), reward, done, info
@@ -272,6 +289,7 @@ class KungFuWrapper(Wrapper):
         new_positions = np.zeros((self.max_enemies, 2), dtype=np.float32)
         new_types = np.zeros(self.max_enemies, dtype=np.float32)
         new_timers = np.zeros(self.max_enemies, dtype=np.float32)
+        new_attack_states = np.zeros(self.max_enemies, dtype=np.float32)
         
         stage = int(ram[0x0058])
         for i, (pos_addr, action_addr, timer_addr) in enumerate([
@@ -294,6 +312,7 @@ class KungFuWrapper(Wrapper):
                     new_types[i] = 5 if stage == 5 else 0
                 new_positions[i] = [enemy_x, 50]
                 new_timers[i] = min(enemy_timer / 60.0, 1.0)
+                new_attack_states[i] = 1.0 if enemy_action in [0x01, 0x02] else 0.0
         
         for i in range(self.max_enemies):
             if new_types[i] != 0:
@@ -307,6 +326,7 @@ class KungFuWrapper(Wrapper):
         self.enemy_positions = new_positions
         self.enemy_types = new_types
         self.enemy_timers = new_timers
+        self.enemy_attack_states = new_attack_states
 
     def _update_boss_info(self, ram):
         stage = int(ram[0x0058])
@@ -394,6 +414,7 @@ class KungFuWrapper(Wrapper):
         projectile_vectors = np.array(self._detect_projectiles(obs), dtype=np.float32)
         enemy_proximity = np.array([1.0 if any(abs(enemy_x - hero_x) <= 20 for enemy_x in [int(ram[addr]) for addr in [0x008E, 0x008F, 0x0090, 0x0091]] if enemy_x != 0) else 0.0], dtype=np.float32)
         boss_info = self.boss_info
+        enemy_attack_states = self.enemy_attack_states
         
         return {
             "viewport": viewport.astype(np.uint8),
@@ -405,24 +426,27 @@ class KungFuWrapper(Wrapper):
             "combat_status": combat_status,
             "projectile_vectors": projectile_vectors,
             "enemy_proximity": enemy_proximity,
-            "boss_info": boss_info
+            "boss_info": boss_info,
+            "enemy_attack_states": enemy_attack_states
         }
 
 class SaveBestModelCallback(BaseCallback):
     def __init__(self, save_path, verbose=1):
         super(SaveBestModelCallback, self).__init__(verbose)
         self.save_path = save_path
-        self.best_hits = 0
+        self.best_score = 0
 
     def _on_step(self) -> bool:
         infos = self.locals.get('infos', [{}])
         total_hits = sum([info.get('enemy_hit', 0) for info in infos])
+        total_hp = sum([info.get('hp', 0) for info in infos])
+        score = total_hits * 10 + total_hp / 255.0
         
-        if total_hits > self.best_hits:
-            self.best_hits = total_hits
+        if score > self.best_score:
+            self.best_score = score
             self.model.save(self.save_path)
             if self.verbose > 0:
-                print(f"Saved best model with {self.best_hits} enemy hits at step {self.num_timesteps}")
+                print(f"Saved best model with score {self.best_score} (hits: {total_hits}, HP: {total_hp}) at step {self.num_timesteps}")
         return True
 
 def setup_logging(log_dir):
@@ -445,72 +469,64 @@ def train(args):
     global_logger = setup_logging(args.log_dir)
     global_logger.info("Starting training session")
     global_model_path = args.model_path
-    current_model = None  # Reset at start of training
+    current_model = None
 
-    logger = setup_logging(args.log_dir)
-    logger.info("Starting training session")
-
-
-    # Common environment and policy setup
+    # Setup environment
     env = SubprocVecEnv([make_env for _ in range(args.num_envs)])
     env = VecFrameStack(env, n_stack=12)
     
-    # policy set up
+    # Policy setup
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
-        "net_arch": dict(
-            pi=[256, 256, 128],
-            vf=[512, 512, 256]
-        )
+        "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])
     }
+    learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
 
     # Optuna study configuration
     study_name = "kungfu_ppo_study"
     storage_name = f"sqlite:///{args.log_dir}/optuna_study.db"
 
-    # Function to load or create study
     def get_study():
         try:
             study = optuna.load_study(study_name=study_name, storage=storage_name)
-            logger.info(f"Loaded existing study '{study_name}' from database with {len(study.trials)} trials")
+            global_logger.info(f"Loaded existing study '{study_name}' with {len(study.trials)} trials")
             return study
         except KeyError:
-            logger.info(f"Study '{study_name}' not found. Creating new study.")
+            global_logger.info(f"Study '{study_name}' not found. Creating new study.")
             return optuna.create_study(study_name=study_name, storage=storage_name, direction="maximize")
 
-    # Function to get best hyperparameters with fallback to defaults
     def get_best_params(study=None):
         default_params = {
-            "learning_rate": args.learning_rate,
+            "learning_rate": learning_rate_schedule,
             "clip_range": args.clip_range,
-            "ent_coef": args.ent_coef,
-            "n_steps": 2048,
+            "ent_coef": 0.1,
+            "n_steps": min(2048, args.timesteps // args.num_envs),  # Adjust n_steps to respect timesteps
             "batch_size": 64,
             "n_epochs": 10
         }
         if study and len(study.trials) > 0 and study.best_trial is not None:
-            logger.info(f"Using best parameters from study with value {study.best_value}")
-            return study.best_params
-        logger.info("No previous trials found in study, using defaults")
+            global_logger.info(f"Using best parameters from study with value {study.best_value}")
+            best_params = study.best_params
+            best_params["learning_rate"] = learning_rate_schedule
+            best_params["ent_coef"] = 0.1
+            best_params["n_steps"] = min(best_params["n_steps"], args.timesteps // args.num_envs)
+            return best_params
+        global_logger.info("No previous trials found in study, using defaults")
         return default_params
 
-    # Optuna objective function
     def objective(trial):
-        # obj best param
         params = {
-            "learning_rate": trial.suggest_loguniform("learning_rate", 1e-5, 1e-2),
+            "learning_rate": learning_rate_schedule,
             "clip_range": trial.suggest_uniform("clip_range", 0.1, 0.3),
-            "ent_coef": trial.suggest_loguniform("ent_coef", 1e-8, 1e-1),
-            "n_steps": trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096]),
+            "ent_coef": 0.1,
+            "n_steps": min(trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096]), args.timesteps // args.num_envs),
             "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
             "n_epochs": trial.suggest_int("n_epochs", 3, 10)
         }
 
-        # multi vec and frame stack
         trial_env = SubprocVecEnv([make_env for _ in range(args.num_envs)])
         trial_env = VecFrameStack(trial_env, n_stack=12)
 
-        # ppo model
         model = PPO(
             "MultiInputPolicy",
             trial_env,
@@ -518,55 +534,47 @@ def train(args):
             gamma=0.99,
             gae_lambda=0.95,
             verbose=0,
-            tensorboard_log=args.tensorboard_log,
             policy_kwargs=policy_kwargs,
             device="cuda" if args.cuda else "cpu"
         )
 
-        # save best model call back
         callback = SaveBestModelCallback(save_path=f"{args.model_path}_trial_{trial.number}")
-        # model learn
         model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
 
-        total_hits = callback.best_hits
-        logger.info(f"Trial {trial.number} finished with {total_hits} enemy hits")
+        total_hits = callback.best_score
+        global_logger.info(f"Trial {trial.number} finished with score {total_hits}")
+        
+        # Clean up trial environment
         trial_env.close()
-
+        del model
+        if args.cuda:
+            torch.cuda.empty_cache()
+        
         return total_hits
 
     # Load or create study
     study = get_study()
     best_params = get_best_params(study)
 
-    # Check if resuming or starting fresh
+    # Training logic
     if args.resume and os.path.exists(args.model_path + ".zip"):
- 
-        # resume
-        logger.info(f"Resuming training from {args.model_path}")
-        # resume we load again
+        global_logger.info(f"Resuming training from {args.model_path}")
         model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
         current_model = model
-
-        # all the best param
-        # Update only compatible parameters, avoid overriding clip_range directly
         model.learning_rate = best_params["learning_rate"]
         model.ent_coef = best_params["ent_coef"]
         model.n_steps = best_params["n_steps"]
         model.batch_size = best_params["batch_size"]
         model.n_epochs = best_params["n_epochs"]
-        model.tensorboard_log = args.tensorboard_log
-        # Note: We don't set model.clip_range here to preserve the loaded model's configuration
     else:
-        logger.info("Starting new training session")
-        # Run Optuna optimization with specified trials
-        logger.info(f"Running Optuna optimization with {args.n_trials} trials")
+        global_logger.info("Starting new training session")
+        global_logger.info(f"Running Optuna optimization with {args.n_trials} trials")
         study.optimize(objective, n_trials=args.n_trials)
-        best_params = get_best_params(study)  # Update best_params after optimization
-        logger.info(f"Best trial: {study.best_trial.number}")
-        logger.info(f"Best value (enemy hits): {study.best_value}")
-        logger.info(f"Best hyperparameters: {study.best_params}")
+        best_params = get_best_params(study)
+        global_logger.info(f"Best trial: {study.best_trial.number}")
+        global_logger.info(f"Best value (score): {study.best_value}")
+        global_logger.info(f"Best hyperparameters: {study.best_params}")
 
-        # Create new model with best params
         model = PPO(
             "MultiInputPolicy",
             env,
@@ -576,36 +584,52 @@ def train(args):
             n_epochs=best_params["n_epochs"],
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=best_params["clip_range"],  # Set as static float here
+            clip_range=best_params["clip_range"],
             ent_coef=best_params["ent_coef"],
             verbose=1,
-            tensorboard_log=args.tensorboard_log,
             policy_kwargs=policy_kwargs,
             device="cuda" if args.cuda else "cpu"
         )
-
         current_model = model
 
     # Train the model
     callback = SaveBestModelCallback(save_path=args.model_path)
+    shutdown_start_time = time.time()
     model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
-    model.save(args.model_path)
-    logger.info(f"Training completed. Model saved at {args.model_path}")
 
+    # Cleanup
+    global_logger.info("Training completed. Starting cleanup...")
+    model.save(args.model_path)
+    global_logger.info("Model saved.")
+    
+    del model
+    current_model = None
+    
+    global_logger.info("Closing environment...")
     env.close()
+    time.sleep(1)  # Brief pause to ensure subprocesses terminate
+    
+    if args.cuda:
+        torch.cuda.empty_cache()
+        global_logger.info("GPU memory cleared.")
+    
+    global_logger.info("Shutdown complete.")
+    shutdown_time = time.time() - shutdown_start_time
+    global_logger.info(f"Shutdown took {shutdown_time:.2f} seconds")
+    
+    logging.shutdown()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with Optuna optimization")
     parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo_best", help="Path to save the trained model")
-    parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps for training")
+    parser.add_argument("--timesteps", type=int, default=10000, help="Total timesteps for training")
     parser.add_argument("--learning_rate", type=float, default=2.5e-4, help="Default learning rate for PPO")
     parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO")
     parser.add_argument("--ent_coef", type=float, default=0.01, help="Default entropy coefficient for PPO")
-    parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
+    parser.add_argument("--num_envs", type=int, default=8, help="Number of parallel environments")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
-    parser.add_argument("--tensorboard_log", default="tensorboard_logs", help="Directory for TensorBoard logs")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs and Optuna database")
     parser.add_argument("--n_trials", type=int, default=1, help="Number of Optuna trials for hyperparameter tuning")
     
