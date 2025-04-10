@@ -1,3 +1,4 @@
+# capture.py
 import retro
 import numpy as np
 import os
@@ -6,22 +7,35 @@ import json
 import cv2
 from pynput import keyboard
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecFrameStack, DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from kungfu_env import KungFuWrapper, SimpleCNN
 
 class TrainingCapturer:
     def __init__(self):
         base_env = retro.make('KungFu-Nes')
         self.env = KungFuWrapper(base_env)
-        self.env = DummyVecEnv([lambda: self.env])  # Vectorize
-        self.env = VecFrameStack(self.env, n_stack=12)  # Match training
-        # [Rest of __init__ unchanged]
+        self.env = DummyVecEnv([lambda: self.env])  # Vectorize for PPO compatibility
+        self.env = VecFrameStack(self.env, n_stack=12)  # Match training with 12 stacked frames
+        self.save_dir = 'training_data'
+        self.state_dir = 'saved_states'
+        self.model_dir = 'models/kungfu_ppo'
+        
+        os.makedirs(self.save_dir, exist_ok=True)
+        os.makedirs(self.state_dir, exist_ok=True)
+        os.makedirs(self.model_dir, exist_ok=True)
+        
+        self.recording = False
+        self.current_segment = []
+        self.segment_id = self._get_next_id(self.save_dir)
+        self.state_id = self._get_next_id(self.state_dir)
+        self.ai_playing = False  # Ensure this is initialized
+        self.model = self._load_ai_model()
+        self._init_controls()
 
     def _get_next_id(self, directory):
-        """Get the next available ID number for saving"""
         try:
             existing = [int(f.split('_')[1].split('.')[0]) 
-                      for f in os.listdir(directory) if f.startswith('segment_')]
+                       for f in os.listdir(directory) if f.startswith('segment_')]
             return max(existing) + 1 if existing else 0
         except Exception:
             return 0
@@ -40,11 +54,14 @@ class TrainingCapturer:
         model_path = os.path.join(self.model_dir, 'kungfu_ppo_best.zip')
         if os.path.exists(model_path):
             print(f"Loading AI model from {model_path}")
-            policy_kwargs = {"features_extractor_class": SimpleCNN}
+            policy_kwargs = {
+                "features_extractor_class": SimpleCNN,
+                "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])  # Match train.py
+            }
             return PPO.load(model_path, env=self.env, custom_objects={"policy_kwargs": policy_kwargs})
         print(f"No AI model found at {model_path}")
         return None
-    
+
     def toggle_ai(self):
         if self.model:
             self.ai_playing = not self.ai_playing
@@ -66,7 +83,7 @@ class TrainingCapturer:
 
     def save_game_state(self):
         state_path = os.path.join(self.state_dir, f"state_{self.state_id}.state")
-        self.env.save_state(state_path)
+        self.env.envs[0].save_state(state_path)  # Access the underlying RetroEnv
         print(f"💾 Saved game state {self.state_id}")
         self.state_id += 1
 
@@ -74,7 +91,7 @@ class TrainingCapturer:
         load_id = max(0, self.state_id - 1)
         state_path = os.path.join(self.state_dir, f"state_{load_id}.state")
         if os.path.exists(state_path):
-            self.env.load_state(state_path)
+            self.env.envs[0].load_state(state_path)  # Access the underlying RetroEnv
             print(f"🔃 Loaded game state {load_id}")
         else:
             print("❌ No saved states found!")
@@ -82,18 +99,16 @@ class TrainingCapturer:
     def _process_frame(self, obs):
         """Process observation for AI input"""
         if isinstance(obs, dict):
-            return obs  # Return the full Dict observation
+            return obs  # Return the full Dict observation for the model
         return obs
-    
+
     def _save_segment(self):
         if len(self.current_segment) > 0:
-            # Save frames and actions
             segment_path = os.path.join(self.save_dir, f"segment_{self.segment_id}.npz")
             frames = np.array([f[0] for f in self.current_segment])
             actions = np.array([f[1] for f in self.current_segment])
             np.savez(segment_path, frames=frames, actions=actions)
             
-            # Save metadata
             metadata = {
                 'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
                 'num_frames': len(self.current_segment),
@@ -155,10 +170,8 @@ class TrainingCapturer:
         self.env.reset()
         try:
             while True:
-                # Get action (AI or human)
                 if self.ai_playing and self.model:
-                    frame = self._process_frame(self.env.get_screen())
-                    action, _ = self.model.predict(frame)
+                    action, _ = self.model.predict(self._process_frame(self.env.get_obs()))
                 else:
                     action = [
                         int(self.controls['up']),
@@ -169,14 +182,11 @@ class TrainingCapturer:
                         int(self.controls['s'])
                     ]
 
-                # Step environment
                 obs, _, done, _ = self.env.step(action)
 
-                # Record if enabled
                 if self.recording:
                     self.current_segment.append((self._process_frame(obs), action))
 
-                # Render at consistent speed
                 self.env.render()
                 time.sleep(0.02)  # ~50 FPS
 

@@ -7,6 +7,8 @@ python train.py --num_envs 4 --cuda --progress_bar --resume --timesteps 10000
 python play.py
 
 
+python capture.py
+
 
 tensorboard --logdir=tensorboard_logs
 
