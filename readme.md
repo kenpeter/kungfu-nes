@@ -55,3 +55,13 @@ python train.py --play --render --state_only --state_file knife_state.state --en
 
 ===
 
+
+
+        print("Controls:")
+        print("R - Start recording segment")
+        print("S - Stop recording segment")
+        print("P - Save game state")
+        print("L - Load last state")
+        print("M - Toggle AI control")
+        print("+/- - Increase/Decrease game speed")
+        print("Q - Quit")
