@@ -7,18 +7,52 @@ import pyglet
 from pyglet import clock
 from pyglet.window import key as keycodes
 from pyglet.gl import *
+import ctypes  # Added for OpenGL texture handling
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
-from kungfu_env import KungFuWrapper  # Assuming this is your custom wrapper
+import gym  # Added for base gym.Wrapper
+
+# Placeholder KungFuWrapper; replace with your actual implementation
+class KungFuWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        return obs
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        return obs, reward, done, info
+
+    def get_screen(self):
+        """Returns the current screen as a 3D array [height, width, 3]."""
+        return self.env.get_screen()
 
 class KungFuRecorder:
     def __init__(self, game, state, save_dir='training_data', state_dir='saved_states'):
+        """
+        Initialize the KungFuRecorder with environment and display setup.
+
+        Args:
+            game (str): The retro game to load (e.g., 'KungFu-Nes').
+            state (str): The initial state of the game.
+            save_dir (str): Directory to save recorded segments.
+            state_dir (str): Directory to save game states.
+        """
         # Initialize retro environment
         base_env = retro.make(game=game, state=state, use_restricted_actions=retro.Actions.ALL)
         self.env = KungFuWrapper(base_env)
         self.env = DummyVecEnv([lambda: self.env])
-        self.env = VecFrameStack(self.env, n_stack=12)  # Match your training setup
+        self.env = VecFrameStack(self.env, n_stack=12)  # Stack 12 frames for training
         
-        # Directories
+        # Access the base environment (KungFuWrapper) for raw screen data
+        self.base_env = self.env.venv.envs[0]
+        
+        # Get screen dimensions from the raw screen
+        screen = self.base_env.get_screen()  # Shape: [height, width, 3]
+        self.screen_height, self.screen_width = screen.shape[:2]
+        
+        # Set up directories
         self.save_dir = save_dir
         self.state_dir = state_dir
         os.makedirs(self.save_dir, exist_ok=True)
@@ -30,17 +64,15 @@ class KungFuRecorder:
         self.segment_id = self._get_next_id(self.save_dir)
         self.state_id = self._get_next_id(self.state_dir)
         
-        # Window setup
-        obs = self.env.reset()
-        # Assuming 'screen' is the key for the image data; adjust based on your KungFuWrapper
-        screen_data = obs['screen'] if 'screen' in obs else list(obs.values())[0]  # Fallback to first value
-        self.screen_height, self.screen_width = screen_data.shape[1:3]  # [n_stack, height, width, channels]
-        
-        self.win = pyglet.window.Window(width=800, height=800 * self.screen_height // self.screen_width)
+        # Set up Pyglet window for display
+        self.win = pyglet.window.Window(
+            width=800,
+            height=800 * self.screen_height // self.screen_width
+        )
         self.key_handler = pyglet.window.key.KeyStateHandler()
         self.win.push_handlers(self.key_handler)
         
-        # OpenGL texture setup
+        # Set up OpenGL texture for rendering
         glEnable(GL_TEXTURE_2D)
         self.texture_id = GLuint(0)
         glGenTextures(1, ctypes.byref(self.texture_id))
@@ -48,33 +80,46 @@ class KungFuRecorder:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
         
-        # Control states
-        self.controls = {'up': False, 'down': False, 'left': False, 'right': False, 'a': False, 's': False}
+        # Initialize control states
+        self.controls = {
+            'up': False, 'down': False, 'left': False, 'right': False,
+            'a': False, 's': False
+        }
 
     def _get_next_id(self, directory):
+        """Determine the next available ID for segments or states."""
         try:
-            existing = [int(f.split('_')[1].split('.')[0]) 
-                       for f in os.listdir(directory) if f.startswith('segment_') or f.startswith('state_')]
+            existing = [
+                int(f.split('_')[1].split('.')[0])
+                for f in os.listdir(directory)
+                if f.startswith('segment_') or f.startswith('state_')
+            ]
             return max(existing) + 1 if existing else 0
         except Exception:
             return 0
 
-    def _update_texture(self, obs):
-        # Extract screen data from dict; adjust key as needed
-        screen_data = obs['screen'] if 'screen' in obs else list(obs.values())[0]
-        frame = screen_data[0, :, :, :3]  # Use first frame, drop extra channels if any
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, self.screen_width, self.screen_height, 0, GL_RGB, GL_UNSIGNED_BYTE, frame.tobytes())
+    def _update_texture(self):
+        """Update the OpenGL texture with the current screen data."""
+        screen = self.base_env.get_screen()  # Shape: [height, width, 3]
+        glTexImage2D(
+            GL_TEXTURE_2D, 0, GL_RGB,
+            self.screen_width, self.screen_height,
+            0, GL_RGB, GL_UNSIGNED_BYTE,
+            screen.tobytes()
+        )
 
     def _save_segment(self):
+        """Save the current recorded segment to a .npz file."""
         if len(self.current_segment) > 0:
             segment_path = os.path.join(self.save_dir, f"segment_{self.segment_id}.npz")
-            frames = np.array([f[0] for f in self.current_segment])  # Full dict saved
+            frames = np.array([f[0] for f in self.current_segment])  # Stacked observations
             actions = np.array([f[1] for f in self.current_segment])
             np.savez(segment_path, frames=frames, actions=actions)
             print(f"💿 Saved segment {self.segment_id} ({len(self.current_segment)} frames)")
             self.segment_id += 1
 
     def run(self):
+        """Run the recording loop with environment interaction and display."""
         print("🕹️ KUNG FU RECORDER CONTROLS:")
         print("↑ ↓ ← → : Move/Jump/Duck | A: Punch | S: Kick")
         print("R: Start/Stop recording | O: Save state | P: Load state | Q: Quit")
@@ -96,7 +141,7 @@ class KungFuRecorder:
         while not self.win.has_exit:
             self.win.dispatch_events()
             
-            # Update controls
+            # Update controls based on keyboard input
             self.controls['up'] = self.key_handler[keycodes.UP]
             self.controls['down'] = self.key_handler[keycodes.DOWN]
             self.controls['left'] = self.key_handler[keycodes.LEFT]
@@ -104,7 +149,7 @@ class KungFuRecorder:
             self.controls['a'] = self.key_handler[keycodes.A]
             self.controls['s'] = self.key_handler[keycodes.S]
 
-            # Handle commands
+            # Handle key commands
             if self.key_handler[keycodes.R]:
                 if self.recording:
                     self.recording = False
@@ -117,7 +162,7 @@ class KungFuRecorder:
                 time.sleep(0.2)  # Debounce
             if self.key_handler[keycodes.O]:
                 state_path = os.path.join(self.state_dir, f"state_{self.state_id}.state")
-                self.env.envs[0].unwrapped.save_state(state_path)
+                self.base_env.env.save_state(state_path)  # Access RetroEnv
                 print(f"💾 Saved state {self.state_id}")
                 self.state_id += 1
                 time.sleep(0.2)
@@ -125,7 +170,7 @@ class KungFuRecorder:
                 load_id = max(0, self.state_id - 1)
                 state_path = os.path.join(self.state_dir, f"state_{load_id}.state")
                 if os.path.exists(state_path):
-                    self.env.envs[0].unwrapped.load_state(state_path)
+                    self.base_env.env.load_state(state_path)
                     obs = self.env.reset()
                     print(f"🔃 Loaded state {load_id}")
                 else:
@@ -134,7 +179,7 @@ class KungFuRecorder:
             if self.key_handler[keycodes.Q]:
                 break
 
-            # Human action
+            # Define action based on controls
             action = [
                 int(self.controls['up']),
                 int(self.controls['down']),
@@ -144,15 +189,15 @@ class KungFuRecorder:
                 int(self.controls['s'])
             ]
 
-            # Step environment
+            # Step the environment
             obs, _, done, _ = self.env.step(action)
             
-            # Record if active
+            # Record frame and action if recording
             if self.recording:
                 self.current_segment.append((obs.copy(), action))
 
-            # Update display
-            self._update_texture(obs)
+            # Update the display
+            self._update_texture()
             pyglet.clock.tick()
             self.win.flip()
 

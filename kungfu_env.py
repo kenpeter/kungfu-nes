@@ -4,7 +4,10 @@ from gym import spaces, Wrapper
 import cv2
 import torch
 import torch.nn as nn
+from stable_baselines3 import PPO
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
+from stable_baselines3.common.monitor import Monitor
 
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
@@ -34,8 +37,8 @@ class KungFuWrapper(Wrapper):
         self.observation_space = spaces.Dict({
             "viewport": spaces.Box(0, 255, (*self.viewport_size, 3), np.uint8),
             "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
-            "combat_status": spaces.Box(-1, 1, (2,), np.float32),
             "projectile_vectors": spaces.Box(-255, 255, (self.max_projectiles * 4,), np.float32),
+            "combat_status": spaces.Box(-1, 1, (2,), np.float32),
             "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
             "boss_info": spaces.Box(-255, 255, (3,), np.float32),
         })
@@ -48,6 +51,8 @@ class KungFuWrapper(Wrapper):
         self.prev_frame = None
         self.last_projectile_distances = [float('inf')] * self.max_projectiles
         self.survival_reward_total = 0
+        self.reward_mean = 0
+        self.reward_std = 1
 
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
@@ -61,7 +66,6 @@ class KungFuWrapper(Wrapper):
         self.survival_reward_total = 0
         return self._get_obs(obs)
 
-    # save this version. it is good.
     def step(self, action):
         self.total_steps += 1
         self.action_counts[action] += 1
@@ -76,7 +80,7 @@ class KungFuWrapper(Wrapper):
         hp_change_rate = (hp - self.last_hp) / 255.0
         
         if hp_change_rate < 0:
-            reward += (hp_change_rate ** 2) * 500
+            reward += (hp_change_rate ** 2) * 50
         else:
             reward += hp_change_rate * 5
 
@@ -97,13 +101,25 @@ class KungFuWrapper(Wrapper):
         if hp_change_rate < 0 and action in [5, 6]:
             reward += 5
 
+        # New: Reward for closing distance to enemies
+        hero_x = int(ram[0x0094])
+        min_enemy_dist = min([abs(enemy_x - hero_x) for enemy_x in curr_enemies if enemy_x != 0] or [255])
+        distance_reward = (255 - min_enemy_dist) * 0.1  # Encourage closing gap
+        reward += distance_reward
+
         action_entropy = -np.sum((self.action_counts / (self.total_steps + 1e-6)) * 
                                 np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
-        reward += action_entropy * 1.0
+        reward += action_entropy * 3.0  # Increased from 2.0 to encourage varied actions
         
         if not done and hp > 0:
-            reward += 0.1
-            self.survival_reward_total += 0.1
+            reward += 0.05
+            self.survival_reward_total += 0.05
+
+        # Reward normalization
+        self.reward_mean = 0.99 * self.reward_mean + 0.01 * reward
+        self.reward_std = 0.99 * self.reward_std + 0.01 * (reward - self.reward_mean) ** 2
+        normalized_reward = (reward - self.reward_mean) / (np.sqrt(self.reward_std) + 1e-6)
+        normalized_reward = np.clip(normalized_reward, -10, 10)
 
         self.last_hp = hp
         self.last_hp_change = hp_change_rate
@@ -115,10 +131,13 @@ class KungFuWrapper(Wrapper):
             "action_percentages": self.action_counts / (self.total_steps + 1e-6),
             "action_names": self.action_names,
             "dodge_reward": dodge_reward,
-            "survival_reward_total": self.survival_reward_total
+            "distance_reward": distance_reward,
+            "survival_reward_total": self.survival_reward_total,
+            "raw_reward": reward,
+            "normalized_reward": normalized_reward
         })
         
-        return self._get_obs(obs), reward, done, info
+        return self._get_obs(obs), normalized_reward, done, info
 
     def _update_boss_info(self, ram):
         stage = int(ram[0x0058])
@@ -195,7 +214,7 @@ class SimpleCNN(BaseFeaturesExtractor):
         assert isinstance(observation_space, spaces.Dict)
         
         self.cnn = nn.Sequential(
-            nn.Conv2d(36, 64, kernel_size=8, stride=4),  # Changed to 36 channels
+            nn.Conv2d(36, 64, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(64, 128, kernel_size=4, stride=2),
             nn.ReLU(),
@@ -205,7 +224,7 @@ class SimpleCNN(BaseFeaturesExtractor):
         )
         
         with torch.no_grad():
-            sample_input = torch.zeros(1, 36, 84, 84)  # Match 36 channels from VecFrameStack
+            sample_input = torch.zeros(1, 36, 84, 84)
             n_flatten = self.cnn(sample_input).shape[1]
         
         enemy_vec_size = observation_space["enemy_vector"].shape[0]
