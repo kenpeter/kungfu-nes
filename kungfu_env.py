@@ -61,6 +61,7 @@ class KungFuWrapper(Wrapper):
         self.survival_reward_total = 0
         return self._get_obs(obs)
 
+    # save this version. it is good.
     def step(self, action):
         self.total_steps += 1
         self.action_counts[action] += 1
