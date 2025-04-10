@@ -84,15 +84,17 @@ class KungFuWrapper(Wrapper):
         reward = 0
         hp_change_rate = (hp - self.last_hp) / 255.0
         
+        # Health-based rewards
         if hp_change_rate < 0:
-            reward += (hp_change_rate ** 2) * 50
+            reward += (hp_change_rate ** 2) * 50  # Penalize health loss
         else:
-            reward += hp_change_rate * 5
+            reward += hp_change_rate * 5  # Small reward for health gain
 
-        reward += enemy_hit * 10
+        reward += enemy_hit * 10  # Reward for hitting enemies
         if done:
-            reward -= 50
+            reward -= 50  # Penalty for dying
 
+        # Projectile dodging
         projectile_info = self._detect_projectiles(obs)
         projectile_distances = [projectile_info[i] for i in range(0, len(projectile_info), 4)]
         dodge_reward = 0
@@ -104,28 +106,42 @@ class KungFuWrapper(Wrapper):
         self.last_projectile_distances = projectile_distances
         
         if hp_change_rate < 0 and action in [5, 6]:
-            reward += 5
+            reward += 5  # Reward dodging when it prevents damage
 
-        # Simplified distance logic for close combat
+        # Distance-based logic for close combat focus
         hero_x = int(ram[0x0094])
         min_enemy_dist = min([abs(enemy_x - hero_x) for enemy_x in curr_enemies if enemy_x != 0] or [255])
         distance_change = self.prev_min_enemy_dist - min_enemy_dist
         
-        # Simplified close-combat focused rewards
-        close_range_threshold = 30
-        if min_enemy_dist <= close_range_threshold:
-            if action in [1, 2, 8]:  # Punch, Kick, Crouch+Punch
-                reward += 1.0
-        else:
-            distance_reward = distance_change * 0.05  # Encourage closing distance
+        close_range_threshold = 30  # Distance where combat is effective
+        
+        if min_enemy_dist > close_range_threshold:
+            # Far from enemies: Encourage closing the gap quickly
+            distance_reward = distance_change * 0.1  # Increased reward for closing distance
             reward += distance_reward
+            
+            # Penalize non-movement actions when far
+            if action in [1, 2, 7, 8]:  # Punch, Kick, Jump+Punch, Crouch+Punch
+                reward -= 2.0  # Penalty for wasting time on combat actions when too far
+            elif action in [3, 4]:  # Right+Punch, Left+Punch (movement + attack)
+                reward += 0.5  # Small reward for moving toward enemy while attacking
+        else:
+            # Close to enemies: Reward combat actions
+            if action in [1, 2, 8]:  # Punch, Kick, Crouch+Punch
+                reward += 2.0  # Increased reward for effective close combat
+            elif action in [3, 4]:  # Right+Punch, Left+Punch
+                reward += 1.5  # Reward for directional attacks
+            elif action in [0, 5, 6]:  # No-op, Crouch, Jump
+                reward -= 0.5  # Small penalty for not attacking when close
 
         self.prev_min_enemy_dist = min_enemy_dist
 
+        # Action entropy to encourage variety
         action_entropy = -np.sum((self.action_counts / (self.total_steps + 1e-6)) * 
                                 np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
         reward += action_entropy * 3.0
         
+        # Survival reward
         if not done and hp > 0:
             reward += 0.05
             self.survival_reward_total += 0.05
@@ -149,11 +165,11 @@ class KungFuWrapper(Wrapper):
             "distance_reward": distance_reward if 'distance_reward' in locals() else 0,
             "survival_reward_total": self.survival_reward_total,
             "raw_reward": reward,
-            "normalized_reward": normalized_reward
+            "normalized_reward": normalized_reward,
+            "min_enemy_dist": min_enemy_dist
         })
         
         return self._get_obs(obs), normalized_reward, done, info
-
     def _update_boss_info(self, ram):
         stage = int(ram[0x0058])
         if stage == 5:
