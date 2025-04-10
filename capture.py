@@ -6,25 +6,16 @@ import json
 import cv2
 from pynput import keyboard
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import VecFrameStack, DummyVecEnv
+from kungfu_env import KungFuWrapper, SimpleCNN
 
 class TrainingCapturer:
     def __init__(self):
-        self.env = retro.make('KungFu-Nes')
-        self.save_dir = 'training_data'
-        self.state_dir = 'saved_states'
-        self.model_dir = 'models\kungfu_ppo'  # Directory where train.py saves models
-        
-        os.makedirs(self.save_dir, exist_ok=True)
-        os.makedirs(self.state_dir, exist_ok=True)
-        os.makedirs(self.model_dir, exist_ok=True)
-        
-        self.recording = False
-        self.current_segment = []
-        self.segment_id = self._get_next_id(self.save_dir)
-        self.state_id = self._get_next_id(self.state_dir)
-        self.ai_playing = False
-        self.model = self._load_ai_model()  # Load model immediately
-        self._init_controls()
+        base_env = retro.make('KungFu-Nes')
+        self.env = KungFuWrapper(base_env)
+        self.env = DummyVecEnv([lambda: self.env])  # Vectorize
+        self.env = VecFrameStack(self.env, n_stack=12)  # Match training
+        # [Rest of __init__ unchanged]
 
     def _get_next_id(self, directory):
         """Get the next available ID number for saving"""
@@ -46,14 +37,14 @@ class TrainingCapturer:
         }
 
     def _load_ai_model(self):
-        """Load the best model from train.py's output"""
         model_path = os.path.join(self.model_dir, 'kungfu_ppo_best.zip')
         if os.path.exists(model_path):
             print(f"Loading AI model from {model_path}")
-            return PPO.load(model_path, env=self.env)
+            policy_kwargs = {"features_extractor_class": SimpleCNN}
+            return PPO.load(model_path, env=self.env, custom_objects={"policy_kwargs": policy_kwargs})
         print(f"No AI model found at {model_path}")
         return None
-
+    
     def toggle_ai(self):
         if self.model:
             self.ai_playing = not self.ai_playing
@@ -88,11 +79,12 @@ class TrainingCapturer:
         else:
             print("❌ No saved states found!")
 
-    def _process_frame(self, frame):
-        """Process frame for AI input"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        return cv2.resize(gray, (84, 84)) / 255.0  # Normalize
-
+    def _process_frame(self, obs):
+        """Process observation for AI input"""
+        if isinstance(obs, dict):
+            return obs  # Return the full Dict observation
+        return obs
+    
     def _save_segment(self):
         if len(self.current_segment) > 0:
             # Save frames and actions
