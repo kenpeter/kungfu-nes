@@ -36,21 +36,20 @@ class KungFuWrapper(Wrapper):
         self.max_enemies = KUNGFU_MAX_ENEMIES
         self.max_projectiles = 2
         
-        # Updated observation space for 5 enemies
+        # Removed is_distance_enemy from observation space
         self.observation_space = spaces.Dict({
             "viewport": spaces.Box(0, 255, (*self.viewport_size, 3), np.uint8),
-            "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),  # Now 10 dimensions
+            "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
             "projectile_vectors": spaces.Box(-255, 255, (self.max_projectiles * 4,), np.float32),
             "combat_status": spaces.Box(-1, 1, (2,), np.float32),
             "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
             "boss_info": spaces.Box(-255, 255, (3,), np.float32),
-            "is_distance_enemy": spaces.Box(0, 1, (1,), np.float32)
         })
         
         self.last_hp = 0
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
-        self.last_enemies = [0] * self.max_enemies  # Now size 5
+        self.last_enemies = [0] * self.max_enemies
         self.total_steps = 0
         self.prev_frame = None
         self.last_projectile_distances = [float('inf')] * self.max_projectiles
@@ -64,7 +63,7 @@ class KungFuWrapper(Wrapper):
         self.last_hp = float(self.env.get_ram()[0x04A6])
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
-        self.last_enemies = [0] * self.max_enemies  # Now size 5
+        self.last_enemies = [0] * self.max_enemies
         self.total_steps = 0
         self.prev_frame = None
         self.last_projectile_distances = [float('inf')] * self.max_projectiles
@@ -79,7 +78,6 @@ class KungFuWrapper(Wrapper):
         ram = self.env.get_ram()
         
         hp = float(ram[0x04A6])
-        # Updated to track 5 enemies (assuming additional RAM address for 5th enemy)
         curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091]), int(ram[0x0092])]
         enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
 
@@ -108,38 +106,19 @@ class KungFuWrapper(Wrapper):
         if hp_change_rate < 0 and action in [5, 6]:
             reward += 5
 
-        # Distance and enemy type logic
+        # Simplified distance logic for close combat
         hero_x = int(ram[0x0094])
         min_enemy_dist = min([abs(enemy_x - hero_x) for enemy_x in curr_enemies if enemy_x != 0] or [255])
         distance_change = self.prev_min_enemy_dist - min_enemy_dist
         
-        # Infer if closest enemy is a distance enemy
-        is_distance_enemy = 0
-        if any(abs(d) < 100 for d in projectile_distances) or (min_enemy_dist > 50 and hp_change_rate < 0):
-            is_distance_enemy = 1
-
-        # Strategy-based rewards
-        stationary_actions = [0, 1, 2, 5, 6, 8]  # No-op, Punch, Kick, Crouch, Jump, Crouch+Punch
-        movement_actions = [3, 4, 7]  # Right+Punch, Left+Punch, Jump+Punch
+        # Simplified close-combat focused rewards
         close_range_threshold = 30
-        distance_threshold = 50
-
-        if is_distance_enemy:
-            distance_reward = distance_change * 0.1
-            if hp_change_rate < 0:
-                distance_reward *= 2.0
-            distance_reward = min(distance_reward, 3.0)
-            reward += distance_reward
-            
-            if min_enemy_dist > distance_threshold and action in stationary_actions:
-                reward -= 1.5
+        if min_enemy_dist <= close_range_threshold:
+            if action in [1, 2, 8]:  # Punch, Kick, Crouch+Punch
+                reward += 1.0
         else:
-            if min_enemy_dist <= close_range_threshold:
-                if action in [1, 2, 8]:  # Punch, Kick, Crouch+Punch
-                    reward += 1.0
-            else:
-                distance_reward = distance_change * 0.05
-                reward += distance_reward
+            distance_reward = distance_change * 0.05  # Encourage closing distance
+            reward += distance_reward
 
         self.prev_min_enemy_dist = min_enemy_dist
 
@@ -168,7 +147,6 @@ class KungFuWrapper(Wrapper):
             "action_names": self.action_names,
             "dodge_reward": dodge_reward,
             "distance_reward": distance_reward if 'distance_reward' in locals() else 0,
-            "is_distance_enemy": is_distance_enemy,
             "survival_reward_total": self.survival_reward_total,
             "raw_reward": reward,
             "normalized_reward": normalized_reward
@@ -223,13 +201,12 @@ class KungFuWrapper(Wrapper):
 
     def _get_obs(self, obs):
         viewport = cv2.resize(obs, self.viewport_size)
-        ram = self.env.get_ram()  # Returns a NumPy array
+        ram = self.env.get_ram()
         
         hero_x = int(ram[0x0094])
         enemy_info = []
-        # Updated to handle 5 enemies with direct indexing
         for addr in [0x008E, 0x008F, 0x0090, 0x0091, 0x0092]:
-            enemy_x = int(ram[addr])  # Direct indexing into NumPy array
+            enemy_x = int(ram[addr])
             if enemy_x != 0:
                 distance = enemy_x - hero_x
                 direction = 1 if distance > 0 else -1
@@ -237,18 +214,13 @@ class KungFuWrapper(Wrapper):
             else:
                 enemy_info.extend([0, 0])
         
-        projectile_distances = self._detect_projectiles(obs)[::4]
-        min_enemy_dist = min([abs(enemy_x - hero_x) for enemy_x in [int(ram[addr]) for addr in [0x008E, 0x008F, 0x0090, 0x0091, 0x0092]] if enemy_x != 0] or [255])
-        is_distance_enemy = 1.0 if (any(abs(d) < 100 for d in projectile_distances) or (min_enemy_dist > 50 and self.last_hp_change < 0)) else 0.0
-
         return {
             "viewport": viewport.astype(np.uint8),
-            "enemy_vector": np.array(enemy_info, dtype=np.float32),  # Now 10 elements
+            "enemy_vector": np.array(enemy_info, dtype=np.float32),
             "combat_status": np.array([self.last_hp/255.0, self.last_hp_change], dtype=np.float32),
             "projectile_vectors": np.array(self._detect_projectiles(obs), dtype=np.float32),
             "enemy_proximity": np.array([1.0 if any(abs(enemy_x - hero_x) <= 20 for enemy_x in [int(ram[addr]) for addr in [0x008E, 0x008F, 0x0090, 0x0091, 0x0092]] if enemy_x != 0) else 0.0], dtype=np.float32),
             "boss_info": self._update_boss_info(ram),
-            "is_distance_enemy": np.array([is_distance_enemy], dtype=np.float32)
         }
 
 class SimpleCNN(BaseFeaturesExtractor):
@@ -267,18 +239,16 @@ class SimpleCNN(BaseFeaturesExtractor):
             sample_input = torch.zeros(1, 36, 84, 84)
             n_flatten = self.cnn(sample_input).shape[1]
         
-        enemy_vec_size = observation_space["enemy_vector"].shape[0]  # Now 10
+        enemy_vec_size = observation_space["enemy_vector"].shape[0]
         combat_status_size = observation_space["combat_status"].shape[0]
         projectile_vec_size = observation_space["projectile_vectors"].shape[0]
         enemy_proximity_size = observation_space["enemy_proximity"].shape[0]
         boss_info_size = observation_space["boss_info"].shape[0]
-        is_distance_enemy_size = observation_space["is_distance_enemy"].shape[0]
         
         self.linear = nn.Sequential(
             nn.Linear(
                 n_flatten + enemy_vec_size + combat_status_size +
-                projectile_vec_size + enemy_proximity_size + boss_info_size +
-                is_distance_enemy_size,
+                projectile_vec_size + enemy_proximity_size + boss_info_size,
                 512
             ),
             nn.ReLU(),
@@ -293,12 +263,11 @@ class SimpleCNN(BaseFeaturesExtractor):
         projectile_vectors = observations["projectile_vectors"]
         enemy_proximity = observations["enemy_proximity"]
         boss_info = observations["boss_info"]
-        is_distance_enemy = observations["is_distance_enemy"]
         
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport).float()
         for tensor in [enemy_vector, combat_status, projectile_vectors, 
-                      enemy_proximity, boss_info, is_distance_enemy]:
+                      enemy_proximity, boss_info]:
             if isinstance(tensor, np.ndarray):
                 tensor = torch.from_numpy(tensor).float()
                 
@@ -310,13 +279,13 @@ class SimpleCNN(BaseFeaturesExtractor):
         cnn_output = self.cnn(viewport)
         
         for tensor in [enemy_vector, combat_status, projectile_vectors,
-                      enemy_proximity, boss_info, is_distance_enemy]:
+                      enemy_proximity, boss_info]:
             if len(tensor.shape) == 1:
                 tensor = tensor.unsqueeze(0)
                 
         combined = torch.cat([
             cnn_output, enemy_vector, combat_status, projectile_vectors,
-            enemy_proximity, boss_info, is_distance_enemy
+            enemy_proximity, boss_info
         ], dim=1)
         return self.linear(combined)
          
