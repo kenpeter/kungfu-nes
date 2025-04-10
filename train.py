@@ -10,7 +10,7 @@ import logging
 import sys
 import signal
 import time
-from kungfu_env import make_env, SimpleCNN  # Import SimpleCNN too
+from kungfu_env import make_env, SimpleCNN, KUNGFU_MAX_ENEMIES  # Import KUNGFU_MAX_ENEMIES
 
 # Global variables
 current_model = None
@@ -102,22 +102,27 @@ def train(args):
     
     global_logger = setup_logging(args.log_dir)
     global_logger.info(f"Starting training with {args.num_envs} envs and {args.timesteps} timesteps")
+    global_logger.info(f"Maximum number of enemies: {KUNGFU_MAX_ENEMIES}")
     global_model_path = args.model_path
     current_model = None
 
     if args.num_envs < 1:
         raise ValueError("Number of environments must be at least 1")
     
+    # Create environments dynamically using make_env
     env_fns = [make_env for _ in range(args.num_envs)]
     env = SubprocVecEnv(env_fns)
     env = VecFrameStack(env, n_stack=12)
     
+    # Policy kwargs using imported SimpleCNN without hardcoding observation space
     policy_kwargs = {
-        "features_extractor_class": SimpleCNN,  # Use shared SimpleCNN
-        "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])
+        "features_extractor_class": SimpleCNN,
+        "features_extractor_kwargs": {"features_dim": 512},  # Pass features_dim explicitly
+        "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])  # Flexible architecture
     }
     learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
 
+    # Training parameters
     params = {
         "learning_rate": learning_rate_schedule,
         "clip_range": args.clip_range,
@@ -127,6 +132,7 @@ def train(args):
         "n_epochs": 10
     }
 
+    # Load or initialize model
     if args.resume and os.path.exists(args.model_path + ".zip"):
         global_logger.info(f"Resuming training from {args.model_path}")
         old_model = PPO.load(args.model_path, device="cuda" if args.cuda else "cpu")
@@ -156,10 +162,12 @@ def train(args):
         )
         current_model = model
 
+    # Set up callbacks
     save_callback = SaveBestModelCallback(save_path=args.model_path)
     exp_callback = ExperienceCollectionCallback()
     callback = CallbackList([save_callback, exp_callback])
     
+    # Train the model
     model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
     experience_data = exp_callback.experience_data
     
