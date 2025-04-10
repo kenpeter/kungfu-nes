@@ -46,8 +46,10 @@ class KungFuStateCapturer:
             'player_hp': int(ram[self.ram_addrs['player_hp']]),
             'enemies': [int(ram[addr]) for addr in self.ram_addrs['enemies']],
             'boss_hp': int(ram[self.ram_addrs['boss_hp']]) if ram[self.ram_addrs['stage']] == 5 else 0,
-            'player_pos': (int(ram[self.ram_addrs['player_x']]), 
-                          int(ram[self.ram_addrs['player_y']]),
+            'player_pos': (
+                int(ram[self.ram_addrs['player_x']]), 
+                int(ram[self.ram_addrs['player_y']])
+            ),
             'boss_pos': int(ram[self.ram_addrs['boss_x']]) if ram[self.ram_addrs['stage']] == 5 else 0,
             'boss_action': int(ram[self.ram_addrs['boss_action']]) if ram[self.ram_addrs['stage']] == 5 else 0,
             'timestamp': time.time()
@@ -187,8 +189,8 @@ class KungFuStateCapturer:
             current_state = self.get_game_state()
             
             # Detect interesting situations
-            if (self.is_state_interesting(current_state) or \
-               (time.time() - last_capture > capture_interval and self.detect_combat_movement(obs)):
+            if self.is_state_interesting(current_state) or \
+            (time.time() - last_capture > capture_interval and self.detect_combat_movement(obs)):
                 desc = self.generate_state_description(current_state)
                 self.capture_state(state_id, desc)
                 state_id += 1
