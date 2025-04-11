@@ -25,11 +25,13 @@ class KungFuWrapper(Wrapper):
             [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch (5)
             [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump (6)
             [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch (7)
-            [0,0,1,0,0,0,1,0,0,0,0,0]   # Crouch+Punch (8)
+            [0,0,1,0,0,0,1,0,0,0,0,0],  # Crouch+Punch (8)
+            [1,0,0,0,0,0,0,0,0,0,0,0],  # Right (9)
+            [0,1,0,0,0,0,0,0,0,0,0,0]   # Left (10)
         ]
         self.action_names = [
             "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
-            "Crouch", "Jump", "Jump+Punch", "Crouch+Punch"
+            "Crouch", "Jump", "Jump+Punch", "Crouch+Punch", "Right", "Left"
         ]
         
         self.action_space = spaces.Discrete(len(self.actions))
@@ -43,7 +45,7 @@ class KungFuWrapper(Wrapper):
             "combat_status": spaces.Box(-1, 1, (2,), np.float32),
             "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
             "boss_info": spaces.Box(-255, 255, (3,), np.float32),
-            "closest_enemy_direction": spaces.Box(-1, 1, (1,), np.float32)  # New field
+            "closest_enemy_direction": spaces.Box(-1, 1, (1,), np.float32)
         })
         
         self.last_hp = 0
@@ -124,31 +126,36 @@ class KungFuWrapper(Wrapper):
         
         if min_enemy_dist > close_range_threshold:
             # Far from enemies: Encourage closing the gap
-            distance_reward = distance_change * 0.2  # Increased to emphasize movement
+            distance_reward = distance_change * 0.2
             reward += distance_reward
             
             # Strongly penalize attack actions when far
             if action in [1, 2, 7, 8]:  # Punch, Kick, Jump+Punch, Crouch+Punch
-                reward -= 3.0  # Heavier penalty to discourage attacks
-            elif action in [3, 4]:  # Right+Punch, Left+Punch (movement actions)
-                # Reward moving toward closest enemy, penalize punch component
+                reward -= 3.0
+            elif action in [3, 4]:  # Right+Punch, Left+Punch
                 if (action == 3 and closest_enemy_dir == 1) or (action == 4 and closest_enemy_dir == -1):
-                    reward += 2.0  # Reward correct direction
-                    reward -= 0.5  # Small penalty for punching instead of pure movement
+                    reward += 1.5  # Reduced reward since pure movement is better
+                    reward -= 0.5  # Penalty for punching
                 else:
-                    reward -= 1.5  # Penalty for moving wrong way
+                    reward -= 1.5
+            elif action in [9, 10]:  # Right, Left
+                if (action == 9 and closest_enemy_dir == 1) or (action == 10 and closest_enemy_dir == -1):
+                    reward += 2.5  # Strong reward for moving toward enemy
+                else:
+                    reward -= 1.0  # Penalty for moving away
             elif action in [0, 5, 6]:  # No-op, Crouch, Jump
-                reward -= 1.0  # Penalize staying still
+                reward -= 1.0
         else:
             # Close to enemies: Reward combat actions
             if action in [1, 2, 8]:  # Punch, Kick, Crouch+Punch
                 reward += 2.0
             elif action in [3, 4]:  # Right+Punch, Left+Punch
-                # Reward directional attacks toward closest enemy
                 if (action == 3 and closest_enemy_dir == 1) or (action == 4 and closest_enemy_dir == -1):
                     reward += 2.5
                 else:
-                    reward += 0.5  # Less reward for wrong direction
+                    reward += 0.5
+            elif action in [9, 10]:  # Right, Left
+                reward -= 0.5  # Discourage pure movement when close
             elif action in [0, 5, 6]:  # No-op, Crouch, Jump
                 reward -= 0.5
 
