@@ -1,6 +1,3 @@
-python train.py --num_envs 4 --cuda --progress_bar --timesteps 10000
-
-
 python train.py --num_envs 4 --cuda --progress_bar --resume --timesteps 10000
 
 
@@ -70,3 +67,10 @@ python train.py --play --render --state_only --state_file knife_state.state --en
         print("M - Toggle AI control")
         print("+/- - Increase/Decrease game speed")
         print("Q - Quit")
+
+
+
+==
+
+
+python capture.py --game KungFu-Nes --state 1Player.Level1
