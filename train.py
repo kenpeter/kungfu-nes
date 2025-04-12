@@ -169,7 +169,7 @@ def train(args):
     env = SubprocVecEnv(env_fns)
     
     # Frame stacking without automatic transposition
-    env = VecFrameStack(env, n_stack=12, channels_order='last')
+    env = VecFrameStack(env, n_stack=4, channels_order='last')
 
     # Disable automatic image transposition
     from stable_baselines3.common.vec_env import VecNormalize
@@ -179,7 +179,7 @@ def train(args):
     # Policy kwargs using imported SimpleCNN
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
-        "features_extractor_kwargs": {"features_dim": 512, "n_stack": 12},  # Pass n_stack explicitly
+        "features_extractor_kwargs": {"features_dim": 512, "n_stack": 4},  # Pass n_stack explicitly
         "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])  # Flexible architecture
     }
     learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)

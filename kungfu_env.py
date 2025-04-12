@@ -257,7 +257,7 @@ class KungFuWrapper(Wrapper):
         }
 
 class SimpleCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=512, n_stack=12):
+    def __init__(self, observation_space, features_dim=512, n_stack=4):
         super().__init__(observation_space, features_dim)
         viewport_shape = observation_space["viewport"].shape  # (H, W, 3*n_stack)
         height, width = viewport_shape[0], viewport_shape[1]
@@ -265,11 +265,11 @@ class SimpleCNN(BaseFeaturesExtractor):
 
         # Adjusted CNN architecture for 224x240 resolution
         self.cnn = nn.Sequential(
-            nn.Conv2d(input_channels, 64, kernel_size=5, stride=2),
+            nn.Conv2d(input_channels, 64, kernel_size=5, stride=2, padding=2),
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(128, 256, kernel_size=3, stride=1),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.Flatten(),
         )
