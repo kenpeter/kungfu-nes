@@ -164,10 +164,17 @@ def train(args):
     if args.num_envs < 1:
         raise ValueError("Number of environments must be at least 1")
     
-    # Create environments dynamically using make_env
+    # Create environments
     env_fns = [make_env for _ in range(args.num_envs)]
     env = SubprocVecEnv(env_fns)
-    env = VecFrameStack(env, n_stack=12)
+    
+    # Frame stacking without automatic transposition
+    env = VecFrameStack(env, n_stack=12, channels_order='last')
+
+    # Disable automatic image transposition
+    from stable_baselines3.common.vec_env import VecNormalize
+    if isinstance(env, VecNormalize):
+        env = VecNormalize(env, norm_obs=False, norm_reward=False)
     
     # Policy kwargs using imported SimpleCNN
     policy_kwargs = {

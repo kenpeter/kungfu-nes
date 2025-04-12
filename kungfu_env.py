@@ -14,7 +14,13 @@ KUNGFU_MAX_ENEMIES = 5
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.viewport_size = (84, 84)
+        # First get the actual frame dimensions
+        test_frame = env.reset()
+        self.true_height, self.true_width = test_frame.shape[:2]
+        
+        # Set viewport size to match actual frame dimensions
+        self.viewport_size = (self.true_width, self.true_height)
+        
         self.actions = [
             [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (0)
             [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (1)
@@ -36,7 +42,7 @@ class KungFuWrapper(Wrapper):
         self.max_enemies = KUNGFU_MAX_ENEMIES
         self.max_projectiles = 2
         self.observation_space = spaces.Dict({
-            "viewport": spaces.Box(0, 255, (*self.viewport_size, 3), np.uint8),
+            "viewport": spaces.Box(0, 255, (self.true_height, self.true_width, 3), np.uint8),
             "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
             "projectile_vectors": spaces.Box(-255, 255, (self.max_projectiles * 4,), np.float32),
             "combat_status": spaces.Box(-1, 1, (2,), np.float32),
@@ -192,7 +198,7 @@ class KungFuWrapper(Wrapper):
         return np.zeros(3, dtype=np.float32)
 
     def _detect_projectiles(self, obs):
-        frame = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
+        frame = obs  # No resizing needed now since we're using full frame
         if self.prev_frame is not None:
             frame_diff = cv2.absdiff(frame, self.prev_frame)
             diff_sum = np.sum(frame_diff, axis=2).astype(np.uint8)
@@ -210,9 +216,7 @@ class KungFuWrapper(Wrapper):
                     x, y, w, h = cv2.boundingRect(contour)
                     proj_x = x + w // 2
                     proj_y = y + h // 2
-                    game_width = 256
-                    proj_x_game = (proj_x / self.viewport_size[0]) * game_width
-                    distance = proj_x_game - hero_x
+                    distance = proj_x - hero_x  # No scaling needed since we're using raw pixel coordinates
                     projectile_info.extend([distance, proj_y, 0, 0])
             projectile_info = projectile_info[:self.max_projectiles * 4]
             while len(projectile_info) < self.max_projectiles * 4:
@@ -223,7 +227,7 @@ class KungFuWrapper(Wrapper):
         return [0] * (self.max_projectiles * 4)
 
     def _get_obs(self, obs):
-        viewport = cv2.resize(obs, self.viewport_size)
+        viewport = obs  # No resizing needed
         ram = self.env.get_ram()
         hero_x = int(ram[0x0094])
         enemy_info = []
@@ -255,62 +259,66 @@ class KungFuWrapper(Wrapper):
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512, n_stack=12):
         super().__init__(observation_space, features_dim)
-        input_channels = 3 * n_stack
+        viewport_shape = observation_space["viewport"].shape  # (H, W, 3*n_stack)
+        height, width = viewport_shape[0], viewport_shape[1]
+        input_channels = viewport_shape[2]  # Should be 3*n_stack
+
+        # Adjusted CNN architecture for 224x240 resolution
         self.cnn = nn.Sequential(
-            nn.Conv2d(input_channels, 64, kernel_size=8, stride=4),
+            nn.Conv2d(input_channels, 64, kernel_size=5, stride=2),
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2),
             nn.ReLU(),
-            nn.Conv2d(128, 64, kernel_size=3, stride=1),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.Flatten(),
         )
+
+        # Calculate flattened size
         with torch.no_grad():
-            sample_input = torch.zeros(1, input_channels, 84, 84)
+            sample_input = torch.zeros(1, input_channels, height, width)
             n_flatten = self.cnn(sample_input).shape[1]
-        non_visual_size = sum(observation_space[k].shape[0] for k in ["enemy_vector", "combat_status", "projectile_vectors", "enemy_proximity", "boss_info", "closest_enemy_direction"])
+
+        # Non-visual features calculation
+        non_visual_size = sum(observation_space[k].shape[0] for k in [
+            "enemy_vector", "combat_status", "projectile_vectors",
+            "enemy_proximity", "boss_info", "closest_enemy_direction"
+        ])
+
         self.non_visual = nn.Sequential(
-            nn.Linear(non_visual_size, 512),
+            nn.Linear(non_visual_size, 256),
             nn.ReLU()
         )
+
+        # Final linear layers
         self.linear = nn.Sequential(
-            nn.Linear(n_flatten + 512, 512),
+            nn.Linear(n_flatten + 256, 512),
             nn.ReLU(),
             nn.Linear(512, features_dim),
             nn.ReLU()
         )
-    
+
     def forward(self, observations):
-        viewport = observations["viewport"]
-        enemy_vector = observations["enemy_vector"]
-        combat_status = observations["combat_status"]
-        projectile_vectors = observations["projectile_vectors"]
-        enemy_proximity = observations["enemy_proximity"]
-        boss_info = observations["boss_info"]
-        closest_enemy_direction = observations["closest_enemy_direction"]
-        if isinstance(viewport, np.ndarray):
-            viewport = torch.from_numpy(viewport).float()
-        for tensor in [enemy_vector, combat_status, projectile_vectors, 
-                      enemy_proximity, boss_info, closest_enemy_direction]:
-            if isinstance(tensor, np.ndarray):
-                tensor = torch.from_numpy(tensor).float()
-        if len(viewport.shape) == 4 and viewport.shape[-1] in [3, 36]:
-            viewport = viewport.permute(0, 3, 1, 2)
-        elif len(viewport.shape) == 3:
-            viewport = viewport.unsqueeze(0).permute(0, 3, 1, 2)
+        # Process visual input
+        viewport = observations["viewport"].permute(0, 3, 1, 2).float()  # (batch, channels, H, W)
         cnn_output = self.cnn(viewport)
-        for tensor in [enemy_vector, combat_status, projectile_vectors,
-                      enemy_proximity, boss_info, closest_enemy_direction]:
-            if len(tensor.shape) == 1:
-                tensor = tensor.unsqueeze(0)
+
+        # Process non-visual features
         non_visual = torch.cat([
-            enemy_vector, combat_status, projectile_vectors,
-            enemy_proximity, boss_info, closest_enemy_direction
+            observations["enemy_vector"].float(),
+            observations["combat_status"].float(),
+            observations["projectile_vectors"].float(),
+            observations["enemy_proximity"].float(),
+            observations["boss_info"].float(),
+            observations["closest_enemy_direction"].float()
         ], dim=-1)
+        
         non_visual_output = self.non_visual(non_visual)
+        
+        # Combine features
         combined = torch.cat([cnn_output, non_visual_output], dim=1)
         return self.linear(combined)
-    
+
 def make_env():
     env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = Monitor(KungFuWrapper(env))

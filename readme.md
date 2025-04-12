@@ -73,4 +73,10 @@ python train.py --play --render --state_only --state_file knife_state.state --en
 ==
 
 
-python capture.py --game KungFu-Nes --state 1Player.Level1
+
+
+
+
+===
+
+python train.py --num_envs 4 --npz_dir recordings --resume --cuda --progress_bar --timesteps 10000
