@@ -12,7 +12,7 @@ import signal
 import time
 from kungfu_env import make_env, SimpleCNN, KUNGFU_MAX_ENEMIES  # Import KUNGFU_MAX_ENEMIES
 
-# Global variables
+# Global variables --
 current_model = None
 global_logger = None
 global_model_path = None
