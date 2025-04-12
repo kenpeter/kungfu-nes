@@ -125,28 +125,30 @@ class KungFuWrapper(Wrapper):
         close_range_threshold = 30
         
         if min_enemy_dist > close_range_threshold:
-            # Far from enemies: Encourage closing the gap
-            distance_reward = distance_change * 0.2
-            reward += distance_reward
+            # Far from enemies: Strongly focus on movement only
+            movement_reward = 5.0  # Base movement reward
             
-            # Strongly penalize attack actions when far
-            if action in [1, 2, 7, 8]:  # Punch, Kick, Jump+Punch, Crouch+Punch
-                reward -= 3.0
-            elif action in [3, 4]:  # Right+Punch, Left+Punch
-                if (action == 3 and closest_enemy_dir == 1) or (action == 4 and closest_enemy_dir == -1):
-                    reward += 1.5  # Reduced reward since pure movement is better
-                    reward -= 0.5  # Penalty for punching
-                else:
-                    reward -= 1.5
-            elif action in [9, 10]:  # Right, Left
+            if action in [9, 10]:  # Right or Left
                 if (action == 9 and closest_enemy_dir == 1) or (action == 10 and closest_enemy_dir == -1):
-                    reward += 2.5  # Strong reward for moving toward enemy
+                    reward += movement_reward * (1 + min_enemy_dist/255)  # Scale with distance
+                    # Additional reward for consecutive movements toward enemy
+                    if hasattr(self, 'last_movement') and self.last_movement == action:
+                        reward += 2.0
+                    self.last_movement = action
                 else:
-                    reward -= 1.0  # Penalty for moving away
-            elif action in [0, 5, 6]:  # No-op, Crouch, Jump
+                    reward -= 3.0  # Strong penalty for wrong direction
+            
+            # Heavy penalties for any attack actions when far
+            if action in [1, 2, 3, 4, 7, 8]:  # All attack actions
+                reward -= 8.0  # Very strong penalty
+                
+            # Small penalty for defensive actions when far
+            elif action in [5, 6]:  # Crouch/Jump
                 reward -= 1.0
+                
+            # No penalty for no-op but no reward either
         else:
-            # Close to enemies: Reward combat actions
+            # Close to enemies: Original combat logic remains
             if action in [1, 2, 8]:  # Punch, Kick, Crouch+Punch
                 reward += 2.0
             elif action in [3, 4]:  # Right+Punch, Left+Punch
