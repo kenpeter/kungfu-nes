@@ -10,9 +10,10 @@ import logging
 import sys
 import signal
 import time
+import glob
 from kungfu_env import make_env, SimpleCNN, KUNGFU_MAX_ENEMIES  # Import KUNGFU_MAX_ENEMIES
 
-# Global variables --
+# Global variables
 current_model = None
 global_logger = None
 global_model_path = None
@@ -73,8 +74,6 @@ class SaveBestModelCallback(BaseCallback):
         super().__init__(verbose)
         self.save_path = save_path
         self.best_score = 0
-
-    import numpy as np
 
     def _on_step(self) -> bool:
         infos = self.locals.get('infos', [{}])
@@ -151,6 +150,122 @@ def setup_logging(log_dir):
     )
     return logging.getLogger()
 
+class NPZReplayEnvironment:
+    """Custom environment for training from NPZ files"""
+    def __init__(self, npz_directory):
+        self.npz_files = glob.glob(os.path.join(npz_directory, '*.npz'))
+        if not self.npz_files:
+            raise ValueError(f"No NPZ files found in directory: {npz_directory}")
+        
+        self.current_file_idx = 0
+        self.current_frame_idx = 0
+        self.load_current_npz()
+        
+        self.observation_space = None
+        self.action_space = None
+        self.num_envs = 1
+        
+        self._setup_spaces()
+    
+    def load_current_npz(self):
+        """Load the current NPZ file data"""
+        npz_data = np.load(self.npz_files[self.current_file_idx])
+        self.frames = npz_data['frames']
+        self.actions = npz_data['actions']
+        self.rewards = npz_data['rewards']
+        self.current_frame_idx = 0
+    
+    def _setup_spaces(self):
+        # Import spaces within the method to ensure availability in subprocesses
+        from gym import spaces
+        import numpy as np  # Also ensure numpy is available if not already imported
+
+        first_frame = self.frames[0]
+        
+        # Define constants
+        KUNGFU_MAX_ENEMIES = 5
+        
+        # Define shapes for observation keys
+        enemy_vector_shape = (KUNGFU_MAX_ENEMIES * 3,)  # e.g., 15
+        combat_status_shape = (1,)
+        projectile_vectors_shape = (10,)
+        closest_enemy_direction_shape = (2,)  # Assuming a 2D direction vector
+        
+        # Define observation space
+        self.observation_space = spaces.Dict({
+            'viewport': spaces.Box(low=0, high=255, shape=first_frame.shape, dtype=np.uint8),
+            'enemy_vector': spaces.Box(low=0, high=255, shape=enemy_vector_shape, dtype=np.float32),
+            'combat_status': spaces.Box(low=0, high=1, shape=combat_status_shape, dtype=np.float32),
+            'projectile_vectors': spaces.Box(low=0, high=255, shape=projectile_vectors_shape, dtype=np.float32),
+            'enemy_proximity': spaces.Box(low=0, high=1, shape=(KUNGFU_MAX_ENEMIES,), dtype=np.float32),
+            'boss_info': spaces.Box(low=0, high=255, shape=(3,), dtype=np.float32),
+            'closest_enemy_direction': spaces.Box(low=-1, high=1, shape=closest_enemy_direction_shape, dtype=np.float32),
+        })
+        
+        self.action_space = spaces.MultiBinary(len(self.actions[0]))
+
+    def reset(self):
+        """Reset to beginning of current NPZ file or load a new one"""
+        self.current_file_idx = np.random.randint(0, len(self.npz_files))
+        self.load_current_npz()
+        
+        # Define shapes for consistency
+        KUNGFU_MAX_ENEMIES = 5
+        enemy_vector_shape = (KUNGFU_MAX_ENEMIES * 3,)
+        combat_status_shape = (1,)
+        projectile_vectors_shape = (10,)
+        closest_enemy_direction_shape = (2,)  # Assuming a 2D direction vector
+        
+        # Return observation with placeholders
+        return {
+            'viewport': self.frames[0],
+            'enemy_vector': np.zeros(enemy_vector_shape, dtype=np.float32),
+            'combat_status': np.zeros(combat_status_shape, dtype=np.float32),
+            'projectile_vectors': np.zeros(projectile_vectors_shape, dtype=np.float32),
+            'enemy_proximity': np.zeros(KUNGFU_MAX_ENEMIES, dtype=np.float32),
+            'boss_info': np.zeros(3, dtype=np.float32),  # placeholder for boss info
+            'closest_enemy_direction': np.zeros(closest_enemy_direction_shape, dtype=np.float32),
+        }
+    
+    def step(self, action):
+        """Step through the pre-recorded data"""
+        frame = self.frames[self.current_frame_idx]
+        reward = self.rewards[self.current_frame_idx]
+        
+        self.current_frame_idx += 1
+        done = self.current_frame_idx >= len(self.frames) - 1
+        if done:
+            self.current_frame_idx = len(self.frames) - 1
+        
+        # Define shapes for consistency
+        KUNGFU_MAX_ENEMIES = 5
+        enemy_vector_shape = (KUNGFU_MAX_ENEMIES * 3,)
+        combat_status_shape = (1,)
+        projectile_vectors_shape = (10,)
+        closest_enemy_direction_shape = (2,)
+        
+        # Return observation with placeholders
+        obs = {
+            'viewport': frame,
+            'enemy_vector': np.zeros(enemy_vector_shape, dtype=np.float32),
+            'combat_status': np.zeros(combat_status_shape, dtype=np.float32),
+            'projectile_vectors': np.zeros(projectile_vectors_shape, dtype=np.float32),
+            'enemy_proximity': np.zeros(KUNGFU_MAX_ENEMIES, dtype=np.float32),
+            'boss_info': np.zeros(3, dtype=np.float32),  # placeholder for boss info,
+            'closest_enemy_direction': np.zeros(closest_enemy_direction_shape, dtype=np.float32),
+        }
+        
+        return obs, reward, done, {"mimic_training": True}
+    
+    def close(self):
+        """Clean up resources"""
+        pass
+
+def create_npz_replay_env():
+    """Factory function for NPZ replay environment"""
+    env = NPZReplayEnvironment(args.npz_dir)
+    return env
+
 def train(args):
     global current_model, global_logger, global_model_path, experience_data
     experience_data = []
@@ -164,23 +279,31 @@ def train(args):
     if args.num_envs < 1:
         raise ValueError("Number of environments must be at least 1")
     
+    # Determine training mode based on npz_dir argument
+    training_mode = "mimic" if args.npz_dir else "live"
+    global_logger.info(f"Training mode: {training_mode}")
+    
     # Create environments
-    env_fns = [make_env for _ in range(args.num_envs)]
-    env = SubprocVecEnv(env_fns)
+    if training_mode == "mimic":
+        global_logger.info(f"Loading NPZ data from: {args.npz_dir}")
+        env_fns = [create_npz_replay_env for _ in range(args.num_envs)]
+        env = SubprocVecEnv(env_fns)
+    else:
+        env_fns = [make_env for _ in range(args.num_envs)]
+        env = SubprocVecEnv(env_fns)
     
     # Frame stacking without automatic transposition
     env = VecFrameStack(env, n_stack=4, channels_order='last')
 
     # Disable automatic image transposition
-    from stable_baselines3.common.vec_env import VecNormalize
-    if isinstance(env, VecNormalize):
-        env = VecNormalize(env, norm_obs=False, norm_reward=False)
+    from stable_baselines3.common.vec_env import VecTransposeImage
+    env = VecTransposeImage(env, skip=True)  # Skip the transposition
     
     # Policy kwargs using imported SimpleCNN
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
-        "features_extractor_kwargs": {"features_dim": 512, "n_stack": 4},  # Pass n_stack explicitly
-        "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])  # Flexible architecture
+        "features_extractor_kwargs": {"features_dim": 512, "n_stack": 4},
+        "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])
     }
     learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
 
@@ -239,7 +362,10 @@ def train(args):
     with open(f"{args.model_path}_experience_count.txt", "w") as f:
         f.write(f"Total experience collected: {experience_count} steps\n")
         f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Training mode: {training_mode}\n")
         f.write(f"Training parameters: num_envs={args.num_envs}, timesteps={args.timesteps}\n")
+        if training_mode == "mimic":
+            f.write(f"NPZ directory: {args.npz_dir}\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu")
@@ -251,6 +377,7 @@ if __name__ == "__main__":
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
+    parser.add_argument("--npz_dir", help="Directory containing NPZ recordings for mimic training")
     
     args = parser.parse_args()
     train(args)

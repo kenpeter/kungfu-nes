@@ -53,30 +53,14 @@ python train.py --play --render --enable_file_logging
 
 python train.py --play --render --state_only --state_file knife_state.state --enable_file_logging
 
-
-
-===
-
-
-
-        print("Controls:")
-        print("R - Start recording segment")
-        print("S - Stop recording segment")
-        print("P - Save game state")
-        print("L - Load last state")
-        print("M - Toggle AI control")
-        print("+/- - Increase/Decrease game speed")
-        print("Q - Quit")
-
-
-
 ==
 
 
 
 
 
-
 ===
 
-python train.py --num_envs 4 --npz_dir recordings --resume --cuda --progress_bar --timesteps 10000
+python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timesteps 10000
+
+python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timesteps 10000 --resume
