@@ -59,6 +59,7 @@ class KungFuWrapper(Wrapper):
         self.reward_mean = 0
         self.reward_std = 1
         self.prev_min_enemy_dist = 255
+        self.last_movement = None
 
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
@@ -71,6 +72,7 @@ class KungFuWrapper(Wrapper):
         self.last_projectile_distances = [float('inf')] * self.max_projectiles
         self.survival_reward_total = 0
         self.prev_min_enemy_dist = 255
+        self.last_movement = None
         return self._get_obs(obs)
 
     def step(self, action):
@@ -126,27 +128,21 @@ class KungFuWrapper(Wrapper):
         
         if min_enemy_dist > close_range_threshold:
             # Far from enemies: Strongly focus on movement only
-            movement_reward = 5.0  # Base movement reward
+            movement_reward = 8.0  # Increased from 5.0
             
             if action in [9, 10]:  # Right or Left
                 if (action == 9 and closest_enemy_dir == 1) or (action == 10 and closest_enemy_dir == -1):
-                    reward += movement_reward * (1 + min_enemy_dist/255)  # Scale with distance
-                    # Additional reward for consecutive movements toward enemy
+                    reward += movement_reward * (1 + min_enemy_dist/255) * 1.5  # Amplified scaling
                     if hasattr(self, 'last_movement') and self.last_movement == action:
-                        reward += 2.0
+                        reward += 3.0  # Increased from 2.0
                     self.last_movement = action
                 else:
-                    reward -= 3.0  # Strong penalty for wrong direction
-            
-            # Heavy penalties for any attack actions when far
-            if action in [1, 2, 3, 4, 7, 8]:  # All attack actions
-                reward -= 8.0  # Very strong penalty
-                
-            # Small penalty for defensive actions when far
+                    reward -= 5.0  # Stronger penalty for wrong direction
+            elif action in [1, 2, 3, 4, 7, 8]:  # All attack actions
+                reward -= 20.0  # Increased penalty from 8.0
+                print(f"Attack action {self.action_names[action]} taken when far (dist={min_enemy_dist}), reward={reward}")
             elif action in [5, 6]:  # Crouch/Jump
                 reward -= 1.0
-                
-            # No penalty for no-op but no reward either
         else:
             # Close to enemies: Original combat logic remains
             if action in [1, 2, 8]:  # Punch, Kick, Crouch+Punch
@@ -166,7 +162,7 @@ class KungFuWrapper(Wrapper):
         # Action entropy
         action_entropy = -np.sum((self.action_counts / (self.total_steps + 1e-6)) * 
                                 np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
-        reward += action_entropy * 3.0
+        reward += action_entropy * 1.0  # Reduced from 3.0
         
         # Survival reward
         if not done and hp > 0:
@@ -189,7 +185,6 @@ class KungFuWrapper(Wrapper):
             "action_percentages": self.action_counts / (self.total_steps + 1e-6),
             "action_names": self.action_names,
             "dodge_reward": dodge_reward,
-            "distance_reward": distance_reward if 'distance_reward' in locals() else 0,
             "survival_reward_total": self.survival_reward_total,
             "raw_reward": reward,
             "normalized_reward": normalized_reward,
@@ -262,7 +257,6 @@ class KungFuWrapper(Wrapper):
                 enemy_info.extend([0, 0])
                 distances.append((float('inf'), 0))
         
-        # Compute closest enemy direction
         closest_enemy_direction = 0
         if distances:
             closest_dist, closest_dir = min(distances, key=lambda x: x[0])
@@ -281,8 +275,7 @@ class KungFuWrapper(Wrapper):
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512, n_stack=12):
         super().__init__(observation_space, features_dim)
-        # Calculate input channels based on frame stacking
-        input_channels = 3 * n_stack  # 3 RGB channels per frame
+        input_channels = 3 * n_stack
         self.cnn = nn.Sequential(
             nn.Conv2d(input_channels, 64, kernel_size=8, stride=4),
             nn.ReLU(),
@@ -293,26 +286,18 @@ class SimpleCNN(BaseFeaturesExtractor):
             nn.Flatten(),
         )
         with torch.no_grad():
-            # Use a sample input to compute the flattened size
             sample_input = torch.zeros(1, input_channels, 84, 84)
             n_flatten = self.cnn(sample_input).shape[1]
         
-        # Compute sizes of additional observation components
-        enemy_vec_size = observation_space["enemy_vector"].shape[0]
-        combat_status_size = observation_space["combat_status"].shape[0]
-        projectile_vec_size = observation_space["projectile_vectors"].shape[0]
-        enemy_proximity_size = observation_space["enemy_proximity"].shape[0]
-        boss_info_size = observation_space["boss_info"].shape[0]
-        closest_enemy_dir_size = observation_space["closest_enemy_direction"].shape[0]
+        # Separate processing for non-visual features
+        non_visual_size = sum(observation_space[k].shape[0] for k in ["enemy_vector", "combat_status", "projectile_vectors", "enemy_proximity", "boss_info", "closest_enemy_direction"])
+        self.non_visual = nn.Sequential(
+            nn.Linear(non_visual_size, 128),
+            nn.ReLU()
+        )
         
-        # Linear layers to combine CNN output and additional features
         self.linear = nn.Sequential(
-            nn.Linear(
-                n_flatten + enemy_vec_size + combat_status_size +
-                projectile_vec_size + enemy_proximity_size + boss_info_size +
-                closest_enemy_dir_size,
-                512
-            ),
+            nn.Linear(n_flatten + 128, 512),
             nn.ReLU(),
             nn.Linear(512, features_dim),
             nn.ReLU()
@@ -327,7 +312,6 @@ class SimpleCNN(BaseFeaturesExtractor):
         boss_info = observations["boss_info"]
         closest_enemy_direction = observations["closest_enemy_direction"]
         
-        # Convert numpy arrays to torch tensors if needed
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport).float()
         for tensor in [enemy_vector, combat_status, projectile_vectors, 
@@ -335,26 +319,25 @@ class SimpleCNN(BaseFeaturesExtractor):
             if isinstance(tensor, np.ndarray):
                 tensor = torch.from_numpy(tensor).float()
                 
-        # Adjust viewport dimensions: [batch, height, width, channels] -> [batch, channels, height, width]
-        if len(viewport.shape) == 4 and viewport.shape[-1] in [3, 36]:  # 3 for single frame, 36 for stacked
+        if len(viewport.shape) == 4 and viewport.shape[-1] in [3, 36]:
             viewport = viewport.permute(0, 3, 1, 2)
-        elif len(viewport.shape) == 3:  # Single environment case
+        elif len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0).permute(0, 3, 1, 2)
             
-        # Process viewport through CNN
         cnn_output = self.cnn(viewport)
         
-        # Ensure all tensors have batch dimension
         for tensor in [enemy_vector, combat_status, projectile_vectors,
                       enemy_proximity, boss_info, closest_enemy_direction]:
             if len(tensor.shape) == 1:
                 tensor = tensor.unsqueeze(0)
                 
-        # Combine CNN output with other features
-        combined = torch.cat([
-            cnn_output, enemy_vector, combat_status, projectile_vectors,
+        non_visual = torch.cat([
+            enemy_vector, combat_status, projectile_vectors,
             enemy_proximity, boss_info, closest_enemy_direction
-        ], dim=1)
+        ], dim=-1)
+        non_visual_output = self.non_visual(non_visual)
+        
+        combined = torch.cat([cnn_output, non_visual_output], dim=1)
         return self.linear(combined)
     
 def make_env():
