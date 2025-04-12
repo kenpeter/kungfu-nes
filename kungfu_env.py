@@ -9,13 +9,12 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from stable_baselines3.common.monitor import Monitor
 
-KUNGFU_MAX_ENEMIES = 5  # Single source of truth
+KUNGFU_MAX_ENEMIES = 5
 
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
         self.viewport_size = (84, 84)
-        
         self.actions = [
             [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (0)
             [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (1)
@@ -33,11 +32,9 @@ class KungFuWrapper(Wrapper):
             "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
             "Crouch", "Jump", "Jump+Punch", "Crouch+Punch", "Right", "Left"
         ]
-        
         self.action_space = spaces.Discrete(len(self.actions))
         self.max_enemies = KUNGFU_MAX_ENEMIES
         self.max_projectiles = 2
-        
         self.observation_space = spaces.Dict({
             "viewport": spaces.Box(0, 255, (*self.viewport_size, 3), np.uint8),
             "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
@@ -47,7 +44,6 @@ class KungFuWrapper(Wrapper):
             "boss_info": spaces.Box(-255, 255, (3,), np.float32),
             "closest_enemy_direction": spaces.Box(-1, 1, (1,), np.float32)
         })
-        
         self.last_hp = 0
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
@@ -88,37 +84,33 @@ class KungFuWrapper(Wrapper):
         reward = 0
         hp_change_rate = (hp - self.last_hp) / 255.0
         
-        # Health-based rewards
         if hp_change_rate < 0:
-            reward += (hp_change_rate ** 2) * 50  # Penalize health loss
+            reward += (hp_change_rate ** 2) * 50
         else:
-            reward += hp_change_rate * 5  # Reward health gain
+            reward += hp_change_rate * 5
 
-        reward += enemy_hit * 10  # Reward for defeating enemies
+        reward += enemy_hit * 10
         if done:
-            reward -= 50  # Penalty for dying
+            reward -= 50
 
-        # Projectile dodging
         projectile_info = self._detect_projectiles(obs)
         projectile_distances = [projectile_info[i] for i in range(0, len(projectile_info), 4)]
         dodge_reward = 0
         for i, (curr_dist, last_dist) in enumerate(zip(projectile_distances, self.last_projectile_distances)):
             if last_dist < 20 and curr_dist > last_dist:
-                if action in [5, 6]:  # Crouch or Jump
+                if action in [5, 6]:
                     dodge_reward += 3
         reward += dodge_reward
         self.last_projectile_distances = projectile_distances
         
         if hp_change_rate < 0 and action in [5, 6]:
-            reward += 5  # Reward dodging that prevents damage
+            reward += 5
 
-        # Distance-based logic for bidirectional combat
         hero_x = int(ram[0x0094])
         enemy_distances = [(enemy_x - hero_x) for enemy_x in curr_enemies if enemy_x != 0]
         min_enemy_dist = min([abs(d) for d in enemy_distances] or [255])
         distance_change = self.prev_min_enemy_dist - min_enemy_dist
     
-        # Find closest enemy direction
         closest_enemy_dir = 0
         if enemy_distances:
             closest_dist = min([abs(d) for d in enemy_distances])
@@ -127,49 +119,42 @@ class KungFuWrapper(Wrapper):
         close_range_threshold = 30
         
         if min_enemy_dist > close_range_threshold:
-            # Far from enemies: Strongly focus on movement only
-            movement_reward = 8.0  # Increased from 5.0
-            
-            if action in [9, 10]:  # Right or Left
+            movement_reward = 8.0
+            valid_actions = [9, 10]
+            if action in valid_actions:
                 if (action == 9 and closest_enemy_dir == 1) or (action == 10 and closest_enemy_dir == -1):
-                    reward += movement_reward * (1 + min_enemy_dist/255) * 1.5  # Amplified scaling
+                    reward += movement_reward * (1 + min_enemy_dist/255) * 1.5
                     if hasattr(self, 'last_movement') and self.last_movement == action:
-                        reward += 3.0  # Increased from 2.0
+                        reward += 3.0
                     self.last_movement = action
                 else:
-                    reward -= 5.0  # Stronger penalty for wrong direction
-            elif action in [1, 2, 3, 4, 7, 8]:  # All attack actions
-                reward -= 20.0  # Increased penalty from 8.0
-                print(f"Attack action {self.action_names[action]} taken when far (dist={min_enemy_dist}), reward={reward}")
-            elif action in [5, 6]:  # Crouch/Jump
-                reward -= 1.0
+                    reward -= 10.0
+            else:
+                reward -= 50.0
+                print(f"Invalid action {self.action_names[action]} taken when far (dist={min_enemy_dist}), reward={reward}")
         else:
-            # Close to enemies: Original combat logic remains
-            if action in [1, 2, 8]:  # Punch, Kick, Crouch+Punch
+            if action in [1, 2, 8]:
                 reward += 2.0
-            elif action in [3, 4]:  # Right+Punch, Left+Punch
+            elif action in [3, 4]:
                 if (action == 3 and closest_enemy_dir == 1) or (action == 4 and closest_enemy_dir == -1):
                     reward += 2.5
                 else:
                     reward += 0.5
-            elif action in [9, 10]:  # Right, Left
-                reward -= 0.5  # Discourage pure movement when close
-            elif action in [0, 5, 6]:  # No-op, Crouch, Jump
+            elif action in [9, 10]:
+                reward -= 0.5
+            elif action in [0, 5, 6]:
                 reward -= 0.5
 
         self.prev_min_enemy_dist = min_enemy_dist
 
-        # Action entropy
         action_entropy = -np.sum((self.action_counts / (self.total_steps + 1e-6)) * 
                                 np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
-        reward += action_entropy * 1.0  # Reduced from 3.0
+        reward += action_entropy * 0.1
         
-        # Survival reward
         if not done and hp > 0:
             reward += 0.05
             self.survival_reward_total += 0.05
 
-        # Reward normalization
         self.reward_mean = 0.99 * self.reward_mean + 0.01 * reward
         self.reward_std = 0.99 * self.reward_std + 0.01 * (reward - self.reward_mean) ** 2
         normalized_reward = (reward - self.reward_mean) / (np.sqrt(self.reward_std) + 1e-6)
@@ -178,6 +163,9 @@ class KungFuWrapper(Wrapper):
         self.last_hp = hp
         self.last_hp_change = hp_change_rate
         self.last_enemies = curr_enemies
+        
+        if min_enemy_dist > close_range_threshold:
+            print(f"Step {self.total_steps}: Action={self.action_names[action]}, MinDist={min_enemy_dist}, ClosestDir={closest_enemy_dir}, Reward={reward}")
         
         info.update({
             "hp": hp,
@@ -209,16 +197,13 @@ class KungFuWrapper(Wrapper):
             frame_diff = cv2.absdiff(frame, self.prev_frame)
             diff_sum = np.sum(frame_diff, axis=2).astype(np.uint8)
             _, motion_mask = cv2.threshold(diff_sum, 20, 255, cv2.THRESH_BINARY)
-            
             lower_white = np.array([180, 180, 180])
             upper_white = np.array([255, 255, 255])
             white_mask = cv2.inRange(frame, lower_white, upper_white)
             combined_mask = cv2.bitwise_and(motion_mask, white_mask)
             contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
             projectile_info = []
             hero_x = int(self.env.get_ram()[0x0094])
-            
             for contour in contours:
                 area = cv2.contourArea(contour)
                 if 5 < area < 50:
@@ -229,20 +214,17 @@ class KungFuWrapper(Wrapper):
                     proj_x_game = (proj_x / self.viewport_size[0]) * game_width
                     distance = proj_x_game - hero_x
                     projectile_info.extend([distance, proj_y, 0, 0])
-            
             projectile_info = projectile_info[:self.max_projectiles * 4]
             while len(projectile_info) < self.max_projectiles * 4:
                 projectile_info.append(0)
             self.prev_frame = frame
             return projectile_info
-        
         self.prev_frame = frame
         return [0] * (self.max_projectiles * 4)
 
     def _get_obs(self, obs):
         viewport = cv2.resize(obs, self.viewport_size)
         ram = self.env.get_ram()
-        
         hero_x = int(ram[0x0094])
         enemy_info = []
         distances = []
@@ -256,12 +238,10 @@ class KungFuWrapper(Wrapper):
             else:
                 enemy_info.extend([0, 0])
                 distances.append((float('inf'), 0))
-        
         closest_enemy_direction = 0
         if distances:
             closest_dist, closest_dir = min(distances, key=lambda x: x[0])
             closest_enemy_direction = closest_dir if closest_dist != float('inf') else 0
-        
         return {
             "viewport": viewport.astype(np.uint8),
             "enemy_vector": np.array(enemy_info, dtype=np.float32),
@@ -288,16 +268,13 @@ class SimpleCNN(BaseFeaturesExtractor):
         with torch.no_grad():
             sample_input = torch.zeros(1, input_channels, 84, 84)
             n_flatten = self.cnn(sample_input).shape[1]
-        
-        # Separate processing for non-visual features
         non_visual_size = sum(observation_space[k].shape[0] for k in ["enemy_vector", "combat_status", "projectile_vectors", "enemy_proximity", "boss_info", "closest_enemy_direction"])
         self.non_visual = nn.Sequential(
-            nn.Linear(non_visual_size, 128),
+            nn.Linear(non_visual_size, 512),
             nn.ReLU()
         )
-        
         self.linear = nn.Sequential(
-            nn.Linear(n_flatten + 128, 512),
+            nn.Linear(n_flatten + 512, 512),
             nn.ReLU(),
             nn.Linear(512, features_dim),
             nn.ReLU()
@@ -311,32 +288,26 @@ class SimpleCNN(BaseFeaturesExtractor):
         enemy_proximity = observations["enemy_proximity"]
         boss_info = observations["boss_info"]
         closest_enemy_direction = observations["closest_enemy_direction"]
-        
         if isinstance(viewport, np.ndarray):
             viewport = torch.from_numpy(viewport).float()
         for tensor in [enemy_vector, combat_status, projectile_vectors, 
                       enemy_proximity, boss_info, closest_enemy_direction]:
             if isinstance(tensor, np.ndarray):
                 tensor = torch.from_numpy(tensor).float()
-                
         if len(viewport.shape) == 4 and viewport.shape[-1] in [3, 36]:
             viewport = viewport.permute(0, 3, 1, 2)
         elif len(viewport.shape) == 3:
             viewport = viewport.unsqueeze(0).permute(0, 3, 1, 2)
-            
         cnn_output = self.cnn(viewport)
-        
         for tensor in [enemy_vector, combat_status, projectile_vectors,
                       enemy_proximity, boss_info, closest_enemy_direction]:
             if len(tensor.shape) == 1:
                 tensor = tensor.unsqueeze(0)
-                
         non_visual = torch.cat([
             enemy_vector, combat_status, projectile_vectors,
             enemy_proximity, boss_info, closest_enemy_direction
         ], dim=-1)
         non_visual_output = self.non_visual(non_visual)
-        
         combined = torch.cat([cnn_output, non_visual_output], dim=1)
         return self.linear(combined)
     
