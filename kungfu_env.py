@@ -4,7 +4,6 @@ from gym import spaces, Wrapper
 import cv2
 import torch
 import torch.nn as nn
-from stable_baselines3 import PPO
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from stable_baselines3.common.monitor import Monitor
@@ -219,9 +218,9 @@ class KungFuWrapper(Wrapper):
             projectile_info = projectile_info[:self.max_projectiles * 4]
             while len(projectile_info) < self.max_projectiles * 4:
                 projectile_info.append(0)
-            self.prev_frame = frame
+            self.prev_frame = frame.copy()  # Ensure frame is copied to avoid reference issues
             return projectile_info
-        self.prev_frame = frame
+        self.prev_frame = frame.copy()
         return [0] * (self.max_projectiles * 4)
 
     def _get_obs(self, obs):

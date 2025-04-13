@@ -2,6 +2,7 @@ import argparse
 import os
 import numpy as np
 import torch
+import zipfile
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
@@ -21,18 +22,24 @@ experience_data = []
 def emergency_save_handler(signum, frame):
     global current_model, global_logger, global_model_path, experience_data
     if current_model is not None and global_model_path is not None:
-        current_model.save(global_model_path)
-        experience_count = len(experience_data)
-        if global_logger:
-            global_logger.info(f"Emergency save triggered. Model saved at {global_model_path}")
-            global_logger.info(f"Collected experience: {experience_count} steps")
-        else:
-            print(f"Emergency save triggered. Model saved at {global_model_path}")
-            print(f"Collected experience: {experience_count} steps")
-        
-        with open(f"{global_model_path}_experience_count.txt", "w") as f:
-            f.write(f"Total experience collected: {experience_count} steps\n")
-            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        try:
+            current_model.save(global_model_path)
+            experience_count = len(experience_data)
+            if global_logger:
+                global_logger.info(f"Emergency save triggered. Model saved at {global_model_path}")
+                global_logger.info(f"Collected experience: {experience_count} steps")
+            else:
+                print(f"Emergency save triggered. Model saved at {global_model_path}")
+                print(f"Collected experience: {experience_count} steps")
+            
+            with open(f"{global_model_path}_experience_count.txt", "w") as f:
+                f.write(f"Total experience collected: {experience_count} steps\n")
+                f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        except Exception as e:
+            if global_logger:
+                global_logger.error(f"Emergency save failed: {e}")
+            else:
+                print(f"Emergency save failed: {e}")
         
         if hasattr(current_model, 'env'):
             current_model.env.close()
@@ -107,20 +114,23 @@ class SaveBestModelCallback(BaseCallback):
         
         if score > self.best_score:
             self.best_score = score
-            self.model.save(self.save_path)
-            if self.verbose > 0:
-                print(f"Saved best model with score {self.best_score:.2f} at step {self.num_timesteps}")
-                print(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Dodge: {total_dodge_reward:.2f}, "
-                    f"Survival: {total_survival_reward:.2f}, Norm. Reward: {avg_normalized_reward:.2f}, "
-                    f"Action Diversity: {action_diversity:.2f}, Min Enemy Dist: {avg_min_enemy_dist:.1f}")
-                
-                if infos and 'action_percentages' in infos[0] and 'action_names' in infos[0]:
-                    action_percentages = infos[0].get('action_percentages', [])
-                    action_names = infos[0].get('action_names', [])
-                    if len(action_percentages) == len(action_names):
-                        print("  Action Percentages:")
-                        for name, perc in zip(action_names, action_percentages):
-                            print(f"    {name}: {perc * 100:.1f}%")
+            try:
+                self.model.save(self.save_path)
+                if self.verbose > 0:
+                    print(f"Saved best model with score {self.best_score:.2f} at step {self.num_timesteps}")
+                    print(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Dodge: {total_dodge_reward:.2f}, "
+                        f"Survival: {total_survival_reward:.2f}, Norm. Reward: {avg_normalized_reward:.2f}, "
+                        f"Action Diversity: {action_diversity:.2f}, Min Enemy Dist: {avg_min_enemy_dist:.1f}")
+                    
+                    if infos and 'action_percentages' in infos[0] and 'action_names' in infos[0]:
+                        action_percentages = infos[0].get('action_percentages', [])
+                        action_names = infos[0].get('action_names', [])
+                        if len(action_percentages) == len(action_names):
+                            print("  Action Percentages:")
+                            for name, perc in zip(action_names, action_percentages):
+                                print(f"    {name}: {perc * 100:.1f}%")
+            except Exception as e:
+                print(f"Failed to save model: {e}")
         
         if self.num_timesteps % 5000 == 0 and self.verbose > 0:
             print(f"Step {self.num_timesteps} Progress:")
@@ -218,16 +228,15 @@ class NPZReplayEnvironment:
     def close(self):
         pass
 
-def create_npz_replay_env():
-    env = NPZReplayEnvironment(args.npz_dir)
-    return env
+def create_npz_replay_env(npz_dir):
+    return lambda: NPZReplayEnvironment(npz_dir)
 
 def train(args):
     global current_model, global_logger, global_model_path, experience_data
     experience_data = []
     
     global_logger = setup_logging(args.log_dir)
-    global_logger.info(f"Starting training with {args.num_envs} envs and {args.timesteps} timesteps")
+    global_logger.info(f"Starting mixed training with {args.num_envs} envs and {args.timesteps} total timesteps")
     global_logger.info(f"Maximum number of enemies: {KUNGFU_MAX_ENEMIES}")
     global_model_path = args.model_path
     current_model = None
@@ -235,22 +244,11 @@ def train(args):
     if args.num_envs < 1:
         raise ValueError("Number of environments must be at least 1")
     
-    training_mode = "mimic" if args.npz_dir else "live"
-    global_logger.info(f"Training mode: {training_mode}")
+    if not args.npz_dir or not os.path.exists(args.npz_dir):
+        global_logger.warning(f"NPZ directory {args.npz_dir} not provided or does not exist. Falling back to live training only.")
+        args.npz_dir = None
     
-    if training_mode == "mimic":
-        global_logger.info(f"Loading NPZ data from: {args.npz_dir}")
-        env_fns = [create_npz_replay_env for _ in range(args.num_envs)]
-        env = SubprocVecEnv(env_fns)
-    else:
-        env_fns = [make_env for _ in range(args.num_envs)]
-        env = SubprocVecEnv(env_fns)
-    
-    env = VecFrameStack(env, n_stack=4, channels_order='last')
-    
-    from stable_baselines3.common.vec_env import VecTransposeImage
-    env = VecTransposeImage(env, skip=True)
-    
+    # Training parameters
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
         "features_extractor_kwargs": {"features_dim": 512, "n_stack": 4},
@@ -267,26 +265,18 @@ def train(args):
         "n_epochs": 10
     }
 
-    if args.resume and os.path.exists(args.model_path + ".zip"):
-        global_logger.info(f"Attempting to resume training from {args.model_path}")
-        try:
-            model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
-            global_logger.info("Successfully loaded existing model")
-        except Exception as e:
-            global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
-            model = PPO(
-                "MultiInputPolicy",
-                env,
-                **params,
-                gamma=0.99,
-                gae_lambda=0.95,
-                verbose=1,
-                policy_kwargs=policy_kwargs,
-                device="cuda" if args.cuda else "cpu"
-            )
-    else:
+    # Initialize model
+    def initialize_model(env):
+        if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
+            global_logger.info(f"Attempting to resume training from {args.model_path}")
+            try:
+                model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
+                global_logger.info("Successfully loaded existing model")
+                return model
+            except Exception as e:
+                global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
         global_logger.info("Starting new training session")
-        model = PPO(
+        return PPO(
             "MultiInputPolicy",
             env,
             **params,
@@ -296,37 +286,86 @@ def train(args):
             policy_kwargs=policy_kwargs,
             device="cuda" if args.cuda else "cpu"
         )
-    current_model = model
 
-    save_callback = SaveBestModelCallback(save_path=args.model_path)
-    exp_callback = ExperienceCollectionCallback()
-    callback = CallbackList([save_callback, exp_callback])
+    # Mixed training loop
+    total_timesteps = args.timesteps
+    timesteps_per_phase = args.phase_timesteps
+    remaining_timesteps = total_timesteps
+    phase_count = 0
     
-    model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
-    experience_data = exp_callback.experience_data
+    while remaining_timesteps > 0:
+        phase_timesteps = min(timesteps_per_phase, remaining_timesteps)
+        phase_count += 1
+        
+        # Randomly choose training mode
+        training_mode = "mimic" if args.npz_dir and np.random.random() < 0.5 else "live"
+        global_logger.info(f"Phase {phase_count}: Starting {training_mode} training for {phase_timesteps} timesteps")
+        
+        # Set up environment
+        if training_mode == "mimic":
+            env_fns = [create_npz_replay_env(args.npz_dir) for _ in range(args.num_envs)]
+        else:
+            env_fns = [make_env for _ in range(args.num_envs)]
+        
+        env = SubprocVecEnv(env_fns)
+        env = VecFrameStack(env, n_stack=4, channels_order='last')
+        from stable_baselines3.common.vec_env import VecTransposeImage
+        env = VecTransposeImage(env, skip=True)
+        
+        # Initialize or reuse model
+        if current_model is None:
+            current_model = initialize_model(env)
+        else:
+            current_model.set_env(env)
+        
+        # Callbacks
+        save_callback = SaveBestModelCallback(save_path=args.model_path)
+        exp_callback = ExperienceCollectionCallback()
+        callback = CallbackList([save_callback, exp_callback])
+        
+        # Train for phase
+        try:
+            current_model.learn(total_timesteps=phase_timesteps, callback=callback, progress_bar=args.progress_bar)
+            experience_data.extend(exp_callback.experience_data)
+        except Exception as e:
+            global_logger.error(f"Training phase {phase_count} failed: {e}")
+            env.close()
+            raise
+        
+        # Save model after phase
+        try:
+            current_model.save(args.model_path)
+            global_logger.info(f"Model saved after {training_mode} phase {phase_count} at {args.model_path}")
+        except Exception as e:
+            global_logger.error(f"Failed to save model after phase {phase_count}: {e}")
+        
+        # Clean up environment
+        env.close()
+        remaining_timesteps -= phase_timesteps
     
+    # Final logging
     experience_count = len(experience_data)
     global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
     
     with open(f"{args.model_path}_experience_count.txt", "w") as f:
         f.write(f"Total experience collected: {experience_count} steps\n")
         f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Training mode: {training_mode}\n")
-        f.write(f"Training parameters: num_envs={args.num_envs}, timesteps={args.timesteps}\n")
-        if training_mode == "mimic":
+        f.write(f"Training parameters: num_envs={args.num_envs}, total_timesteps={args.timesteps}, phase_timesteps={args.phase_timesteps}\n")
+        if args.npz_dir:
             f.write(f"NPZ directory: {args.npz_dir}\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu")
-    parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo_best", help="Path to save the trained model")
-    parser.add_argument("--timesteps", type=int, default=10000, help="Total timesteps for training")
+    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with mixed live and mimic training")
+    parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo_mixed", help="Path to save the trained model")
+    parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps for training")
+    parser.add_argument("--phase_timesteps", type=int, default=20000, help="Timesteps per training phase")
     parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
-    parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for mimic training")
+    parser.add_argument("--npz_dir", default="recordings", help="Directory containing NPZ recordings for mimic training")
     
     args = parser.parse_args()
     train(args)
