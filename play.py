@@ -11,7 +11,7 @@ def play():
     env = KungFuWrapper(base_env)
     env = DummyVecEnv([lambda: env])  # Vectorize for compatibility with PPO
     env = VecFrameStack(env, n_stack=4)  # Match training setup with 12 stacked frames
-    model_path = 'models/kungfu_ppo/kungfu_ppo_best.zip'
+    model_path = 'models/kungfu_ppo/kungfu_ppo_mixed.zip'
     
     if not os.path.exists(model_path):
         print(f"No model found at {model_path}")
