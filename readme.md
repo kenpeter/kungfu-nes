@@ -5,6 +5,11 @@ python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timest
 
 
 
+python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timesteps 50 --resume --render
+
+
+
+
 
 python play.py
 

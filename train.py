@@ -3,16 +3,18 @@ import os
 import numpy as np
 import torch
 import zipfile
+import retro
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack, DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.utils import get_linear_fn
+from stable_baselines3.common.vec_env import VecTransposeImage
 import logging
 import sys
 import signal
 import time
 import glob
-from kungfu_env import make_env, SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES
+from kungfu_env import KungFuWrapper, SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES
 
 current_model = None
 global_logger = None
@@ -140,6 +142,14 @@ class SaveBestModelCallback(BaseCallback):
         
         return True
 
+class RenderCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+    
+    def _on_step(self) -> bool:
+        self.training_env.render(mode='human')
+        return True
+
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
@@ -225,8 +235,16 @@ class NPZReplayEnvironment:
         
         return obs, reward, done, {"mimic_training": True}
     
+    def render(self, mode='human'):
+        pass  # NPZ environment doesn't support rendering
+    
     def close(self):
         pass
+
+def make_kungfu_env():
+    base_env = retro.make('KungFu-Nes')
+    env = KungFuWrapper(base_env)
+    return env
 
 def create_npz_replay_env(npz_dir):
     return lambda: NPZReplayEnvironment(npz_dir)
@@ -251,6 +269,15 @@ def train(args):
     else:
         global_logger.info("Training in live mode")
     
+    # Adjust num_envs if rendering is enabled
+    if args.render:
+        if training_mode == "mimic":
+            global_logger.warning("Rendering is not supported in mimic mode. Ignoring --render flag.")
+            args.render = False
+        else:
+            global_logger.info("Rendering enabled. Using a single environment for visualization.")
+            args.num_envs = 1
+
     # Training parameters
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
@@ -273,7 +300,8 @@ def train(args):
         if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
             global_logger.info(f"Resuming training from {args.model_path}")
             try:
-                model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
+                custom_objects = {"policy_kwargs": policy_kwargs}
+                model = PPO.load(args.model_path, env=env, custom_objects=custom_objects, device="cuda" if args.cuda else "cpu")
                 global_logger.info("Successfully loaded existing model")
                 return model
             except Exception as e:
@@ -294,11 +322,14 @@ def train(args):
     if training_mode == "mimic":
         env_fns = [create_npz_replay_env(args.npz_dir) for _ in range(args.num_envs)]
     else:
-        env_fns = [make_env for _ in range(args.num_envs)]
+        env_fns = [make_kungfu_env for _ in range(args.num_envs)]
     
-    env = SubprocVecEnv(env_fns)
+    if args.render:
+        env = DummyVecEnv([make_kungfu_env])
+    else:
+        env = SubprocVecEnv(env_fns)
+    
     env = VecFrameStack(env, n_stack=4, channels_order='last')
-    from stable_baselines3.common.vec_env import VecTransposeImage
     env = VecTransposeImage(env, skip=True)
     
     # Initialize model
@@ -307,7 +338,10 @@ def train(args):
     # Callbacks
     save_callback = SaveBestModelCallback(save_path=args.model_path)
     exp_callback = ExperienceCollectionCallback()
-    callback = CallbackList([save_callback, exp_callback])
+    callbacks = [save_callback, exp_callback]
+    if args.render:
+        callbacks.append(RenderCallback())
+    callback = CallbackList(callbacks)
     
     # Train
     try:
@@ -350,6 +384,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for mimic training")
+    parser.add_argument("--render", action="store_true", help="Render the environment during training")
     
     args = parser.parse_args()
     train(args)
