@@ -236,7 +236,7 @@ def train(args):
     experience_data = []
     
     global_logger = setup_logging(args.log_dir)
-    global_logger.info(f"Starting mixed training with {args.num_envs} envs and {args.timesteps} total timesteps")
+    global_logger.info(f"Starting training with {args.num_envs} envs and {args.timesteps} total timesteps")
     global_logger.info(f"Maximum number of enemies: {KUNGFU_MAX_ENEMIES}")
     global_model_path = args.model_path
     current_model = None
@@ -244,9 +244,12 @@ def train(args):
     if args.num_envs < 1:
         raise ValueError("Number of environments must be at least 1")
     
-    if not args.npz_dir or not os.path.exists(args.npz_dir):
-        global_logger.warning(f"NPZ directory {args.npz_dir} not provided or does not exist. Falling back to live training only.")
-        args.npz_dir = None
+    # Determine training mode
+    training_mode = "mimic" if args.npz_dir and os.path.exists(args.npz_dir) else "live"
+    if training_mode == "mimic":
+        global_logger.info(f"Training in mimic mode using NPZ directory: {args.npz_dir}")
+    else:
+        global_logger.info("Training in live mode")
     
     # Training parameters
     policy_kwargs = {
@@ -268,7 +271,7 @@ def train(args):
     # Initialize model
     def initialize_model(env):
         if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
-            global_logger.info(f"Attempting to resume training from {args.model_path}")
+            global_logger.info(f"Resuming training from {args.model_path}")
             try:
                 model = PPO.load(args.model_path, env=env, device="cuda" if args.cuda else "cpu")
                 global_logger.info("Successfully loaded existing model")
@@ -287,61 +290,43 @@ def train(args):
             device="cuda" if args.cuda else "cpu"
         )
 
-    # Mixed training loop
-    total_timesteps = args.timesteps
-    timesteps_per_phase = args.phase_timesteps
-    remaining_timesteps = total_timesteps
-    phase_count = 0
+    # Set up environment
+    if training_mode == "mimic":
+        env_fns = [create_npz_replay_env(args.npz_dir) for _ in range(args.num_envs)]
+    else:
+        env_fns = [make_env for _ in range(args.num_envs)]
     
-    while remaining_timesteps > 0:
-        phase_timesteps = min(timesteps_per_phase, remaining_timesteps)
-        phase_count += 1
-        
-        # Randomly choose training mode
-        training_mode = "mimic" if args.npz_dir and np.random.random() < 0.5 else "live"
-        global_logger.info(f"Phase {phase_count}: Starting {training_mode} training for {phase_timesteps} timesteps")
-        
-        # Set up environment
-        if training_mode == "mimic":
-            env_fns = [create_npz_replay_env(args.npz_dir) for _ in range(args.num_envs)]
-        else:
-            env_fns = [make_env for _ in range(args.num_envs)]
-        
-        env = SubprocVecEnv(env_fns)
-        env = VecFrameStack(env, n_stack=4, channels_order='last')
-        from stable_baselines3.common.vec_env import VecTransposeImage
-        env = VecTransposeImage(env, skip=True)
-        
-        # Initialize or reuse model
-        if current_model is None:
-            current_model = initialize_model(env)
-        else:
-            current_model.set_env(env)
-        
-        # Callbacks
-        save_callback = SaveBestModelCallback(save_path=args.model_path)
-        exp_callback = ExperienceCollectionCallback()
-        callback = CallbackList([save_callback, exp_callback])
-        
-        # Train for phase
-        try:
-            current_model.learn(total_timesteps=phase_timesteps, callback=callback, progress_bar=args.progress_bar)
-            experience_data.extend(exp_callback.experience_data)
-        except Exception as e:
-            global_logger.error(f"Training phase {phase_count} failed: {e}")
-            env.close()
-            raise
-        
-        # Save model after phase
-        try:
-            current_model.save(args.model_path)
-            global_logger.info(f"Model saved after {training_mode} phase {phase_count} at {args.model_path}")
-        except Exception as e:
-            global_logger.error(f"Failed to save model after phase {phase_count}: {e}")
-        
-        # Clean up environment
+    env = SubprocVecEnv(env_fns)
+    env = VecFrameStack(env, n_stack=4, channels_order='last')
+    from stable_baselines3.common.vec_env import VecTransposeImage
+    env = VecTransposeImage(env, skip=True)
+    
+    # Initialize model
+    current_model = initialize_model(env)
+    
+    # Callbacks
+    save_callback = SaveBestModelCallback(save_path=args.model_path)
+    exp_callback = ExperienceCollectionCallback()
+    callback = CallbackList([save_callback, exp_callback])
+    
+    # Train
+    try:
+        current_model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
+        experience_data.extend(exp_callback.experience_data)
+    except Exception as e:
+        global_logger.error(f"Training failed: {e}")
         env.close()
-        remaining_timesteps -= phase_timesteps
+        raise
+    
+    # Save final model
+    try:
+        current_model.save(args.model_path)
+        global_logger.info(f"Final model saved at {args.model_path}")
+    except Exception as e:
+        global_logger.error(f"Failed to save final model: {e}")
+    
+    # Clean up
+    env.close()
     
     # Final logging
     experience_count = len(experience_data)
@@ -350,22 +335,21 @@ def train(args):
     with open(f"{args.model_path}_experience_count.txt", "w") as f:
         f.write(f"Total experience collected: {experience_count} steps\n")
         f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Training parameters: num_envs={args.num_envs}, total_timesteps={args.timesteps}, phase_timesteps={args.phase_timesteps}\n")
-        if args.npz_dir:
+        f.write(f"Training parameters: num_envs={args.num_envs}, total_timesteps={args.timesteps}, mode={training_mode}\n")
+        if args.npz_dir and training_mode == "mimic":
             f.write(f"NPZ directory: {args.npz_dir}\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with mixed live and mimic training")
-    parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo_mixed", help="Path to save the trained model")
+    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with live or mimic training")
+    parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo", help="Path to save the trained model")
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps for training")
-    parser.add_argument("--phase_timesteps", type=int, default=20000, help="Timesteps per training phase")
     parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
-    parser.add_argument("--npz_dir", default="recordings", help="Directory containing NPZ recordings for mimic training")
+    parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for mimic training")
     
     args = parser.parse_args()
     train(args)
