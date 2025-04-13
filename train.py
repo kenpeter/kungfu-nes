@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import zipfile
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack, DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.utils import get_linear_fn
 import logging
@@ -223,51 +223,13 @@ class NPZReplayEnvironment:
             'closest_enemy_direction': np.zeros(1, dtype=np.float32),
         }
         
-        return obs, bonus, done, {"mimic_training": True}
+        return obs, reward, done, {"mimic_training": True}
     
     def close(self):
         pass
 
 def create_npz_replay_env(npz_dir):
     return lambda: NPZReplayEnvironment(npz_dir)
-
-class RenderCallback(BaseCallback):
-    def __init__(self, render_env, render_freq=1000, speedup=2.0, verbose=0):
-        super().__init__(verbose)
-        self.render_env = render_env
-        self.render_freq = render_freq
-        self.speedup = speedup
-        self.step_count = 0
-        self.last_obs = None
-
-    def _on_step(self) -> bool:
-        self.step_count += 1
-        if self.step_count % self.render_freq == 0:
-            try:
-                # Get the latest observation and action
-                obs = self.locals.get('new_obs')
-                actions = self.locals.get('actions')
-                if obs is not None and actions is not None:
-                    self.last_obs = obs
-                    # Step the render environment with the same action
-                    for _ in range(int(self.speedup)):
-                        self.render_env.step(actions[0])  # Use first env's action
-                        self.render_env.render()
-            except Exception as e:
-                if global_logger:
-                    global_logger.warning(f"Rendering failed: {e}")
-                else:
-                    print(f"Rendering failed: {e}")
-        return True
-
-    def _on_training_end(self) -> None:
-        try:
-            self.render_env.close()
-        except Exception as e:
-            if global_logger:
-                global_logger.warning(f"Failed to close render env: {e}")
-            else:
-                print(f"Failed to close render env: {e}")
 
 def train(args):
     global current_model, global_logger, global_model_path, experience_data
@@ -339,35 +301,13 @@ def train(args):
     from stable_baselines3.common.vec_env import VecTransposeImage
     env = VecTransposeImage(env, skip=True)
     
-    # Set up rendering environment if requested
-    render_env = None
-    if args.render and training_mode != "mimic":
-        try:
-            import retro
-            from kungfu_env import KungFuWrapper
-            base_render_env = retro.make('KungFu-Nes')
-            render_env = KungFuWrapper(base_render_env)
-            render_env = DummyVecEnv([lambda: render_env])
-            render_env = VecFrameStack(render_env, n_stack=4, channels_order='last')
-            render_env = VecTransposeImage(render_env, skip=True)
-            global_logger.info(f"Rendering enabled with speedup factor {args.render_speedup}")
-        except Exception as e:
-            global_logger.warning(f"Failed to initialize rendering environment: {e}. Disabling rendering.")
-            args.render = False
-    
     # Initialize model
     current_model = initialize_model(env)
     
     # Callbacks
     save_callback = SaveBestModelCallback(save_path=args.model_path)
     exp_callback = ExperienceCollectionCallback()
-    callbacks = [save_callback, exp_callback]
-    
-    if args.render and render_env is not None:
-        render_callback = RenderCallback(render_env=render_env, render_freq=args.render_freq, speedup=args.render_speedup)
-        callbacks.append(render_callback)
-    
-    callback = CallbackList(callbacks)
+    callback = CallbackList([save_callback, exp_callback])
     
     # Train
     try:
@@ -375,8 +315,6 @@ def train(args):
         experience_data.extend(exp_callback.experience_data)
     except Exception as e:
         global_logger.error(f"Training failed: {e}")
-        if render_env:
-            render_env.close()
         env.close()
         raise
     
@@ -388,8 +326,6 @@ def train(args):
         global_logger.error(f"Failed to save final model: {e}")
     
     # Clean up
-    if render_env:
-        render_env.close()
     env.close()
     
     # Final logging
@@ -414,9 +350,6 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for mimic training")
-    parser.add_argument("--render", action="store_true", help="Render game UI during training")
-    parser.add_argument("--render_freq", type=int, default=1000, help="Frequency of rendering (steps)")
-    parser.add_argument("--render_speedup", type=float, default=2.0, help="Speed-up factor for rendering")
     
     args = parser.parse_args()
     train(args)
