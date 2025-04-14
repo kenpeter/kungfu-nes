@@ -15,13 +15,19 @@ python train.py  --cuda --progress_bar --timesteps 50 --resume --render
 
 
 
-python play.py
+
+python playback.py recordings/KungFu-Nes_1Player.Level1_k.back.npz
 
 
-python capture.py
 
 
-tensorboard --logdir=tensorboard_logs
+
+
+python playback.py recordings/your_recording.npz --speed 0.5  # Half speed
+python playback.py recordings/your_recording.npz --speed 2.0  # Double speed
+
+
+
 
 
 
