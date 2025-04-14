@@ -15,6 +15,8 @@ import signal
 import time
 import glob
 from kungfu_env import KungFuWrapper, SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES
+import threading
+import queue
 
 current_model = None
 global_logger = None
@@ -143,19 +145,72 @@ class SaveBestModelCallback(BaseCallback):
         return True
 
 class RenderCallback(BaseCallback):
-    def __init__(self, verbose=0):
+    def __init__(self, render_freq=256, fps=30, verbose=0):
         super().__init__(verbose)
+        self.render_freq = render_freq
+        self.fps = fps
+        self.step_count = 0
+        self.render_queue = queue.Queue(maxsize=1)
+        self.render_thread = threading.Thread(target=self._render_loop, daemon=True)
+        self.last_render_time = time.time()
+        self.render_env = None
+        self.render_thread.start()
+    
+    def _render_loop(self):
+        while True:
+            try:
+                # Only get new env if queue has something
+                if not self.render_queue.empty():
+                    self.render_env = self.render_queue.get()
+                    self.render_queue.task_done()
+                
+                if self.render_env:
+                    start_time = time.time()
+                    target_frame_time = 1.0 / self.fps
+                    if start_time - self.last_render_time >= target_frame_time:
+                        self.render_env.render(mode='human')
+                        self.last_render_time = start_time
+                        render_time = time.time() - start_time
+                        global_logger.debug(f"Render time: {render_time:.3f}s, Queue size: {self.render_queue.qsize()}")
+                        if render_time > target_frame_time:
+                            global_logger.debug(f"Render time exceeds frame target: {render_time:.3f}s vs {target_frame_time:.3f}s")
+                    # Sleep to maintain FPS
+                    time.sleep(max(0, target_frame_time - (time.time() - start_time)))
+                else:
+                    time.sleep(0.01)  # Avoid busy-waiting if no env
+            except Exception as e:
+                global_logger.warning(f"Render thread error: {e}")
+                time.sleep(0.01)
     
     def _on_step(self) -> bool:
-        self.training_env.render(mode='human')
+        self.step_count += 1
+        if self.step_count % self.render_freq == 0:
+            try:
+                # Only put if queue is empty
+                if self.render_queue.qsize() == 0:
+                    self.render_queue.put(self.training_env)
+                    global_logger.debug(f"Queued render at step {self.step_count}")
+            except Exception as e:
+                global_logger.warning(f"Queue error: {e}")
         return True
+    
+    def _on_training_end(self) -> None:
+        if self.render_env:
+            try:
+                self.render_env.close()
+                global_logger.info("Closed render environment")
+            except Exception as e:
+                global_logger.warning(f"Error closing render env: {e}")
 
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[logging.StreamHandler()]
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(os.path.join(log_dir, 'training.log'))
+        ]
     )
     return logging.getLogger()
 
@@ -224,7 +279,7 @@ class NPZReplayEnvironment:
             self.current_frame_idx = len(self.frames) - 1
         
         obs = {
-            'viewport': frame,
+            'viewport': self.frames[0],
             'enemy_vector': np.zeros(KUNGFU_MAX_ENEMIES * 2, dtype=np.float32),
             'combat_status': np.zeros(2, dtype=np.float32),
             'projectile_vectors': np.zeros(MAX_PROJECTILES * 4, dtype=np.float32),
@@ -281,8 +336,8 @@ def train(args):
     # Training parameters
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
-        "features_extractor_kwargs": {"features_dim": 512, "n_stack": 4},
-        "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])
+        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},  # Reduced features_dim
+        "net_arch": dict(pi=[128, 128], vf=[256, 256])  # Simplified architecture
     }
     learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
 
@@ -290,9 +345,9 @@ def train(args):
         "learning_rate": learning_rate_schedule,
         "clip_range": args.clip_range,
         "ent_coef": 0.1,
-        "n_steps": min(2048, args.timesteps // args.num_envs if args.num_envs > 0 else args.timesteps),
-        "batch_size": 64,
-        "n_epochs": 10
+        "n_steps": 512,  # Reduced from 2048
+        "batch_size": 32,  # Reduced from 64
+        "n_epochs": 5,  # Reduced from 10
     }
 
     # Initialize model
@@ -340,7 +395,7 @@ def train(args):
     exp_callback = ExperienceCollectionCallback()
     callbacks = [save_callback, exp_callback]
     if args.render:
-        callbacks.append(RenderCallback())
+        callbacks.append(RenderCallback(render_freq=args.render_freq, fps=30))
     callback = CallbackList(callbacks)
     
     # Train
@@ -366,7 +421,7 @@ def train(args):
     experience_count = len(experience_data)
     global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
     
-    with open(f"{args.model_path}_experience_count.txt", "w") as f:
+    with open(f"{global_model_path}_experience_count.txt", "w") as f:
         f.write(f"Total experience collected: {experience_count} steps\n")
         f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Training parameters: num_envs={args.num_envs}, total_timesteps={args.timesteps}, mode={training_mode}\n")
@@ -385,6 +440,8 @@ if __name__ == "__main__":
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
     parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for mimic training")
     parser.add_argument("--render", action="store_true", help="Render the environment during training")
+    parser.add_argument("--render_freq", type=int, default=256, help="Render every N steps")
+    parser.add_argument("--render_fps", type=int, default=30, help="Target rendering FPS")
     
     args = parser.parse_args()
     train(args)
