@@ -6,68 +6,58 @@ import ctypes
 import os
 import time
 import numpy as np
-
+from datetime import datetime
 from pyglet import clock
 from pyglet.window import key as keycodes
 from pyglet.gl import *
-
 import retro
 
+# Constants
 SAVE_PERIOD = 60  # frames
-DEFAULT_GAME_SPEED = 1.0  # 1.0 is normal speed, lower values slow down the game
-STATE_SAVE_DIR = "saved_states"  # Directory for saved game states
-RECORDING_DIR = "recordings"     # Directory for ML training data
-
+DEFAULT_GAME_SPEED = 1.0
+STATE_SAVE_DIR = "saved_states"
+RECORDING_DIR = "recordings"
+MIN_RECORDING_LENGTH = 60  # Minimum frames to save a recording
+FRAME_SKIP = 2  # Record every Nth frame
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--scenario', help='scenario to use', default='scenario')
     parser.add_argument('--width', type=int, help='window width', default=800)
     parser.add_argument('--speed', type=float, help='game speed (1.0 is normal)', default=DEFAULT_GAME_SPEED)
+    parser.add_argument('--frame-skip', type=int, help='record every N frames', default=FRAME_SKIP)
     args = parser.parse_args()
 
-    game_speed = args.speed
-    print(f"Game speed set to: {game_speed}x (1.0 is normal speed)")
-
-    # Create directories for saved states and recordings
+    # Create directories if they don't exist
     os.makedirs(STATE_SAVE_DIR, exist_ok=True)
     os.makedirs(RECORDING_DIR, exist_ok=True)
 
-    # Placeholder for game and state (to be set by UI)
-    game = None
-    state = None
-    game_state_path = None
+    # Initialize game environment
+    game = 'KungFu-Nes'
+    state = '1Player.Level1'
+    game_state_path = os.path.join(STATE_SAVE_DIR, f"{game}_{state}.state")
+    
+    env = retro.make(
+        game=game,
+        state=state,
+        use_restricted_actions=retro.Actions.ALL,
+        scenario=args.scenario
+    )
+    obs = env.reset()
+    screen_height, screen_width = obs.shape[:2]
+    
+    # Verify button order matches training wrapper
+    EXPECTED_BUTTON_ORDER = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A', 'B', 'C', 'X', 'Y', 'Z', 'MODE', 'START', 'SELECT']
+    print("Button order verification:")
+    print(f"  Environment: {env.buttons}")
+    print(f"  Expected:    {EXPECTED_BUTTON_ORDER}")
+    if list(env.buttons) != EXPECTED_BUTTON_ORDER:
+        print("\nWARNING: Button order mismatch! This will cause training problems!")
+        print("Modify either capture.py or your training wrapper to use consistent button ordering.\n")
 
-    # Initialize environment (game and state will be set later via UI)
-    env = None
-    obs = None
-    screen_height, screen_width = None, None
-
-    def initialize_game(game_name, state_name):
-        nonlocal env, obs, screen_height, screen_width, game, state, game_state_path
-        game = game_name
-        state = state_name
-        game_state_path = os.path.join(STATE_SAVE_DIR, f"{game}_{state}.state")
-        env = retro.make(
-            game=game,
-            state=state,
-            use_restricted_actions=retro.Actions.ALL,
-            scenario=args.scenario
-        )
-        obs = env.reset()
-        screen_height, screen_width = obs.shape[:2]
-        print("Available buttons:", env.buttons)
-
-    # Simulate UI setting game and state (replace with actual UI logic)
-    # For demonstration, we'll use KungFu-Nes and 1Player.Level1 as per your example
-    initialize_game('KungFu-Nes', '1Player.Level1')
-
-    random.seed(0)
-
-    key_handler = pyglet.window.key.KeyStateHandler()
+    # Window setup
     win_width = args.width
     win_height = win_width * screen_height // screen_width
-
     win = pyglet.window.Window(
         width=win_width,
         height=win_height,
@@ -76,6 +66,7 @@ def main():
         style=pyglet.window.Window.WINDOW_STYLE_DEFAULT
     )
 
+    # Print controls
     print("\nWindow Controls:")
     print("- R: Toggle recording game segment for ML training")
     print("- O: Save current game state")
@@ -83,33 +74,30 @@ def main():
     print("- Game controls: Arrow keys, Z(A), X(B), C, A(X), S(Y), D(Z), ENTER(START), SPACE(SELECT), TAB(MODE)")
     print("- Press CTRL+C in terminal to force quit\n")
 
+    # Handle high DPI displays
     pixel_scale = 1.0
     if hasattr(win.context, '_nscontext'):
         pixel_scale = win.context._nscontext.view().backingScaleFactor()
-
     win.width = int(win.width // pixel_scale)
     win.height = int(win.height // pixel_scale)
 
+    # Input handling
+    key_handler = pyglet.window.key.KeyStateHandler()
     win.push_handlers(key_handler)
-
     key_previous_states = {}
 
-    steps = 0
-    recorded_actions = []
-    recorded_states = []
-
+    # Recording state
     is_recording = False
     recording_frames = []
     recording_actions = []
     recording_rewards = []
-    recording_count = 0
+    frame_counter = 0
 
-    pyglet.app.platform_event_loop.start()
-
+    # Performance monitoring
     fps_display = pyglet.window.FPSDisplay(win)
-
     pyglet.clock.schedule_interval(lambda dt: None, 1/60.0)
 
+    # OpenGL texture setup
     glEnable(GL_TEXTURE_2D)
     texture_id = GLuint(0)
     glGenTextures(1, ctypes.byref(texture_id))
@@ -120,38 +108,51 @@ def main():
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, screen_width, screen_height, 0, GL_RGB, GL_UNSIGNED_BYTE, None)
 
+    # Timing control
     last_frame_time = time.time()
-    frame_duration = 1/60.0 / game_speed
+    frame_duration = 1/60.0 / args.speed
 
     def update_caption():
         status = " [RECORDING]" if is_recording else ""
         win.set_caption(f"{game} - {state}{status} (Game Running)")
 
     def save_recording():
-        nonlocal recording_frames, recording_actions, recording_rewards, recording_count
-        if len(recording_frames) == 0:
-            print("No frames to save!")
+        nonlocal recording_frames, recording_actions, recording_rewards, frame_counter
+        
+        if len(recording_frames) < MIN_RECORDING_LENGTH:
+            print(f"Recording too short ({len(recording_frames)} frames) - discarded")
+            recording_frames = []
+            recording_actions = []
+            recording_rewards = []
             return
 
-        frames_array = np.array(recording_frames)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        recording_path = os.path.join(RECORDING_DIR, f"{game}_{state}_{timestamp}.npz")
+        
+        frames_array = np.array(recording_frames, dtype=np.uint8)
         actions_array = np.array(recording_actions)
         rewards_array = np.array(recording_rewards)
 
-        recording_path = os.path.join(RECORDING_DIR, f"{game}_{state}_rec{recording_count}.npz")
-        np.savez(
+        np.savez_compressed(
             recording_path,
             frames=frames_array,
             actions=actions_array,
-            rewards=rewards_array
+            rewards=rewards_array,
+            buttons=list(env.buttons),
+            scenario=args.scenario,
+            timestamp=timestamp,
+            game_speed=args.speed,
+            frame_skip=args.frame_skip
         )
+        
         print(f"Saved recording with {len(recording_frames)} frames to {recording_path}")
-
         recording_frames = []
         recording_actions = []
         recording_rewards = []
-        recording_count += 1
 
+    # Main game loop
     while not win.has_exit:
+        # Frame timing control
         current_time = time.time()
         elapsed = current_time - last_frame_time
         if elapsed < frame_duration:
@@ -159,33 +160,29 @@ def main():
         last_frame_time = time.time()
 
         win.dispatch_events()
-
         win.clear()
 
+        # Input processing
         keys_clicked = set()
         keys_pressed = set()
         for key_code, pressed in key_handler.items():
             if pressed:
                 keys_pressed.add(key_code)
-
             if not key_previous_states.get(key_code, False) and pressed:
                 keys_clicked.add(key_code)
             key_previous_states[key_code] = pressed
 
+        # Handle recording toggle
         if keycodes.R in keys_clicked:
-            if not is_recording:
-                is_recording = True
-                recording_frames = []
-                recording_actions = []
-                recording_rewards = []
+            is_recording = not is_recording
+            if is_recording:
                 print("Recording started for ML training data")
+                frame_counter = 0
             else:
-                is_recording = False
                 save_recording()
-                print("Recording stopped")
-
             update_caption()
 
+        # Handle state save/load
         if keycodes.O in keys_clicked:
             save_state = env.em.get_state()
             with open(game_state_path, "wb") as f:
@@ -201,6 +198,7 @@ def main():
             else:
                 print(f"No saved state found at {game_state_path}")
 
+        # Convert keyboard inputs to game actions
         inputs = {
             'A': keycodes.Z in keys_pressed,
             'B': keycodes.X in keys_pressed,
@@ -215,52 +213,52 @@ def main():
             'MODE': keycodes.TAB in keys_pressed,
             'START': keycodes.ENTER in keys_pressed,
             'SELECT': keycodes.SPACE in keys_pressed,
-            None: False
         }
 
-        action = []
-        for b in env.buttons:
-            if b in inputs:
-                action.append(inputs[b])
-            else:
-                action.append(False)
-
-        if steps % SAVE_PERIOD == 0:
-            recorded_states.append((steps, env.em.get_state()))
+        action = [inputs.get(b, False) for b in env.buttons]
         obs, rew, done, info = env.step(action)
-        recorded_actions.append(action)
-        steps += 1
 
-        if is_recording:
+        # Handle game over during recording
+        if done and is_recording:
+            print("Game over detected - saving recording")
+            save_recording()
+            is_recording = False
+            update_caption()
+            env.reset()
+
+        # Frame recording with skipping
+        frame_counter += 1
+        if is_recording and frame_counter % args.frame_skip == 0:
             recording_frames.append(obs.copy())
             recording_actions.append(action.copy())
             recording_rewards.append(rew)
 
+        # Rendering
         glBindTexture(GL_TEXTURE_2D, texture_id)
         video_buffer = ctypes.cast(obs.tobytes(), ctypes.POINTER(ctypes.c_short))
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, obs.shape[1], obs.shape[0], GL_RGB, GL_UNSIGNED_BYTE, video_buffer)
 
-        x = 0
-        y = 0
-        h = win.height
-        w = win.width
-
         pyglet.graphics.draw(
             4,
             pyglet.gl.GL_QUADS,
-            ('v2f', [x, y, x + w, y, x + w, y + h, x, y + h]),
+            ('v2f', [0, 0, win.width, 0, win.width, win.height, 0, win.height]),
             ('t2f', [0, 1, 1, 1, 1, 0, 0, 0]),
         )
 
         fps_display.draw()
-
         win.flip()
 
+        # Handle Pyglet event loop
         timeout = clock.get_sleep_time(False)
         pyglet.app.platform_event_loop.step(timeout)
-
         clock.tick()
 
+    # Cleanup
+    env.close()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCapture terminated by user")
+        sys.exit(0)
