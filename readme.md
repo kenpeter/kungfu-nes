@@ -17,6 +17,7 @@ python train.py  --cuda --progress_bar --timesteps 50 --resume --render
 
 
 python playback.py recordings/KungFu-Nes_1Player.Level1_k.back.npz
+python playback.py recordings/KungFu-Nes_1Player.Level1_k.punch.npz
 
 
 

@@ -23,8 +23,8 @@ def play():
     # Match the policy_kwargs from training
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
-        "features_extractor_kwargs": {"features_dim": 512, "n_stack": 4},
-        "net_arch": dict(pi=[256, 256, 128], vf=[512, 512, 256])
+        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},
+        "net_arch": dict(pi=[128, 128], vf=[256, 256])
     }
     custom_objects = {"policy_kwargs": policy_kwargs}
     model = PPO.load(model_path, env=env, custom_objects=custom_objects)

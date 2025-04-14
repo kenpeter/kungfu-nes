@@ -1,0 +1,37 @@
+SystemID NES
+0051	b	u	0	RAM	Game Mode
+0049	b	u	0	RAM	Frame Counter
+0069	b	u	0	RAM	Hero Action
+00D4	b	h	0	RAM	Screen Scroll 2
+00E5	b	h	0	RAM	Screen Scroll 1
+04A5	b	u	0	RAM	Boss HP
+04A6	b	u	0	RAM	Hero HP
+0058	b	u	0	RAM	Current Stage
+0531	b	h	0	RAM	Score 5
+0532	b	h	0	RAM	Score 4
+0533	b	h	0	RAM	Score 3
+0534	b	h	0	RAM	Score 2
+0535	b	h	0	RAM	Score 1
+0021	b	u	0	RAM	Hero Action Timer
+0094	b	u	0	RAM	Hero Screen Pos X
+00B6	b	u	0	RAM	Hero Pos Y
+036A	b	u	0	RAM	Hero Air Mode
+0008	b	u	0	RAM	Game Submode
+0378	b	u	0	RAM	Shrug Counter
+002B	b	u	0	RAM	Enemy 1 Action Timer
+002C	b	u	0	RAM	Enemy 2 Action Timer
+002D	b	u	0	RAM	Enemy 3 Action Timer
+002E	b	u	0	RAM	Enemy 4 Action Timer
+008E	b	u	0	RAM	Enemy 1 Pos X
+008F	b	u	0	RAM	Enemy 2 Pos X
+0090	b	u	0	RAM	Enemy 3 Pos X
+0091	b	u	0	RAM	Enemy 4 Pos X
+0080	b	h	0	RAM	Enemy 1 Action
+0081	b	h	0	RAM	Enemy 2 Action
+0082	b	h	0	RAM	Enemy 3 Action
+0083	b	h	0	RAM	Enemy 4 Action
+0374	b	u	0	RAM	Grab Counter
+0090	b	h	0	RAM	Boss Pos X
+004E	b	u	0	RAM	Boss Action
+0093	b	u	0	RAM	Boss Pos X
+
