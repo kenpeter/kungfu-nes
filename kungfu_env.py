@@ -1,12 +1,13 @@
-import retro
+import gymnasium as gym
 import numpy as np
-from gym import spaces, Wrapper
+from gymnasium import spaces, Wrapper
 import cv2
 import torch
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from stable_baselines3.common.monitor import Monitor
+import retro
 
 KUNGFU_MAX_ENEMIES = 5
 MAX_PROJECTILES = 2
@@ -14,9 +15,8 @@ MAX_PROJECTILES = 2
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        test_frame = env.reset()
-        self.true_height, self.true_width = test_frame.shape[:2]
-        
+        obs, _ = env.reset()
+        self.true_height, self.true_width = obs.shape[:2]
         self.viewport_size = (self.true_width, self.true_height)
         
         self.actions = [
@@ -61,8 +61,8 @@ class KungFuWrapper(Wrapper):
         self.prev_min_enemy_dist = 255
         self.last_movement = None
 
-    def reset(self, **kwargs):
-        obs = self.env.reset(**kwargs)
+    def reset(self, seed=None, options=None, **kwargs):
+        obs, info = self.env.reset(seed=seed, options=options, **kwargs)
         self.last_hp = float(self.env.get_ram()[0x04A6])
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
@@ -73,12 +73,12 @@ class KungFuWrapper(Wrapper):
         self.survival_reward_total = 0
         self.prev_min_enemy_dist = 255
         self.last_movement = None
-        return self._get_obs(obs)
+        return self._get_obs(obs), info
 
     def step(self, action):
         self.total_steps += 1
         self.action_counts[action] += 1
-        obs, _, done, info = self.env.step(self.actions[action])
+        obs, reward, terminated, truncated, info = self.env.step(self.actions[action])
         ram = self.env.get_ram()
         
         hp = float(ram[0x04A6])
@@ -94,7 +94,7 @@ class KungFuWrapper(Wrapper):
             reward += hp_change_rate * 5
 
         reward += enemy_hit * 10
-        if done:
+        if terminated or truncated:
             reward -= 50
 
         projectile_info = self._detect_projectiles(obs)
@@ -154,7 +154,7 @@ class KungFuWrapper(Wrapper):
                                 np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
         reward += action_entropy * 0.1
         
-        if not done and hp > 0:
+        if not (terminated or truncated) and hp > 0:
             reward += 0.05
             self.survival_reward_total += 0.05
 
@@ -183,7 +183,7 @@ class KungFuWrapper(Wrapper):
             "closest_enemy_direction": closest_enemy_dir
         })
         
-        return self._get_obs(obs), normalized_reward, done, info
+        return self._get_obs(obs), normalized_reward, terminated, truncated, info
     
     def _update_boss_info(self, ram):
         stage = int(ram[0x0058])
@@ -218,7 +218,7 @@ class KungFuWrapper(Wrapper):
             projectile_info = projectile_info[:self.max_projectiles * 4]
             while len(projectile_info) < self.max_projectiles * 4:
                 projectile_info.append(0)
-            self.prev_frame = frame.copy()  # Ensure frame is copied to avoid reference issues
+            self.prev_frame = frame.copy()
             return projectile_info
         self.prev_frame = frame.copy()
         return [0] * (self.max_projectiles * 4)
@@ -254,11 +254,11 @@ class KungFuWrapper(Wrapper):
         }
 
 class SimpleCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=512, n_stack=4):
+    def __init__(self, observation_space, features_dim=256, n_stack=4):
         super().__init__(observation_space, features_dim)
         viewport_shape = observation_space["viewport"].shape
         height, width = viewport_shape[0], viewport_shape[1]
-        input_channels = 3 * n_stack  # 3 channels per frame * number of stacked frames
+        input_channels = 3 * n_stack
 
         self.cnn = nn.Sequential(
             nn.Conv2d(input_channels, 64, kernel_size=5, stride=2, padding=2),
@@ -293,7 +293,7 @@ class SimpleCNN(BaseFeaturesExtractor):
 
     def forward(self, observations):
         viewport = observations["viewport"].float() / 255.0
-        viewport = viewport.permute(0, 3, 1, 2)  # [batch, H, W, C] -> [batch, C, H, W]
+        viewport = viewport.permute(0, 3, 1, 2)
         cnn_output = self.cnn(viewport)
 
         non_visual = torch.cat([
@@ -311,6 +311,6 @@ class SimpleCNN(BaseFeaturesExtractor):
         return self.linear(combined)
 
 def make_env():
-    env = retro.make(game='KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
+    env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = Monitor(KungFuWrapper(env))
     return env

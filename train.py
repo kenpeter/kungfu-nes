@@ -46,7 +46,13 @@ def emergency_save_handler(signum, frame):
                 print(f"Emergency save failed: {e}")
         
         if hasattr(current_model, 'env'):
-            current_model.env.close()
+            try:
+                current_model.env.close()
+            except Exception as e:
+                if global_logger:
+                    global_logger.warning(f"Failed to close environment: {e}")
+                else:
+                    print(f"Failed to close environment: {e}")
         if args.cuda:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -159,7 +165,6 @@ class RenderCallback(BaseCallback):
     def _render_loop(self):
         while True:
             try:
-                # Only get new env if queue has something
                 if not self.render_queue.empty():
                     self.render_env = self.render_queue.get()
                     self.render_queue.task_done()
@@ -174,10 +179,9 @@ class RenderCallback(BaseCallback):
                         global_logger.debug(f"Render time: {render_time:.3f}s, Queue size: {self.render_queue.qsize()}")
                         if render_time > target_frame_time:
                             global_logger.debug(f"Render time exceeds frame target: {render_time:.3f}s vs {target_frame_time:.3f}s")
-                    # Sleep to maintain FPS
                     time.sleep(max(0, target_frame_time - (time.time() - start_time)))
                 else:
-                    time.sleep(0.01)  # Avoid busy-waiting if no env
+                    time.sleep(0.01)
             except Exception as e:
                 global_logger.warning(f"Render thread error: {e}")
                 time.sleep(0.01)
@@ -186,7 +190,6 @@ class RenderCallback(BaseCallback):
         self.step_count += 1
         if self.step_count % self.render_freq == 0:
             try:
-                # Only put if queue is empty
                 if self.render_queue.qsize() == 0:
                     self.render_queue.put(self.training_env)
                     global_logger.debug(f"Queued render at step {self.step_count}")
@@ -238,7 +241,7 @@ class NPZReplayEnvironment:
         self.current_frame_idx = 0
     
     def _setup_spaces(self):
-        from gym import spaces
+        from gymnasium import spaces
         import numpy as np
 
         first_frame = self.frames[0]
@@ -255,28 +258,11 @@ class NPZReplayEnvironment:
         
         self.action_space = spaces.Discrete(11)
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            np.random.seed(seed)
         self.current_file_idx = np.random.randint(0, len(self.npz_files))
         self.load_current_npz()
-        
-        return {
-            'viewport': self.frames[0],
-            'enemy_vector': np.zeros(KUNGFU_MAX_ENEMIES * 2, dtype=np.float32),
-            'combat_status': np.zeros(2, dtype=np.float32),
-            'projectile_vectors': np.zeros(MAX_PROJECTILES * 4, dtype=np.float32),
-            'enemy_proximity': np.zeros(1, dtype=np.float32),
-            'boss_info': np.zeros(3, dtype=np.float32),
-            'closest_enemy_direction': np.zeros(1, dtype=np.float32),
-        }
-    
-    def step(self, action):
-        frame = self.frames[self.current_frame_idx]
-        reward = self.rewards[self.current_frame_idx]
-        
-        self.current_frame_idx += 1
-        done = self.current_frame_idx >= len(self.frames) - 1
-        if done:
-            self.current_frame_idx = len(self.frames) - 1
         
         obs = {
             'viewport': self.frames[0],
@@ -287,17 +273,39 @@ class NPZReplayEnvironment:
             'boss_info': np.zeros(3, dtype=np.float32),
             'closest_enemy_direction': np.zeros(1, dtype=np.float32),
         }
+        return obs, {"mimic_training": True}
+    
+    def step(self, action):
+        frame = self.frames[self.current_frame_idx]
+        reward = self.rewards[self.current_frame_idx]
         
-        return obs, reward, done, {"mimic_training": True}
+        self.current_frame_idx += 1
+        terminated = self.current_frame_idx >= len(self.frames) - 1
+        truncated = False
+        
+        if terminated:
+            self.current_frame_idx = len(self.frames) - 1
+        
+        obs = {
+            'viewport': frame,
+            'enemy_vector': np.zeros(KUNGFU_MAX_ENEMIES * 2, dtype=np.float32),
+            'combat_status': np.zeros(2, dtype=np.float32),
+            'projectile_vectors': np.zeros(MAX_PROJECTILES * 4, dtype=np.float32),
+            'enemy_proximity': np.zeros(1, dtype=np.float32),
+            'boss_info': np.zeros(3, dtype=np.float32),
+            'closest_enemy_direction': np.zeros(1, dtype=np.float32),
+        }
+        
+        return obs, reward, terminated, truncated, {"mimic_training": True}
     
     def render(self, mode='human'):
-        pass  # NPZ environment doesn't support rendering
+        pass
     
     def close(self):
         pass
 
 def make_kungfu_env():
-    base_env = retro.make('KungFu-Nes')
+    base_env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
     env = KungFuWrapper(base_env)
     return env
 
@@ -317,14 +325,12 @@ def train(args):
     if args.num_envs < 1:
         raise ValueError("Number of environments must be at least 1")
     
-    # Determine training mode
     training_mode = "mimic" if args.npz_dir and os.path.exists(args.npz_dir) else "live"
     if training_mode == "mimic":
         global_logger.info(f"Training in mimic mode using NPZ directory: {args.npz_dir}")
     else:
         global_logger.info("Training in live mode")
     
-    # Adjust num_envs if rendering is enabled
     if args.render:
         if training_mode == "mimic":
             global_logger.warning("Rendering is not supported in mimic mode. Ignoring --render flag.")
@@ -333,11 +339,10 @@ def train(args):
             global_logger.info("Rendering enabled. Using a single environment for visualization.")
             args.num_envs = 1
 
-    # Training parameters
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
-        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},  # Reduced features_dim
-        "net_arch": dict(pi=[128, 128], vf=[256, 256])  # Simplified architecture
+        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},
+        "net_arch": dict(pi=[128, 128], vf=[256, 256])
     }
     learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
 
@@ -345,12 +350,11 @@ def train(args):
         "learning_rate": learning_rate_schedule,
         "clip_range": args.clip_range,
         "ent_coef": 0.1,
-        "n_steps": 512,  # Reduced from 2048
-        "batch_size": 32,  # Reduced from 64
-        "n_epochs": 5,  # Reduced from 10
+        "n_steps": 512,
+        "batch_size": 32,
+        "n_epochs": 5,
     }
 
-    # Initialize model
     def initialize_model(env):
         if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
             global_logger.info(f"Resuming training from {args.model_path}")
@@ -373,7 +377,6 @@ def train(args):
             device="cuda" if args.cuda else "cpu"
         )
 
-    # Set up environment
     if training_mode == "mimic":
         env_fns = [create_npz_replay_env(args.npz_dir) for _ in range(args.num_envs)]
     else:
@@ -387,10 +390,8 @@ def train(args):
     env = VecFrameStack(env, n_stack=4, channels_order='last')
     env = VecTransposeImage(env, skip=True)
     
-    # Initialize model
     current_model = initialize_model(env)
     
-    # Callbacks
     save_callback = SaveBestModelCallback(save_path=args.model_path)
     exp_callback = ExperienceCollectionCallback()
     callbacks = [save_callback, exp_callback]
@@ -398,26 +399,28 @@ def train(args):
         callbacks.append(RenderCallback(render_freq=args.render_freq, fps=30))
     callback = CallbackList(callbacks)
     
-    # Train
     try:
         current_model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
         experience_data.extend(exp_callback.experience_data)
     except Exception as e:
         global_logger.error(f"Training failed: {e}")
-        env.close()
+        try:
+            env.close()
+        except Exception as close_e:
+            global_logger.warning(f"Failed to close environment: {close_e}")
         raise
     
-    # Save final model
     try:
         current_model.save(args.model_path)
         global_logger.info(f"Final model saved at {args.model_path}")
     except Exception as e:
         global_logger.error(f"Failed to save final model: {e}")
     
-    # Clean up
-    env.close()
+    try:
+        env.close()
+    except Exception as e:
+        global_logger.warning(f"Failed to close environment during cleanup: {e}")
     
-    # Final logging
     experience_count = len(experience_data)
     global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
     
