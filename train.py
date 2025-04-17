@@ -17,6 +17,8 @@ import glob
 from kungfu_env import KungFuWrapper, SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES
 import threading
 import queue
+import gymnasium as gym
+from gymnasium import spaces  # Added this line to fix the NameError
 
 current_model = None
 global_logger = None
@@ -217,8 +219,9 @@ def setup_logging(log_dir):
     )
     return logging.getLogger()
 
-class NPZReplayEnvironment:
+class NPZReplayEnvironment(gym.Env):
     def __init__(self, npz_directory):
+        super().__init__()
         self.npz_files = glob.glob(os.path.join(npz_directory, '*.npz'))
         if not self.npz_files:
             raise ValueError(f"No NPZ files found in directory: {npz_directory}")
@@ -227,10 +230,7 @@ class NPZReplayEnvironment:
         self.current_frame_idx = 0
         self.load_current_npz()
         
-        self.observation_space = None
-        self.action_space = None
         self.num_envs = 1
-        
         self._setup_spaces()
     
     def load_current_npz(self):
@@ -241,9 +241,6 @@ class NPZReplayEnvironment:
         self.current_frame_idx = 0
     
     def _setup_spaces(self):
-        from gymnasium import spaces
-        import numpy as np
-
         first_frame = self.frames[0]
         
         self.observation_space = spaces.Dict({
@@ -257,7 +254,7 @@ class NPZReplayEnvironment:
         })
         
         self.action_space = spaces.Discrete(11)
-
+    
     def reset(self, seed=None, options=None):
         if seed is not None:
             np.random.seed(seed)
@@ -299,7 +296,9 @@ class NPZReplayEnvironment:
         return obs, reward, terminated, truncated, {"mimic_training": True}
     
     def render(self, mode='human'):
-        pass
+        if mode == 'rgb_array':
+            return self.frames[self.current_frame_idx]
+        return None
     
     def close(self):
         pass
