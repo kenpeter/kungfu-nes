@@ -19,9 +19,9 @@ import threading
 import queue
 import gymnasium as gym
 from gymnasium import spaces
-from sb3_contrib.common.envs import ExpertDataset
-from sb3_contrib.gail import GAIL
-
+from imitation.algorithms.adversarial.gail import GAIL
+from imitation.data.types import Trajectory
+import pickle
 
 current_model = None
 global_logger = None
@@ -315,22 +315,28 @@ def create_npz_replay_env(npz_dir):
     return lambda: NPZReplayEnvironment(npz_dir)
 
 def create_expert_dataset(npz_dir):
-    """Create an ExpertDataset from NPZ files for GAIL training."""
+    """Create an expert dataset for imitation's GAIL from NPZ files."""
     npz_files = glob.glob(os.path.join(npz_dir, '*.npz'))
     if not npz_files:
         raise ValueError(f"No NPZ files found in directory: {npz_dir}")
     
-    observations = []
-    actions = []
-    rewards = []
-    
+    trajectories = []
     for npz_file in npz_files:
         npz_data = np.load(npz_file)
         frames = npz_data['frames']
-        npz_actions = npz_data['actions']
-        npz_rewards = npz_data['rewards']
+        actions = npz_data['actions']
+        
+        # Ensure len(obs) == len(acts) + 1
+        if len(frames) == len(actions):
+            # Truncate actions to be one less than frames
+            actions = actions[:-1]
+        elif len(frames) != len(actions) + 1:
+            # Skip or log invalid files
+            print(f"Warning: Skipping {npz_file} due to invalid length: {len(frames)} frames, {len(actions)} actions")
+            continue
         
         # Convert frames to observation dicts
+        observations = []
         for frame in frames:
             obs = {
                 'viewport': frame,
@@ -342,16 +348,22 @@ def create_expert_dataset(npz_dir):
                 'closest_enemy_direction': np.zeros(1, dtype=np.float32),
             }
             observations.append(obs)
-        actions.extend(npz_actions)
-        rewards.extend(npz_rewards)
+        
+        # Create a Trajectory object
+        trajectory = Trajectory(
+            obs=np.array(observations, dtype=object),
+            acts=actions,
+            infos=None,
+            terminal=len(frames) >= len(actions) + 1
+        )
+        trajectories.append(trajectory)
     
-    return ExpertDataset(
-        observations=observations,
-        actions=np.array(actions),
-        rewards=np.array(rewards),
-        traj_data=None,  # No trajectory data needed for this use case
-        batch_size=32
-    )
+    # Save trajectories to a pickle file for compatibility
+    dataset_path = os.path.join(npz_dir, "expert_trajectories.pkl")
+    with open(dataset_path, 'wb') as f:
+        pickle.dump(trajectories, f)
+    
+    return trajectories
 
 def train(args):
     global current_model, global_logger, global_model_path, experience_data
@@ -396,14 +408,25 @@ def train(args):
         "n_epochs": 5,
     }
 
-    def initialize_model(env, expert_dataset=None):
+    def initialize_model(env, expert_trajectories=None):
         if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
             global_logger.info(f"Resuming training from {args.model_path}")
             try:
                 custom_objects = {"policy_kwargs": policy_kwargs}
-                if training_mode == "mimic" and expert_dataset is not None:
-                    model = GAIL.load(args.model_path, env=env, expert_dataset=expert_dataset,
-                                    custom_objects=custom_objects, device="cuda" if args.cuda else "cpu")
+                if training_mode == "mimic" and expert_trajectories is not None:
+                    # Load the underlying PPO policy and re-initialize GAIL
+                    ppo_model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
+                                       device="cuda" if args.cuda else "cpu")
+                    model = GAIL(
+                        venv=env,
+                        gen_algo=ppo_model,
+                        demonstrations=expert_trajectories,
+                        **params,
+                        gamma=0.99,
+                        gae_lambda=0.95,
+                        verbose=1,
+                        device="cuda" if args.cuda else "cpu"
+                    )
                 else:
                     model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
                                    device="cuda" if args.cuda else "cpu")
@@ -413,16 +436,25 @@ def train(args):
                 global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
         
         global_logger.info("Starting new training session")
-        if training_mode == "mimic" and expert_dataset is not None:
-            return GAIL(
+        if training_mode == "mimic" and expert_trajectories is not None:
+            ppo_policy = PPO(
                 "MultiInputPolicy",
                 env,
-                expert_dataset=expert_dataset,
                 **params,
                 gamma=0.99,
                 gae_lambda=0.95,
                 verbose=1,
                 policy_kwargs=policy_kwargs,
+                device="cuda" if args.cuda else "cpu"
+            )
+            return GAIL(
+                venv=env,
+                gen_algo=ppo_policy,
+                demonstrations=expert_trajectories,
+                **params,
+                gamma=0.99,
+                gae_lambda=0.95,
+                verbose=1,
                 device="cuda" if args.cuda else "cpu"
             )
         return PPO(
@@ -437,12 +469,12 @@ def train(args):
         )
 
     # Create environment and expert dataset
-    expert_dataset = None
+    expert_trajectories = None
     if training_mode == "mimic":
         env_fns = [create_npz_replay_env(args.npz_dir) for _ in range(args.num_envs)]
         try:
-            expert_dataset = create_expert_dataset(args.npz_dir)
-            global_logger.info(f"Loaded expert dataset with {len(expert_dataset.observations)} demonstrations")
+            expert_trajectories = create_expert_dataset(args.npz_dir)
+            global_logger.info(f"Loaded expert dataset with {len(expert_trajectories)} trajectories")
         except Exception as e:
             global_logger.error(f"Failed to create expert dataset: {e}")
             raise
@@ -457,7 +489,7 @@ def train(args):
     env = VecFrameStack(env, n_stack=4, channels_order='last')
     env = VecTransposeImage(env, skip=True)
     
-    current_model = initialize_model(env, expert_dataset)
+    current_model = initialize_model(env, expert_trajectories)
     
     save_callback = SaveBestModelCallback(save_path=args.model_path)
     exp_callback = ExperienceCollectionCallback()
