@@ -18,7 +18,10 @@ from kungfu_env import KungFuWrapper, SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECT
 import threading
 import queue
 import gymnasium as gym
-from gymnasium import spaces  # Added this line to fix the NameError
+from gymnasium import spaces
+from sb3_contrib.common.envs import ExpertDataset
+from sb3_contrib.gail import GAIL
+
 
 current_model = None
 global_logger = None
@@ -311,6 +314,45 @@ def make_kungfu_env():
 def create_npz_replay_env(npz_dir):
     return lambda: NPZReplayEnvironment(npz_dir)
 
+def create_expert_dataset(npz_dir):
+    """Create an ExpertDataset from NPZ files for GAIL training."""
+    npz_files = glob.glob(os.path.join(npz_dir, '*.npz'))
+    if not npz_files:
+        raise ValueError(f"No NPZ files found in directory: {npz_dir}")
+    
+    observations = []
+    actions = []
+    rewards = []
+    
+    for npz_file in npz_files:
+        npz_data = np.load(npz_file)
+        frames = npz_data['frames']
+        npz_actions = npz_data['actions']
+        npz_rewards = npz_data['rewards']
+        
+        # Convert frames to observation dicts
+        for frame in frames:
+            obs = {
+                'viewport': frame,
+                'enemy_vector': np.zeros(KUNGFU_MAX_ENEMIES * 2, dtype=np.float32),
+                'combat_status': np.zeros(2, dtype=np.float32),
+                'projectile_vectors': np.zeros(MAX_PROJECTILES * 4, dtype=np.float32),
+                'enemy_proximity': np.zeros(1, dtype=np.float32),
+                'boss_info': np.zeros(3, dtype=np.float32),
+                'closest_enemy_direction': np.zeros(1, dtype=np.float32),
+            }
+            observations.append(obs)
+        actions.extend(npz_actions)
+        rewards.extend(npz_rewards)
+    
+    return ExpertDataset(
+        observations=observations,
+        actions=np.array(actions),
+        rewards=np.array(rewards),
+        traj_data=None,  # No trajectory data needed for this use case
+        batch_size=32
+    )
+
 def train(args):
     global current_model, global_logger, global_model_path, experience_data
     experience_data = []
@@ -354,17 +396,35 @@ def train(args):
         "n_epochs": 5,
     }
 
-    def initialize_model(env):
+    def initialize_model(env, expert_dataset=None):
         if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
             global_logger.info(f"Resuming training from {args.model_path}")
             try:
                 custom_objects = {"policy_kwargs": policy_kwargs}
-                model = PPO.load(args.model_path, env=env, custom_objects=custom_objects, device="cuda" if args.cuda else "cpu")
+                if training_mode == "mimic" and expert_dataset is not None:
+                    model = GAIL.load(args.model_path, env=env, expert_dataset=expert_dataset,
+                                    custom_objects=custom_objects, device="cuda" if args.cuda else "cpu")
+                else:
+                    model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
+                                   device="cuda" if args.cuda else "cpu")
                 global_logger.info("Successfully loaded existing model")
                 return model
             except Exception as e:
                 global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
+        
         global_logger.info("Starting new training session")
+        if training_mode == "mimic" and expert_dataset is not None:
+            return GAIL(
+                "MultiInputPolicy",
+                env,
+                expert_dataset=expert_dataset,
+                **params,
+                gamma=0.99,
+                gae_lambda=0.95,
+                verbose=1,
+                policy_kwargs=policy_kwargs,
+                device="cuda" if args.cuda else "cpu"
+            )
         return PPO(
             "MultiInputPolicy",
             env,
@@ -376,8 +436,16 @@ def train(args):
             device="cuda" if args.cuda else "cpu"
         )
 
+    # Create environment and expert dataset
+    expert_dataset = None
     if training_mode == "mimic":
         env_fns = [create_npz_replay_env(args.npz_dir) for _ in range(args.num_envs)]
+        try:
+            expert_dataset = create_expert_dataset(args.npz_dir)
+            global_logger.info(f"Loaded expert dataset with {len(expert_dataset.observations)} demonstrations")
+        except Exception as e:
+            global_logger.error(f"Failed to create expert dataset: {e}")
+            raise
     else:
         env_fns = [make_kungfu_env for _ in range(args.num_envs)]
     
@@ -389,7 +457,7 @@ def train(args):
     env = VecFrameStack(env, n_stack=4, channels_order='last')
     env = VecTransposeImage(env, skip=True)
     
-    current_model = initialize_model(env)
+    current_model = initialize_model(env, expert_dataset)
     
     save_callback = SaveBestModelCallback(save_path=args.model_path)
     exp_callback = ExperienceCollectionCallback()
@@ -431,16 +499,16 @@ def train(args):
             f.write(f"NPZ directory: {args.npz_dir}\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with live or mimic training")
+    parser = argparse.ArgumentParser(description="Train a PPO or GAIL model for Kung Fu with live or mimic training")
     parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo", help="Path to save the trained model")
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps for training")
-    parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO")
+    parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO/GAIL")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
-    parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for mimic training")
+    parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for mimic training with GAIL")
     parser.add_argument("--render", action="store_true", help="Render the environment during training")
     parser.add_argument("--render_freq", type=int, default=256, help="Render every N steps")
     parser.add_argument("--render_fps", type=int, default=30, help="Target rendering FPS")
