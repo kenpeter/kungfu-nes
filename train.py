@@ -21,6 +21,8 @@ import gymnasium as gym
 from gymnasium import spaces
 from imitation.algorithms.adversarial.gail import GAIL
 from imitation.data.types import Trajectory
+from imitation.rewards.reward_nets import BasicRewardNet
+from imitation.util.networks import RunningNorm
 import pickle
 
 current_model = None
@@ -417,11 +419,19 @@ def train(args):
                     # Load the underlying PPO policy and re-initialize GAIL
                     ppo_model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
                                        device="cuda" if args.cuda else "cpu")
+                    # Create reward_net for the discriminator
+                    reward_net = BasicRewardNet(
+                        observation_space=env.observation_space,
+                        action_space=env.action_space,
+                        normalize_input_layer=RunningNorm,
+                        hid_sizes=(64, 64),
+                    )
                     model = GAIL(
                         venv=env,
                         gen_algo=ppo_model,
                         demonstrations=expert_trajectories,
-                        **params,
+                        demo_batch_size=params["batch_size"],
+                        reward_net=reward_net,
                         gamma=0.99,
                         gae_lambda=0.95,
                         verbose=1,
@@ -440,18 +450,31 @@ def train(args):
             ppo_policy = PPO(
                 "MultiInputPolicy",
                 env,
-                **params,
+                learning_rate=params["learning_rate"],
+                clip_range=params["clip_range"],
+                ent_coef=params["ent_coef"],
+                n_steps=params["n_steps"],
+                batch_size=params["batch_size"],
+                n_epochs=params["n_epochs"],
                 gamma=0.99,
                 gae_lambda=0.95,
                 verbose=1,
                 policy_kwargs=policy_kwargs,
                 device="cuda" if args.cuda else "cpu"
             )
+            # Create reward_net for the discriminator
+            reward_net = BasicRewardNet(
+                observation_space=env.observation_space,
+                action_space=env.action_space,
+                normalize_input_layer=RunningNorm,
+                hid_sizes=(64, 64),
+            )
             return GAIL(
                 venv=env,
                 gen_algo=ppo_policy,
                 demonstrations=expert_trajectories,
-                **params,
+                demo_batch_size=params["batch_size"],
+                reward_net=reward_net,
                 gamma=0.99,
                 gae_lambda=0.95,
                 verbose=1,
@@ -460,7 +483,12 @@ def train(args):
         return PPO(
             "MultiInputPolicy",
             env,
-            **params,
+            learning_rate=params["learning_rate"],
+            clip_range=params["clip_range"],
+            ent_coef=params["ent_coef"],
+            n_steps=params["n_steps"],
+            batch_size=params["batch_size"],
+            n_epochs=params["n_epochs"],
             gamma=0.99,
             gae_lambda=0.95,
             verbose=1,
