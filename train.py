@@ -305,7 +305,7 @@ class NPZReplayEnvironment:
         pass
 
 def make_kungfu_env():
-    base_env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
+    base_env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array")
     env = KungFuWrapper(base_env)
     return env
 

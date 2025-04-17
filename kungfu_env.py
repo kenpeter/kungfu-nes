@@ -311,6 +311,6 @@ class SimpleCNN(BaseFeaturesExtractor):
         return self.linear(combined)
 
 def make_env():
-    env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL)
+    env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array")
     env = Monitor(KungFuWrapper(env))
     return env
