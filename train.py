@@ -97,11 +97,28 @@ class SaveBestModelCallback(BaseCallback):
         self.save_path = save_path
         self.best_score = 0
         self.behaviour_mode = behaviour_mode
+        # Define actions for reward calculations (match KungFuWrapper.actions)
+        self.actions = [
+            [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (0)
+            [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (1)
+            [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick (2)
+            [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch (3)
+            [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch (4)
+            [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch (5)
+            [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump (6)
+            [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch (7)
+            [0,0,1,0,0,0,1,0,0,0,0,0],  # Crouch+Punch (8)
+            [1,0,0,0,0,0,0,0,0,0,0,0],  # Right (9)
+            [0,1,0,0,0,0,0,0,0,0,0,0]   # Left (10)
+        ]
+        self.action_names = [
+            "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
+            "Crouch", "Jump", "Jump+Punch", "Crouch+Punch", "Right", "Left"
+        ]
 
     def _on_step(self) -> bool:
         if self.behaviour_mode:
-            # In behaviour mode, we don't use the reward function
-            # Instead, we save every N steps
+            # In behaviour mode, save every N steps
             if self.num_timesteps % 5000 == 0:
                 try:
                     self.model.save(self.save_path)
@@ -240,10 +257,10 @@ def setup_logging(log_dir):
 class BehaviourCloningLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_fn = nn.BCEWithLogitsLoss()  # For MultiBinary actions
         
     def forward(self, model_output, target_actions):
-        return self.loss_fn(model_output, target_actions)
+        return self.loss_fn(model_output, target_actions.float())
 
 class ExpertReplayEnvironment(gym.Env):
     def __init__(self, npz_directory):
@@ -280,7 +297,6 @@ class ExpertReplayEnvironment(gym.Env):
             'closest_enemy_direction': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
         })
         
-        # Changed to MultiBinary to match the multi-button action format in NPZ files
         self.action_space = spaces.MultiBinary(9)  # 9 buttons for Kung Fu
     
     def reset(self, seed=None, options=None):
@@ -305,11 +321,9 @@ class ExpertReplayEnvironment(gym.Env):
         frame = self.frames[self.current_frame_idx]
         expert_action = self.actions[self.current_frame_idx] if self.current_frame_idx < len(self.actions) else np.zeros(9, dtype=np.uint8)
         
-        # Ensure action and expert_action are NumPy arrays for comparison
         action = np.array(action, dtype=np.uint8)
         expert_action = np.array(expert_action, dtype=np.uint8)
         
-        # Calculate behavior cloning reward: high reward if actions match exactly
         reward = 1.0 if np.array_equal(action, expert_action) else 0.0
         
         self.current_frame_idx += 1
@@ -317,7 +331,8 @@ class ExpertReplayEnvironment(gym.Env):
         truncated = False
         
         if terminated:
-            self.current_frame_idx = len(self.frames) - 1
+            self.current_file_idx = (self.current_file_idx + 1) % len(self.npz_files)
+            self.load_current_npz()
         
         next_frame_idx = min(self.current_frame_idx, len(self.frames) - 1)
         next_expert_action = self.actions[next_frame_idx] if next_frame_idx < len(self.actions) else np.zeros(9, dtype=np.uint8)
@@ -363,7 +378,6 @@ class BehaviourCloningCallback(BaseCallback):
                     self.matches += 1 if info['action_match'] else 0
                     self.total += 1
         
-        # Print progress every 10 seconds
         current_time = time.time()
         if current_time - self.last_print_time >= 10:
             if self.total > 0:
@@ -382,7 +396,6 @@ def create_expert_replay_env(npz_dir):
     return lambda: ExpertReplayEnvironment(npz_dir)
 
 def extract_expert_data(npz_dir):
-    """Extract expert data from NPZ files for training statistics."""
     npz_files = glob.glob(os.path.join(npz_dir, '*.npz'))
     if not npz_files:
         return None, 0
@@ -401,17 +414,10 @@ def extract_expert_data(npz_dir):
             total_actions += len(actions)
             
             for action in actions:
-                # Convert action to a tuple for hashing
-                if isinstance(action, np.ndarray):
-                    action_key = tuple(action.tolist())
-                else:
-                    action_key = action
-                
-                # Validate action shape
-                if isinstance(action_key, tuple) and len(action_key) != 9:
+                action_key = tuple(action.tolist())
+                if len(action_key) != 9:
                     global_logger.warning(f"Invalid action shape in {npz_file}: {action_key}")
                     continue
-                
                 if action_key not in action_counts:
                     action_counts[action_key] = 0
                 action_counts[action_key] += 1
@@ -419,6 +425,43 @@ def extract_expert_data(npz_dir):
             print(f"Error processing {npz_file}: {e}")
     
     return action_counts, total_frames
+
+def map_multibinary_to_discrete(action):
+    """Map MultiBinary(9) action to Discrete(11) action index."""
+    actions = [
+        [0,0,0,0,0,0,0,0,0],  # No-op (0)
+        [0,0,0,0,0,0,1,0,0],  # Punch (1)
+        [0,0,0,0,0,0,0,0,1],  # Kick (2)
+        [1,0,0,0,0,0,1,0,0],  # Right+Punch (3)
+        [0,1,0,0,0,0,1,0,0],  # Left+Punch (4)
+        [0,0,1,0,0,0,0,0,0],  # Crouch (5)
+        [0,0,0,0,0,1,0,0,0],  # Jump (6)
+        [0,0,0,0,0,1,1,0,0],  # Jump+Punch (7)
+        [0,0,1,0,0,0,1,0,0],  # Crouch+Punch (8)
+        [1,0,0,0,0,0,0,0,0],  # Right (9)
+        [0,1,0,0,0,0,0,0,0]   # Left (10)
+    ]
+    for i, predefined_action in enumerate(actions):
+        if np.array_equal(action, predefined_action):
+            return i
+    return 0  # Default to No-op if no match
+
+def map_discrete_to_multibinary(action_idx):
+    """Map Discrete(11) action index to MultiBinary(9) action."""
+    actions = [
+        [0,0,0,0,0,0,0,0,0],  # No-op (0)
+        [0,0,0,0,0,0,1,0,0],  # Punch (1)
+        [0,0,0,0,0,0,0,0,1],  # Kick (2)
+        [1,0,0,0,0,0,1,0,0],  # Right+Punch (3)
+        [0,1,0,0,0,0,1,0,0],  # Left+Punch (4)
+        [0,0,1,0,0,0,0,0,0],  # Crouch (5)
+        [0,0,0,0,0,1,0,0,0],  # Jump (6)
+        [0,0,0,0,0,1,1,0,0],  # Jump+Punch (7)
+        [0,0,1,0,0,0,1,0,0],  # Crouch+Punch (8)
+        [1,0,0,0,0,0,0,0,0],  # Right (9)
+        [0,1,0,0,0,0,0,0,0]   # Left (10)
+    ]
+    return np.array(actions[action_idx], dtype=np.uint8)
 
 def train(args):
     global current_model, global_logger, global_model_path, experience_data
@@ -437,7 +480,6 @@ def train(args):
     if training_mode == "behaviour":
         global_logger.info(f"Training in behaviour cloning mode using NPZ directory: {args.npz_dir}")
         
-        # Extract expert data statistics
         action_counts, total_frames = extract_expert_data(args.npz_dir)
         if action_counts:
             global_logger.info(f"Expert data contains {total_frames} frames with action distribution:")
@@ -461,14 +503,12 @@ def train(args):
         "activation_fn": nn.ReLU,
     }
     
-    # Adjust learning parameters based on training mode
     if training_mode == "behaviour":
-        # Higher learning rate for behavior cloning
         learning_rate_schedule = get_linear_fn(start=5e-4, end=1e-4, end_fraction=0.5)
-        ent_coef = 0.01  # Lower entropy to encourage precise imitation
+        ent_coef = 0.01
     else:
         learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
-        ent_coef = 0.1  # Higher entropy for exploration
+        ent_coef = 0.1
 
     params = {
         "learning_rate": learning_rate_schedule,
@@ -476,24 +516,40 @@ def train(args):
         "ent_coef": ent_coef,
         "n_steps": 512,
         "batch_size": 32,
-        "n_epochs": 10 if training_mode == "behaviour" else 5,  # More epochs for behavior cloning
+        "n_epochs": 10 if training_mode == "behaviour" else 5,
     }
 
-    def initialize_model(env):
+    def initialize_model(env, action_space_type):
         if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
             global_logger.info(f"Resuming training from {args.model_path}")
             try:
                 custom_objects = {"policy_kwargs": policy_kwargs}
                 model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
                                  device="cuda" if args.cuda else "cpu")
+                # Check action space compatibility
+                model_action_space = model.policy.action_space
+                env_action_space = env.action_space
+                if model_action_space != env_action_space:
+                    global_logger.warning(f"Action space mismatch: Model {model_action_space} != Env {env_action_space}")
+                    if isinstance(model_action_space, spaces.MultiBinary) and isinstance(env_action_space, spaces.Discrete):
+                        global_logger.info("Converting MultiBinary model to Discrete action space")
+                        model.policy.action_space = env_action_space
+                        model.policy.pi_features_extractor = None  # Reset to force reinitialization
+                    elif isinstance(model_action_space, spaces.Discrete) and isinstance(env_action_space, spaces.MultiBinary):
+                        global_logger.info("Converting Discrete model to MultiBinary action space")
+                        model.policy.action_space = env_action_space
+                        model.policy.pi_features_extractor = None  # Reset to force reinitialization
+                    else:
+                        raise ValueError(f"Unsupported action space conversion: {model_action_space} to {env_action_space}")
                 global_logger.info("Successfully loaded existing model")
                 return model
             except Exception as e:
                 global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
         
         global_logger.info("Starting new training session")
+        policy = "MultiInputPolicy"  # Use MultiInputPolicy for Dict observation space
         return PPO(
-            "MultiInputPolicy",
+            policy,
             env,
             learning_rate=params["learning_rate"],
             clip_range=params["clip_range"],
@@ -508,11 +564,12 @@ def train(args):
             device="cuda" if args.cuda else "cpu"
         )
 
-    # Create environment based on training mode
     if training_mode == "behaviour":
         env_fns = [create_expert_replay_env(args.npz_dir) for _ in range(args.num_envs)]
+        action_space_type = "multibinary"
     else:
         env_fns = [make_kungfu_env for _ in range(args.num_envs)]
+        action_space_type = "discrete"
     
     if args.render:
         env = DummyVecEnv([make_kungfu_env])
@@ -522,9 +579,8 @@ def train(args):
     env = VecFrameStack(env, n_stack=4, channels_order='last')
     env = VecTransposeImage(env, skip=True)
     
-    current_model = initialize_model(env)
+    current_model = initialize_model(env, action_space_type)
     
-    # Set up callbacks based on training mode
     save_callback = SaveBestModelCallback(save_path=args.model_path, behaviour_mode=(training_mode == "behaviour"))
     exp_callback = ExperienceCollectionCallback()
     callbacks = [save_callback, exp_callback]
@@ -590,7 +646,6 @@ if __name__ == "__main__":
     try:
         train(args)
     finally:
-        # Ensure proper cleanup
         if current_model and hasattr(current_model, 'env'):
             try:
                 current_model.env.close()
