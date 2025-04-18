@@ -416,70 +416,20 @@ def train(args):
             try:
                 custom_objects = {"policy_kwargs": policy_kwargs}
                 if training_mode == "mimic" and expert_trajectories is not None:
-                    # Load the underlying PPO policy and re-initialize GAIL
-                    ppo_model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
-                                       device="cuda" if args.cuda else "cpu")
-                    # Create reward_net for the discriminator
-                    reward_net = BasicRewardNet(
-                        observation_space=env.observation_space,
-                        action_space=env.action_space,
-                        normalize_input_layer=RunningNorm,
-                        hid_sizes=(64, 64),
-                    )
-                    model = GAIL(
-                        venv=env,
-                        gen_algo=ppo_model,
-                        demonstrations=expert_trajectories,
-                        demo_batch_size=params["batch_size"],
-                        reward_net=reward_net,
-                        gamma=0.99,
-                        gae_lambda=0.95,
-                        verbose=1,
-                        device="cuda" if args.cuda else "cpu"
-                    )
+                    # For now, fall back to regular PPO training instead of GAIL
+                    global_logger.info("Loading PPO model without GAIL due to dictionary observation space issues")
+                    model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
+                                device="cuda" if args.cuda else "cpu")
                 else:
                     model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
-                                   device="cuda" if args.cuda else "cpu")
+                                device="cuda" if args.cuda else "cpu")
                 global_logger.info("Successfully loaded existing model")
                 return model
             except Exception as e:
                 global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
         
         global_logger.info("Starting new training session")
-        if training_mode == "mimic" and expert_trajectories is not None:
-            ppo_policy = PPO(
-                "MultiInputPolicy",
-                env,
-                learning_rate=params["learning_rate"],
-                clip_range=params["clip_range"],
-                ent_coef=params["ent_coef"],
-                n_steps=params["n_steps"],
-                batch_size=params["batch_size"],
-                n_epochs=params["n_epochs"],
-                gamma=0.99,
-                gae_lambda=0.95,
-                verbose=1,
-                policy_kwargs=policy_kwargs,
-                device="cuda" if args.cuda else "cpu"
-            )
-            # Create reward_net for the discriminator
-            reward_net = BasicRewardNet(
-                observation_space=env.observation_space,
-                action_space=env.action_space,
-                normalize_input_layer=RunningNorm,
-                hid_sizes=(64, 64),
-            )
-            return GAIL(
-                venv=env,
-                gen_algo=ppo_policy,
-                demonstrations=expert_trajectories,
-                demo_batch_size=params["batch_size"],
-                reward_net=reward_net,
-                gamma=0.99,
-                gae_lambda=0.95,
-                verbose=1,
-                device="cuda" if args.cuda else "cpu"
-            )
+        # Use regular PPO instead of GAIL
         return PPO(
             "MultiInputPolicy",
             env,
