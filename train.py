@@ -19,10 +19,9 @@ import threading
 import queue
 import gymnasium as gym
 from gymnasium import spaces
-from imitation.algorithms.adversarial.gail import GAIL
-from imitation.data.types import Trajectory
-from imitation.rewards.reward_nets import BasicRewardNet
-from imitation.util.networks import RunningNorm
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+import torch.nn as nn
+import torch.nn.functional as F
 import pickle
 
 current_model = None
@@ -93,12 +92,26 @@ class ExperienceCollectionCallback(BaseCallback):
         return True
 
 class SaveBestModelCallback(BaseCallback):
-    def __init__(self, save_path, verbose=1):
+    def __init__(self, save_path, verbose=1, behaviour_mode=False):
         super().__init__(verbose)
         self.save_path = save_path
         self.best_score = 0
+        self.behaviour_mode = behaviour_mode
 
     def _on_step(self) -> bool:
+        if self.behaviour_mode:
+            # In behaviour mode, we don't use the reward function
+            # Instead, we save every N steps
+            if self.num_timesteps % 5000 == 0:
+                try:
+                    self.model.save(self.save_path)
+                    if self.verbose > 0:
+                        print(f"Behaviour model saved at step {self.num_timesteps}")
+                except Exception as e:
+                    print(f"Failed to save model: {e}")
+            return True
+            
+        # Regular reward-based saving for RL mode
         infos = self.locals.get('infos', [{}])
         
         total_hits = sum([info.get('enemy_hit', 0) for info in infos])
@@ -224,7 +237,15 @@ def setup_logging(log_dir):
     )
     return logging.getLogger()
 
-class NPZReplayEnvironment(gym.Env):
+class BehaviourCloningLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.loss_fn = nn.CrossEntropyLoss()
+        
+    def forward(self, model_output, target_actions):
+        return self.loss_fn(model_output, target_actions)
+
+class ExpertReplayEnvironment(gym.Env):
     def __init__(self, npz_directory):
         super().__init__()
         self.npz_files = glob.glob(os.path.join(npz_directory, '*.npz'))
@@ -242,7 +263,7 @@ class NPZReplayEnvironment(gym.Env):
         npz_data = np.load(self.npz_files[self.current_file_idx])
         self.frames = npz_data['frames']
         self.actions = npz_data['actions']
-        self.rewards = npz_data['rewards']
+        self.rewards = np.ones_like(npz_data['rewards'])  # Override rewards to all be 1.0 for expert actions
         self.current_frame_idx = 0
     
     def _setup_spaces(self):
@@ -275,11 +296,14 @@ class NPZReplayEnvironment(gym.Env):
             'boss_info': np.zeros(3, dtype=np.float32),
             'closest_enemy_direction': np.zeros(1, dtype=np.float32),
         }
-        return obs, {"mimic_training": True}
+        return obs, {"behaviour_training": True, "expert_action": self.actions[0] if len(self.actions) > 0 else 0}
     
     def step(self, action):
         frame = self.frames[self.current_frame_idx]
-        reward = self.rewards[self.current_frame_idx]
+        expert_action = self.actions[self.current_frame_idx] if self.current_frame_idx < len(self.actions) else 0
+        
+        # Calculate behavior cloning reward: high reward for matching expert action
+        reward = 1.0 if action == expert_action else 0.0
         
         self.current_frame_idx += 1
         terminated = self.current_frame_idx >= len(self.frames) - 1
@@ -288,8 +312,11 @@ class NPZReplayEnvironment(gym.Env):
         if terminated:
             self.current_frame_idx = len(self.frames) - 1
         
+        next_frame_idx = min(self.current_frame_idx, len(self.frames) - 1)
+        next_expert_action = self.actions[next_frame_idx] if next_frame_idx < len(self.actions) else 0
+        
         obs = {
-            'viewport': frame,
+            'viewport': self.frames[next_frame_idx],
             'enemy_vector': np.zeros(KUNGFU_MAX_ENEMIES * 2, dtype=np.float32),
             'combat_status': np.zeros(2, dtype=np.float32),
             'projectile_vectors': np.zeros(MAX_PROJECTILES * 4, dtype=np.float32),
@@ -298,7 +325,13 @@ class NPZReplayEnvironment(gym.Env):
             'closest_enemy_direction': np.zeros(1, dtype=np.float32),
         }
         
-        return obs, reward, terminated, truncated, {"mimic_training": True}
+        info = {
+            "behaviour_training": True,
+            "expert_action": next_expert_action,
+            "action_match": action == expert_action
+        }
+        
+        return obs, reward, terminated, truncated, info
     
     def render(self, mode='human'):
         if mode == 'rgb_array':
@@ -308,64 +341,81 @@ class NPZReplayEnvironment(gym.Env):
     def close(self):
         pass
 
+class BehaviourCloningCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.matches = 0
+        self.total = 0
+        self.last_print_time = time.time()
+        
+    def _on_step(self) -> bool:
+        infos = self.locals.get('infos', [{}])
+        for info in infos:
+            if info.get('behaviour_training', False):
+                if 'action_match' in info:
+                    self.matches += 1 if info['action_match'] else 0
+                    self.total += 1
+        
+        # Print progress every 10 seconds
+        current_time = time.time()
+        if current_time - self.last_print_time >= 10:
+            if self.total > 0:
+                match_rate = self.matches / self.total * 100
+                print(f"Behaviour cloning: {self.matches}/{self.total} actions matched ({match_rate:.2f}%)")
+            self.last_print_time = current_time
+        
+        return True
+
 def make_kungfu_env():
     base_env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array")
     env = KungFuWrapper(base_env)
     return env
 
-def create_npz_replay_env(npz_dir):
-    return lambda: NPZReplayEnvironment(npz_dir)
+def create_expert_replay_env(npz_dir):
+    return lambda: ExpertReplayEnvironment(npz_dir)
 
-def create_expert_dataset(npz_dir):
-    """Create an expert dataset for imitation's GAIL from NPZ files."""
+def extract_expert_data(npz_dir):
+    """Extract expert data from NPZ files for training statistics."""
     npz_files = glob.glob(os.path.join(npz_dir, '*.npz'))
     if not npz_files:
-        raise ValueError(f"No NPZ files found in directory: {npz_dir}")
+        return None, 0
     
-    trajectories = []
+    # Count total frames and actions
+    total_frames = 0
+    total_actions = 0
+    action_counts = {}
+    
     for npz_file in npz_files:
-        npz_data = np.load(npz_file)
-        frames = npz_data['frames']
-        actions = npz_data['actions']
-        
-        # Ensure len(obs) == len(acts) + 1
-        if len(frames) == len(actions):
-            # Truncate actions to be one less than frames
-            actions = actions[:-1]
-        elif len(frames) != len(actions) + 1:
-            # Skip or log invalid files
-            print(f"Warning: Skipping {npz_file} due to invalid length: {len(frames)} frames, {len(actions)} actions")
-            continue
-        
-        # Convert frames to observation dicts
-        observations = []
-        for frame in frames:
-            obs = {
-                'viewport': frame,
-                'enemy_vector': np.zeros(KUNGFU_MAX_ENEMIES * 2, dtype=np.float32),
-                'combat_status': np.zeros(2, dtype=np.float32),
-                'projectile_vectors': np.zeros(MAX_PROJECTILES * 4, dtype=np.float32),
-                'enemy_proximity': np.zeros(1, dtype=np.float32),
-                'boss_info': np.zeros(3, dtype=np.float32),
-                'closest_enemy_direction': np.zeros(1, dtype=np.float32),
-            }
-            observations.append(obs)
-        
-        # Create a Trajectory object
-        trajectory = Trajectory(
-            obs=np.array(observations, dtype=object),
-            acts=actions,
-            infos=None,
-            terminal=len(frames) >= len(actions) + 1
-        )
-        trajectories.append(trajectory)
+        try:
+            npz_data = np.load(npz_file)
+            frames = npz_data['frames']
+            actions = npz_data['actions']
+            
+            total_frames += len(frames)
+            total_actions += len(actions)
+            
+            # Count occurrences of each action
+            # Fix for the "unhashable type: 'numpy.ndarray'" error:
+            # Convert ndarray actions to integers or tuples
+            for action in actions:
+                # Convert action to a hashable type if it's an ndarray
+                if isinstance(action, np.ndarray):
+                    # For single-value arrays
+                    if action.size == 1:
+                        action_key = int(action)
+                    else:
+                        # For multi-value arrays, convert to tuple
+                        action_key = tuple(action.tolist())
+                else:
+                    action_key = action
+                    
+                if action_key not in action_counts:
+                    action_counts[action_key] = 0
+                action_counts[action_key] += 1
+        except Exception as e:
+            print(f"Error processing {npz_file}: {e}")
     
-    # Save trajectories to a pickle file for compatibility
-    dataset_path = os.path.join(npz_dir, "expert_trajectories.pkl")
-    with open(dataset_path, 'wb') as f:
-        pickle.dump(trajectories, f)
-    
-    return trajectories
+    return action_counts, total_frames
 
 def train(args):
     global current_model, global_logger, global_model_path, experience_data
@@ -380,15 +430,22 @@ def train(args):
     if args.num_envs < 1:
         raise ValueError("Number of environments must be at least 1")
     
-    training_mode = "mimic" if args.npz_dir and os.path.exists(args.npz_dir) else "live"
-    if training_mode == "mimic":
-        global_logger.info(f"Training in mimic mode using NPZ directory: {args.npz_dir}")
+    training_mode = "behaviour" if args.npz_dir and os.path.exists(args.npz_dir) else "live"
+    if training_mode == "behaviour":
+        global_logger.info(f"Training in behaviour cloning mode using NPZ directory: {args.npz_dir}")
+        
+        # Extract expert data statistics
+        action_counts, total_frames = extract_expert_data(args.npz_dir)
+        if action_counts:
+            global_logger.info(f"Expert data contains {total_frames} frames with action distribution:")
+            for action, count in sorted(action_counts.items()):
+                global_logger.info(f"  Action {action}: {count} occurrences ({count/total_frames*100:.2f}%)")
     else:
-        global_logger.info("Training in live mode")
+        global_logger.info("Training in live reinforcement learning mode")
     
     if args.render:
-        if training_mode == "mimic":
-            global_logger.warning("Rendering is not supported in mimic mode. Ignoring --render flag.")
+        if training_mode == "behaviour":
+            global_logger.warning("Rendering is not supported in behaviour cloning mode. Ignoring --render flag.")
             args.render = False
         else:
             global_logger.info("Rendering enabled. Using a single environment for visualization.")
@@ -399,37 +456,38 @@ def train(args):
         "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},
         "net_arch": dict(pi=[128, 128], vf=[256, 256])
     }
-    learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
+    
+    # Adjust learning parameters based on training mode
+    if training_mode == "behaviour":
+        # Higher learning rate for behavior cloning
+        learning_rate_schedule = get_linear_fn(start=5e-4, end=1e-4, end_fraction=0.5)
+        ent_coef = 0.01  # Lower entropy to encourage precise imitation
+    else:
+        learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
+        ent_coef = 0.1  # Higher entropy for exploration
 
     params = {
         "learning_rate": learning_rate_schedule,
         "clip_range": args.clip_range,
-        "ent_coef": 0.1,
+        "ent_coef": ent_coef,
         "n_steps": 512,
         "batch_size": 32,
-        "n_epochs": 5,
+        "n_epochs": 10 if training_mode == "behaviour" else 5,  # More epochs for behavior cloning
     }
 
-    def initialize_model(env, expert_trajectories=None):
+    def initialize_model(env):
         if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
             global_logger.info(f"Resuming training from {args.model_path}")
             try:
                 custom_objects = {"policy_kwargs": policy_kwargs}
-                if training_mode == "mimic" and expert_trajectories is not None:
-                    # For now, fall back to regular PPO training instead of GAIL
-                    global_logger.info("Loading PPO model without GAIL due to dictionary observation space issues")
-                    model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
-                                device="cuda" if args.cuda else "cpu")
-                else:
-                    model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
-                                device="cuda" if args.cuda else "cpu")
+                model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
+                             device="cuda" if args.cuda else "cpu")
                 global_logger.info("Successfully loaded existing model")
                 return model
             except Exception as e:
                 global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
         
         global_logger.info("Starting new training session")
-        # Use regular PPO instead of GAIL
         return PPO(
             "MultiInputPolicy",
             env,
@@ -446,16 +504,9 @@ def train(args):
             device="cuda" if args.cuda else "cpu"
         )
 
-    # Create environment and expert dataset
-    expert_trajectories = None
-    if training_mode == "mimic":
-        env_fns = [create_npz_replay_env(args.npz_dir) for _ in range(args.num_envs)]
-        try:
-            expert_trajectories = create_expert_dataset(args.npz_dir)
-            global_logger.info(f"Loaded expert dataset with {len(expert_trajectories)} trajectories")
-        except Exception as e:
-            global_logger.error(f"Failed to create expert dataset: {e}")
-            raise
+    # Create environment based on training mode
+    if training_mode == "behaviour":
+        env_fns = [create_expert_replay_env(args.npz_dir) for _ in range(args.num_envs)]
     else:
         env_fns = [make_kungfu_env for _ in range(args.num_envs)]
     
@@ -467,13 +518,20 @@ def train(args):
     env = VecFrameStack(env, n_stack=4, channels_order='last')
     env = VecTransposeImage(env, skip=True)
     
-    current_model = initialize_model(env, expert_trajectories)
+    current_model = initialize_model(env)
     
-    save_callback = SaveBestModelCallback(save_path=args.model_path)
+    # Set up callbacks based on training mode
+    save_callback = SaveBestModelCallback(save_path=args.model_path, behaviour_mode=(training_mode == "behaviour"))
     exp_callback = ExperienceCollectionCallback()
     callbacks = [save_callback, exp_callback]
+    
+    if training_mode == "behaviour":
+        bc_callback = BehaviourCloningCallback()
+        callbacks.append(bc_callback)
+    
     if args.render:
         callbacks.append(RenderCallback(render_freq=args.render_freq, fps=30))
+    
     callback = CallbackList(callbacks)
     
     try:
@@ -505,20 +563,20 @@ def train(args):
         f.write(f"Total experience collected: {experience_count} steps\n")
         f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Training parameters: num_envs={args.num_envs}, total_timesteps={args.timesteps}, mode={training_mode}\n")
-        if args.npz_dir and training_mode == "mimic":
+        if args.npz_dir and training_mode == "behaviour":
             f.write(f"NPZ directory: {args.npz_dir}\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a PPO or GAIL model for Kung Fu with live or mimic training")
+    parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with live RL or behaviour cloning")
     parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo", help="Path to save the trained model")
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps for training")
-    parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO/GAIL")
+    parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
-    parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for mimic training with GAIL")
+    parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for behaviour cloning")
     parser.add_argument("--render", action="store_true", help="Render the environment during training")
     parser.add_argument("--render_freq", type=int, default=256, help="Render every N steps")
     parser.add_argument("--render_fps", type=int, default=30, help="Target rendering FPS")
