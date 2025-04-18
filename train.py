@@ -149,8 +149,8 @@ class SaveBestModelCallback(BaseCallback):
                 if self.verbose > 0:
                     print(f"Saved best model with score {self.best_score:.2f} at step {self.num_timesteps}")
                     print(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Dodge: {total_dodge_reward:.2f}, "
-                        f"Survival: {total_survival_reward:.2f}, Norm. Reward: {avg_normalized_reward:.2f}, "
-                        f"Action Diversity: {action_diversity:.2f}, Min Enemy Dist: {avg_min_enemy_dist:.1f}")
+                          f"Survival: {total_survival_reward:.2f}, Norm. Reward: {avg_normalized_reward:.2f}, "
+                          f"Action Diversity: {action_diversity:.2f}, Min Enemy Dist: {avg_min_enemy_dist:.1f}")
                     
                     if infos and 'action_percentages' in infos[0] and 'action_names' in infos[0]:
                         action_percentages = infos[0].get('action_percentages', [])
@@ -166,7 +166,7 @@ class SaveBestModelCallback(BaseCallback):
             print(f"Step {self.num_timesteps} Progress:")
             print(f"  Current Score: {score:.2f}, Best Score: {self.best_score:.2f}")
             print(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Norm. Reward: {avg_normalized_reward:.2f}, "
-                f"Min Enemy Dist: {avg_min_enemy_dist:.1f}, Survival: {total_survival_reward:.2f}")
+                  f"Min Enemy Dist: {avg_min_enemy_dist:.1f}, Survival: {total_survival_reward:.2f}")
         
         return True
 
@@ -265,6 +265,7 @@ class ExpertReplayEnvironment(gym.Env):
         self.actions = npz_data['actions']
         self.rewards = np.ones_like(npz_data['rewards'])  # Override rewards to all be 1.0 for expert actions
         self.current_frame_idx = 0
+        global_logger.debug(f"Loaded NPZ file {self.npz_files[self.current_file_idx]} with {len(self.actions)} actions")
     
     def _setup_spaces(self):
         first_frame = self.frames[0]
@@ -279,7 +280,8 @@ class ExpertReplayEnvironment(gym.Env):
             'closest_enemy_direction': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
         })
         
-        self.action_space = spaces.Discrete(11)
+        # Changed to MultiBinary to match the multi-button action format in NPZ files
+        self.action_space = spaces.MultiBinary(9)  # 9 buttons for Kung Fu
     
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -296,14 +298,19 @@ class ExpertReplayEnvironment(gym.Env):
             'boss_info': np.zeros(3, dtype=np.float32),
             'closest_enemy_direction': np.zeros(1, dtype=np.float32),
         }
-        return obs, {"behaviour_training": True, "expert_action": self.actions[0] if len(self.actions) > 0 else 0}
+        expert_action = self.actions[0] if len(self.actions) > 0 else np.zeros(9, dtype=np.uint8)
+        return obs, {"behaviour_training": True, "expert_action": expert_action}
     
     def step(self, action):
         frame = self.frames[self.current_frame_idx]
-        expert_action = self.actions[self.current_frame_idx] if self.current_frame_idx < len(self.actions) else 0
+        expert_action = self.actions[self.current_frame_idx] if self.current_frame_idx < len(self.actions) else np.zeros(9, dtype=np.uint8)
         
-        # Calculate behavior cloning reward: high reward for matching expert action
-        reward = 1.0 if action == expert_action else 0.0
+        # Ensure action and expert_action are NumPy arrays for comparison
+        action = np.array(action, dtype=np.uint8)
+        expert_action = np.array(expert_action, dtype=np.uint8)
+        
+        # Calculate behavior cloning reward: high reward if actions match exactly
+        reward = 1.0 if np.array_equal(action, expert_action) else 0.0
         
         self.current_frame_idx += 1
         terminated = self.current_frame_idx >= len(self.frames) - 1
@@ -313,7 +320,7 @@ class ExpertReplayEnvironment(gym.Env):
             self.current_frame_idx = len(self.frames) - 1
         
         next_frame_idx = min(self.current_frame_idx, len(self.frames) - 1)
-        next_expert_action = self.actions[next_frame_idx] if next_frame_idx < len(self.actions) else 0
+        next_expert_action = self.actions[next_frame_idx] if next_frame_idx < len(self.actions) else np.zeros(9, dtype=np.uint8)
         
         obs = {
             'viewport': self.frames[next_frame_idx],
@@ -328,7 +335,7 @@ class ExpertReplayEnvironment(gym.Env):
         info = {
             "behaviour_training": True,
             "expert_action": next_expert_action,
-            "action_match": action == expert_action
+            "action_match": np.array_equal(action, expert_action)
         }
         
         return obs, reward, terminated, truncated, info
@@ -380,7 +387,6 @@ def extract_expert_data(npz_dir):
     if not npz_files:
         return None, 0
     
-    # Count total frames and actions
     total_frames = 0
     total_actions = 0
     action_counts = {}
@@ -394,21 +400,18 @@ def extract_expert_data(npz_dir):
             total_frames += len(frames)
             total_actions += len(actions)
             
-            # Count occurrences of each action
-            # Fix for the "unhashable type: 'numpy.ndarray'" error:
-            # Convert ndarray actions to integers or tuples
             for action in actions:
-                # Convert action to a hashable type if it's an ndarray
+                # Convert action to a tuple for hashing
                 if isinstance(action, np.ndarray):
-                    # For single-value arrays
-                    if action.size == 1:
-                        action_key = int(action)
-                    else:
-                        # For multi-value arrays, convert to tuple
-                        action_key = tuple(action.tolist())
+                    action_key = tuple(action.tolist())
                 else:
                     action_key = action
-                    
+                
+                # Validate action shape
+                if isinstance(action_key, tuple) and len(action_key) != 9:
+                    global_logger.warning(f"Invalid action shape in {npz_file}: {action_key}")
+                    continue
+                
                 if action_key not in action_counts:
                     action_counts[action_key] = 0
                 action_counts[action_key] += 1
@@ -454,7 +457,8 @@ def train(args):
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
         "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},
-        "net_arch": dict(pi=[128, 128], vf=[256, 256])
+        "net_arch": dict(pi=[128, 128], vf=[256, 256]),
+        "activation_fn": nn.ReLU,
     }
     
     # Adjust learning parameters based on training mode
@@ -481,7 +485,7 @@ def train(args):
             try:
                 custom_objects = {"policy_kwargs": policy_kwargs}
                 model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
-                             device="cuda" if args.cuda else "cpu")
+                                 device="cuda" if args.cuda else "cpu")
                 global_logger.info("Successfully loaded existing model")
                 return model
             except Exception as e:
@@ -557,6 +561,7 @@ def train(args):
         global_logger.warning(f"Failed to close environment during cleanup: {e}")
     
     experience_count = len(experience_data)
+    experience_data = []  # Clear experience data to free memory
     global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
     
     with open(f"{global_model_path}_experience_count.txt", "w") as f:
@@ -582,4 +587,14 @@ if __name__ == "__main__":
     parser.add_argument("--render_fps", type=int, default=30, help="Target rendering FPS")
     
     args = parser.parse_args()
-    train(args)
+    try:
+        train(args)
+    finally:
+        # Ensure proper cleanup
+        if current_model and hasattr(current_model, 'env'):
+            try:
+                current_model.env.close()
+            except Exception as e:
+                global_logger.error(f"Failed to close environment during final cleanup: {e}")
+        if args.cuda:
+            torch.cuda.empty_cache()
