@@ -32,19 +32,32 @@ def main():
     os.makedirs(STATE_SAVE_DIR, exist_ok=True)
     os.makedirs(RECORDING_DIR, exist_ok=True)
 
-    # Initialize game environment
+    # Initialize game environment - ONLY create one environment instance
     game = 'KungFu-Nes'
     state = '1Player.Level1'
     game_state_path = os.path.join(STATE_SAVE_DIR, f"{game}_{state}.state")
     
+    print("Creating game environment...")
     env = retro.make(
         game=game,
         state=state,
         use_restricted_actions=retro.Actions.ALL,
-        scenario=args.scenario
+        scenario=args.scenario,
+        render_mode="rgb_array"  # Make sure this is the only render call
     )
-    obs = env.reset()
+    
+    # Fix for newer Gymnasium/Retro API: properly unpack tuple return value
+    print("Resetting environment...")
+    result = env.reset()
+    if isinstance(result, tuple):
+        obs, info = result  # Unpack if it's a tuple (new API)
+        print("Using new API (tuple return from reset)")
+    else:
+        obs = result  # For backward compatibility
+        print("Using old API (single value return from reset)")
+        
     screen_height, screen_width = obs.shape[:2]
+    print(f"Screen dimensions: {screen_width}x{screen_height}")
     
     # Verify button order matches training wrapper
     EXPECTED_BUTTON_ORDER = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A', 'B', 'C', 'X', 'Y', 'Z', 'MODE', 'START', 'SELECT']
@@ -58,6 +71,7 @@ def main():
     # Window setup
     win_width = args.width
     win_height = win_width * screen_height // screen_width
+    print(f"Creating window with dimensions: {win_width}x{win_height}")
     win = pyglet.window.Window(
         width=win_width,
         height=win_height,
@@ -150,6 +164,7 @@ def main():
         recording_actions = []
         recording_rewards = []
 
+    print("Starting main game loop...")
     # Main game loop
     while not win.has_exit:
         # Frame timing control
@@ -184,6 +199,7 @@ def main():
 
         # Handle state save/load
         if keycodes.O in keys_clicked:
+            print("Saving game state...")
             save_state = env.em.get_state()
             with open(game_state_path, "wb") as f:
                 f.write(save_state)
@@ -191,6 +207,7 @@ def main():
 
         if keycodes.P in keys_clicked:
             if os.path.exists(game_state_path):
+                print("Loading game state...")
                 with open(game_state_path, "rb") as f:
                     save_state = f.read()
                 env.em.set_state(save_state)
@@ -216,7 +233,18 @@ def main():
         }
 
         action = [inputs.get(b, False) for b in env.buttons]
-        obs, rew, done, info = env.step(action)
+        
+        # Debug input handling
+        if any(action):
+            print("Pressed buttons:", [btn for btn, pressed in zip(env.buttons, action) if pressed])
+        
+        # Handle step return value for new API
+        step_result = env.step(action)
+        if len(step_result) == 5:  # New API (obs, rew, terminated, truncated, info)
+            obs, rew, terminated, truncated, info = step_result
+            done = terminated or truncated
+        else:  # Old API (obs, rew, done, info)
+            obs, rew, done, info = step_result
 
         # Handle game over during recording
         if done and is_recording:
@@ -224,7 +252,9 @@ def main():
             save_recording()
             is_recording = False
             update_caption()
-            env.reset()
+            reset_result = env.reset()
+            if isinstance(reset_result, tuple):
+                obs, _ = reset_result
 
         # Frame recording with skipping
         frame_counter += 1
@@ -235,8 +265,11 @@ def main():
 
         # Rendering
         glBindTexture(GL_TEXTURE_2D, texture_id)
-        video_buffer = ctypes.cast(obs.tobytes(), ctypes.POINTER(ctypes.c_short))
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, obs.shape[1], obs.shape[0], GL_RGB, GL_UNSIGNED_BYTE, video_buffer)
+        try:
+            video_buffer = ctypes.cast(obs.tobytes(), ctypes.POINTER(ctypes.c_short))
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, obs.shape[1], obs.shape[0], GL_RGB, GL_UNSIGNED_BYTE, video_buffer)
+        except Exception as e:
+            print(f"Rendering error: {e}")
 
         pyglet.graphics.draw(
             4,
@@ -254,6 +287,7 @@ def main():
         clock.tick()
 
     # Cleanup
+    print("Closing environment...")
     env.close()
 
 if __name__ == "__main__":
@@ -262,3 +296,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nCapture terminated by user")
         sys.exit(0)
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

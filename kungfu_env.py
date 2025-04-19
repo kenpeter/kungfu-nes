@@ -46,7 +46,13 @@ KUNGFU_OBSERVATION_SPACE = spaces.Dict({
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        obs, _ = env.reset()
+        # Get initial observation and handle tuple return
+        result = env.reset()
+        if isinstance(result, tuple):
+            obs, _ = result
+        else:
+            obs = result
+            
         self.true_height, self.true_width = obs.shape[:2]
         self.viewport_size = (self.true_width, self.true_height)
         
@@ -70,7 +76,15 @@ class KungFuWrapper(Wrapper):
         self.last_movement = None
 
     def reset(self, seed=None, options=None, **kwargs):
-        obs, info = self.env.reset(seed=seed, options=options, **kwargs)
+        result = self.env.reset(seed=seed, options=options, **kwargs)
+        
+        # Handle both old and new API
+        if isinstance(result, tuple):
+            obs, info = result
+        else:
+            obs = result
+            info = {}
+            
         self.last_hp = float(self.env.get_ram()[0x04A6])
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
@@ -86,7 +100,19 @@ class KungFuWrapper(Wrapper):
     def step(self, action):
         self.total_steps += 1
         self.action_counts[action] += 1
-        obs, reward, terminated, truncated, info = self.env.step(self.actions[action])
+        
+        # Execute action and handle return value formats
+        result = self.env.step(self.actions[action])
+        
+        # Handle both old and new API
+        if len(result) == 5:  # New API (obs, rew, terminated, truncated, info)
+            obs, reward, terminated, truncated, info = result
+            done = terminated or truncated
+        else:  # Old API (obs, rew, done, info)
+            obs, reward, done, info = result
+            terminated = done
+            truncated = False
+            
         ram = self.env.get_ram()
         
         hp = float(ram[0x04A6])
@@ -102,7 +128,7 @@ class KungFuWrapper(Wrapper):
             reward += hp_change_rate * 5
 
         reward += enemy_hit * 10
-        if terminated or truncated:
+        if done:
             reward -= 50
 
         projectile_info = self._detect_projectiles(obs)
@@ -162,7 +188,7 @@ class KungFuWrapper(Wrapper):
                                 np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
         reward += action_entropy * 0.1
         
-        if not (terminated or truncated) and hp > 0:
+        if not done and hp > 0:
             reward += 0.05
             self.survival_reward_total += 0.05
 
@@ -191,6 +217,7 @@ class KungFuWrapper(Wrapper):
             "closest_enemy_direction": closest_enemy_dir
         })
         
+        # Return format compatible with new Gymnasium API
         return self._get_obs(obs), normalized_reward, terminated, truncated, info
     
     def _update_boss_info(self, ram):
