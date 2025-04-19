@@ -12,6 +12,37 @@ import retro
 KUNGFU_MAX_ENEMIES = 5
 MAX_PROJECTILES = 2
 
+# Define actions outside the class for export
+KUNGFU_ACTIONS = [
+    [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (0)
+    [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (1)
+    [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick (2)
+    [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch (3)
+    [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch (4)
+    [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch (5)
+    [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump (6)
+    [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch (7)
+    [0,0,1,0,0,0,1,0,0,0,0,0],  # Crouch+Punch (8)
+    [1,0,0,0,0,0,0,0,0,0,0,0],  # Right (9)
+    [0,1,0,0,0,0,0,0,0,0,0,0]   # Left (10)
+]
+
+KUNGFU_ACTION_NAMES = [
+    "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
+    "Crouch", "Jump", "Jump+Punch", "Crouch+Punch", "Right", "Left"
+]
+
+# Define observation space outside the class for export
+KUNGFU_OBSERVATION_SPACE = spaces.Dict({
+    "viewport": spaces.Box(0, 255, (224, 240, 3), np.uint8),
+    "enemy_vector": spaces.Box(-255, 255, (KUNGFU_MAX_ENEMIES * 2,), np.float32),
+    "projectile_vectors": spaces.Box(-255, 255, (MAX_PROJECTILES * 4,), np.float32),
+    "combat_status": spaces.Box(-1, 1, (2,), np.float32),
+    "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
+    "boss_info": spaces.Box(-255, 255, (3,), np.float32),
+    "closest_enemy_direction": spaces.Box(-1, 1, (1,), np.float32)
+})
+
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -19,35 +50,12 @@ class KungFuWrapper(Wrapper):
         self.true_height, self.true_width = obs.shape[:2]
         self.viewport_size = (self.true_width, self.true_height)
         
-        self.actions = [
-            [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (0)
-            [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (1)
-            [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick (2)
-            [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch (3)
-            [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch (4)
-            [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch (5)
-            [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump (6)
-            [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch (7)
-            [0,0,1,0,0,0,1,0,0,0,0,0],  # Crouch+Punch (8)
-            [1,0,0,0,0,0,0,0,0,0,0,0],  # Right (9)
-            [0,1,0,0,0,0,0,0,0,0,0,0]   # Left (10)
-        ]
-        self.action_names = [
-            "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
-            "Crouch", "Jump", "Jump+Punch", "Crouch+Punch", "Right", "Left"
-        ]
+        self.actions = KUNGFU_ACTIONS
+        self.action_names = KUNGFU_ACTION_NAMES
         self.action_space = spaces.Discrete(len(self.actions))
         self.max_enemies = KUNGFU_MAX_ENEMIES
         self.max_projectiles = MAX_PROJECTILES
-        self.observation_space = spaces.Dict({
-            "viewport": spaces.Box(0, 255, (self.true_height, self.true_width, 3), np.uint8),
-            "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
-            "projectile_vectors": spaces.Box(-255, 255, (self.max_projectiles * 4,), np.float32),
-            "combat_status": spaces.Box(-1, 1, (2,), np.float32),
-            "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
-            "boss_info": spaces.Box(-255, 255, (3,), np.float32),
-            "closest_enemy_direction": spaces.Box(-1, 1, (1,), np.float32)
-        })
+        self.observation_space = KUNGFU_OBSERVATION_SPACE
         self.last_hp = 0
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))

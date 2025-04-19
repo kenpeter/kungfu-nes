@@ -5,25 +5,16 @@ import cv2
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from stable_baselines3.common.vec_env import VecTransposeImage
-from kungfu_env import SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES
-from gymnasium import spaces
+from kungfu_env import SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES, KUNGFU_ACTIONS, KUNGFU_OBSERVATION_SPACE
 
 class PlaybackWrapper(retro.RetroEnv):
-    """Wrapper for playback with MultiBinary action space and dictionary observation space."""
+    """Wrapper for playback with Discrete action space and dictionary observation space."""
     def __init__(self):
         super().__init__(game='KungFu-Nes', render_mode='human')
-        # Define MultiBinary action space to match the trained model
-        self.action_space = spaces.MultiBinary(9)
-        # Define dictionary observation space to match training
-        self.observation_space = spaces.Dict({
-            'viewport': spaces.Box(low=0, high=255, shape=(224, 240, 3), dtype=np.uint8),
-            'enemy_vector': spaces.Box(low=-255, high=255, shape=(KUNGFU_MAX_ENEMIES * 2,), dtype=np.float32),
-            'combat_status': spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32),
-            'projectile_vectors': spaces.Box(low=-255, high=255, shape=(MAX_PROJECTILES * 4,), dtype=np.float32),
-            'enemy_proximity': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
-            'boss_info': spaces.Box(low=-255, high=255, shape=(3,), dtype=np.float32),
-            'closest_enemy_direction': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
-        })
+        # Use Discrete action space to match the trained model
+        self.action_space = spaces.Discrete(len(KUNGFU_ACTIONS))
+        # Use exported observation space
+        self.observation_space = KUNGFU_OBSERVATION_SPACE
         self.max_enemies = KUNGFU_MAX_ENEMIES
         self.max_projectiles = MAX_PROJECTILES
         self.prev_frame = None
@@ -38,13 +29,8 @@ class PlaybackWrapper(retro.RetroEnv):
         return self._get_obs(obs)
 
     def step(self, action):
-        # Convert MultiBinary(9) action to 12-element retro action
-        action = np.array(action, dtype=np.uint8)
-        if action.shape != (9,):
-            raise ValueError(f"Expected action shape (9,), got {action.shape}")
-        # Pad 9-element action to 12-element array (fill unused buttons with 0)
-        retro_action = np.zeros(12, dtype=np.uint8)
-        retro_action[:9] = action
+        # Convert Discrete action to retro action using KUNGFU_ACTIONS
+        retro_action = np.array(KUNGFU_ACTIONS[action], dtype=np.uint8)
         obs, reward, terminated, truncated, info = super().step(retro_action)
         return self._get_obs(obs), reward, terminated, truncated, info
 
