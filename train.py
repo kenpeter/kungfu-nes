@@ -14,7 +14,7 @@ import sys
 import signal
 import time
 import glob
-from kungfu_env import KungFuWrapper, SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES, KUNGFU_OBSERVATION_SPACE, KUNGFU_ACTIONS
+from kungfu_env import KungFuWrapper, SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES, KUNGFU_OBSERVATION_SPACE, KUNGFU_ACTIONS, KUNGFU_ACTION_NAMES
 import threading
 import queue
 import gymnasium as gym
@@ -97,24 +97,9 @@ class SaveBestModelCallback(BaseCallback):
         self.save_path = save_path
         self.best_score = 0
         self.behaviour_mode = behaviour_mode
-        # Define actions for reward calculations (match KungFuWrapper.actions)
-        self.actions = [
-            [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (0)
-            [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (1)
-            [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick (2)
-            [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch (3)
-            [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch (4)
-            [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch (5)
-            [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump (6)
-            [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch (7)
-            [0,0,1,0,0,0,1,0,0,0,0,0],  # Crouch+Punch (8)
-            [1,0,0,0,0,0,0,0,0,0,0,0],  # Right (9)
-            [0,1,0,0,0,0,0,0,0,0,0,0]   # Left (10)
-        ]
-        self.action_names = [
-            "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
-            "Crouch", "Jump", "Jump+Punch", "Crouch+Punch", "Right", "Left"
-        ]
+        # Use KUNGFU_ACTIONS and KUNGFU_ACTION_NAMES from kungfu_env
+        self.actions = KUNGFU_ACTIONS
+        self.action_names = KUNGFU_ACTION_NAMES
 
     def _on_step(self) -> bool:
         if self.behaviour_mode:
@@ -262,7 +247,6 @@ class BehaviourCloningLoss(nn.Module):
     def forward(self, model_output, target_actions):
         return self.loss_fn(model_output, target_actions.float())
 
-
 class ExpertReplayEnvironment(gym.Env):
     def __init__(self, npz_directory):
         super().__init__()
@@ -284,14 +268,18 @@ class ExpertReplayEnvironment(gym.Env):
     def load_current_npz(self):
         npz_data = np.load(self.npz_files[self.current_file_idx])
         self.frames = npz_data['frames']
-        self.actions = npz_data['actions']  # Discrete action indices (0-10)
+        self.actions = npz_data['actions']  # Discrete action indices (0-12)
+        # Clip actions to valid range (0-12) for compatibility with old recordings
+        if np.max(self.actions) >= len(KUNGFU_ACTIONS):
+            global_logger.warning(f"Clipping invalid action indices in {self.npz_files[self.current_file_idx]} (max={np.max(self.actions)})")
+            self.actions = np.clip(self.actions, 0, len(KUNGFU_ACTIONS) - 1)
         self.rewards = np.ones_like(npz_data['rewards'])  # Override rewards
         self.current_frame_idx = 0
         global_logger.debug(f"Loaded NPZ file {self.npz_files[self.current_file_idx]} with {len(self.actions)} actions")
     
     def _setup_spaces(self):
         self.observation_space = KUNGFU_OBSERVATION_SPACE
-        self.action_space = spaces.Discrete(11)  # Match KungFuWrapper
+        self.action_space = spaces.Discrete(len(KUNGFU_ACTIONS))  # 13 actions
     
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -374,7 +362,7 @@ def extract_expert_data(npz_dir):
             
             for action in actions:
                 action_idx = int(action)
-                if action_idx < 0 or action_idx >= 11:
+                if action_idx < 0 or action_idx >= len(KUNGFU_ACTIONS):
                     global_logger.warning(f"Invalid action index in {npz_file}: {action_idx}")
                     continue
                 action_key = action_idx
@@ -385,7 +373,6 @@ def extract_expert_data(npz_dir):
             print(f"Error processing {npz_file}: {e}")
     
     return action_counts, total_frames
-
 
 class BehaviourCloningCallback(BaseCallback):
     def __init__(self, verbose=0):
@@ -416,76 +403,16 @@ def make_kungfu_env():
     env = KungFuWrapper(base_env)
     return env
 
-def create_expert_replay_env(npz_dir):
-    return lambda: ExpertReplayEnvironment(npz_dir)
-
-def extract_expert_data(npz_dir):
-    npz_files = glob.glob(os.path.join(npz_dir, '*.npz'))
-    if not npz_files:
-        return None, 0
-    
-    total_frames = 0
-    total_actions = 0
-    action_counts = {}
-    
-    for npz_file in npz_files:
-        try:
-            npz_data = np.load(npz_file)
-            frames = npz_data['frames']
-            actions = npz_data['actions']
-            
-            total_frames += len(frames)
-            total_actions += len(actions)
-            
-            for action in actions:
-                action_key = tuple(action.tolist())
-                if len(action_key) != 9:
-                    global_logger.warning(f"Invalid action shape in {npz_file}: {action_key}")
-                    continue
-                if action_key not in action_counts:
-                    action_counts[action_key] = 0
-                action_counts[action_key] += 1
-        except Exception as e:
-            print(f"Error processing {npz_file}: {e}")
-    
-    return action_counts, total_frames
-
 def map_multibinary_to_discrete(action):
-    """Map MultiBinary(9) action to Discrete(11) action index."""
-    actions = [
-        [0,0,0,0,0,0,0,0,0],  # No-op (0)
-        [0,0,0,0,0,0,1,0,0],  # Punch (1)
-        [0,0,0,0,0,0,0,0,1],  # Kick (2)
-        [1,0,0,0,0,0,1,0,0],  # Right+Punch (3)
-        [0,1,0,0,0,0,1,0,0],  # Left+Punch (4)
-        [0,0,1,0,0,0,0,0,0],  # Crouch (5)
-        [0,0,0,0,0,1,0,0,0],  # Jump (6)
-        [0,0,0,0,0,1,1,0,0],  # Jump+Punch (7)
-        [0,0,1,0,0,0,1,0,0],  # Crouch+Punch (8)
-        [1,0,0,0,0,0,0,0,0],  # Right (9)
-        [0,1,0,0,0,0,0,0,0]   # Left (10)
-    ]
-    for i, predefined_action in enumerate(actions):
+    """Map MultiBinary(9) action to Discrete(13) action index."""
+    for i, predefined_action in enumerate(KUNGFU_ACTIONS):
         if np.array_equal(action, predefined_action):
             return i
     return 0  # Default to No-op if no match
 
 def map_discrete_to_multibinary(action_idx):
-    """Map Discrete(11) action index to MultiBinary(9) action."""
-    actions = [
-        [0,0,0,0,0,0,0,0,0],  # No-op (0)
-        [0,0,0,0,0,0,1,0,0],  # Punch (1)
-        [0,0,0,0,0,0,0,0,1],  # Kick (2)
-        [1,0,0,0,0,0,1,0,0],  # Right+Punch (3)
-        [0,1,0,0,0,0,1,0,0],  # Left+Punch (4)
-        [0,0,1,0,0,0,0,0,0],  # Crouch (5)
-        [0,0,0,0,0,1,0,0,0],  # Jump (6)
-        [0,0,0,0,0,1,1,0,0],  # Jump+Punch (7)
-        [0,0,1,0,0,0,1,0,0],  # Crouch+Punch (8)
-        [1,0,0,0,0,0,0,0,0],  # Right (9)
-        [0,1,0,0,0,0,0,0,0]   # Left (10)
-    ]
-    return np.array(actions[action_idx], dtype=np.uint8)
+    """Map Discrete(13) action index to MultiBinary(9) action."""
+    return np.array(KUNGFU_ACTIONS[action_idx], dtype=np.uint8)
 
 def train(args):
     global current_model, global_logger, global_model_path, experience_data
@@ -544,6 +471,11 @@ def train(args):
                 custom_objects = {"policy_kwargs": policy_kwargs}
                 model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
                                  device="cuda" if args.cuda else "cpu")
+                # Check action space compatibility
+                expected_actions = len(KUNGFU_ACTIONS)
+                model_actions = model.policy.action_space.n
+                if model_actions != expected_actions:
+                    global_logger.warning(f"Model action space ({model_actions}) does not match environment ({expected_actions}). Retraining recommended.")
                 global_logger.info("Successfully loaded existing model")
                 return model
             except Exception as e:
@@ -624,7 +556,6 @@ def train(args):
         if args.npz_dir and training_mode == "behaviour":
             f.write(f"NPZ directory: {args.npz_dir}\n")
 
-            
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with live RL or behaviour cloning")
     parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo", help="Path to save the trained model")

@@ -22,7 +22,7 @@ MIN_RECORDING_LENGTH = 60  # Minimum frames to save a recording
 FRAME_SKIP = 2  # Record every Nth frame
 
 def map_input_to_discrete_action(inputs, buttons, keys_pressed):
-    """Map keyboard inputs to a discrete action index (0-10) based on KUNGFU_ACTIONS."""
+    """Map keyboard inputs to a discrete action index (0-12) based on KUNGFU_ACTIONS."""
     # Direct mapping of numeric keys (0-9) to specific action indices
     number_keys = [
         keycodes._0, keycodes._1, keycodes._2, keycodes._3, keycodes._4,
@@ -33,7 +33,20 @@ def map_input_to_discrete_action(inputs, buttons, keys_pressed):
             print(f"DEBUG - Testing action {i}")
             return i
     
-    # Map game inputs to actions based on KUNGFU_ACTIONS indices
+    # Check for combo actions first
+    if inputs.get('DOWN', False) and inputs.get('A', False):  # DOWN + Z for Crouch Kick
+        print("DEBUG - DOWN + A pressed - using action 11 (Crouch Kick)")
+        return 11  # DOWN + A
+    
+    if inputs.get('DOWN', False) and inputs.get('B', False):  # DOWN + X for Crouch Punch
+        print("DEBUG - DOWN + B pressed - using action 12 (Crouch Punch)")
+        return 12  # DOWN + B
+    
+    if inputs.get('UP', False) and inputs.get('RIGHT', False):  # UP + RIGHT
+        print("DEBUG - UP + RIGHT pressed - using action 10")
+        return 10  # UP + RIGHT
+    
+    # Map individual game inputs
     if inputs.get('UP', False):
         print("DEBUG - UP pressed - using action 4")
         return 4  # UP
@@ -126,7 +139,8 @@ def main():
     print("- R: Toggle recording game segment for ML training")
     print("- O: Save current game state")
     print("- P: Load previously saved game state")
-    print("- Game controls: Arrow keys, Z(A), X(B), C, A(X), S(Y), D(Z), ENTER(START), SPACE(SELECT), TAB(MODE)")
+    print("- Game controls: Arrow keys (UP, DOWN, LEFT, RIGHT), Z(A), X(B), C, A(X), S(Y), D(Z), ENTER(START), SPACE(SELECT), TAB(MODE)")
+    print("- Combos: DOWN + Z (Crouch Kick), DOWN + X (Crouch Punch), UP + RIGHT (Jump + Right)")
     print("- Numeric keys (0-9): Select specific actions for debugging")
     print("- Press CTRL+C in terminal to force quit\n")
 
@@ -235,7 +249,7 @@ def main():
 
         # Handle recording toggle
         if keycodes.R in keys_clicked:
-            print("DEBUG - R key pressed")  # Debug to confirm detection
+            print("DEBUG - R key pressed")
             is_recording = not is_recording
             if is_recording:
                 print("Recording started for ML training data")
@@ -281,7 +295,7 @@ def main():
         }
         
         # Debug raw inputs
-        print(f"DEBUG - Raw inputs: UP={inputs.get('UP')}, RIGHT={inputs.get('RIGHT')}")
+        print(f"DEBUG - Raw inputs: UP={inputs.get('UP')}, RIGHT={inputs.get('RIGHT')}, DOWN={inputs.get('DOWN')}, A={inputs.get('A')}, B={inputs.get('B')}")
 
         # Map inputs to discrete action
         discrete_action = map_input_to_discrete_action(inputs, env.buttons, keys_pressed)

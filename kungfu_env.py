@@ -15,20 +15,23 @@ MAX_PROJECTILES = 2
 # Define actions with 9 buttons to match retro environment
 KUNGFU_ACTIONS = [
     [0, 0, 0, 0, 0, 0, 0, 0, 0],  # No-op
-    [1, 0, 0, 0, 0, 0, 0, 0, 0],  # B
+    [1, 0, 0, 0, 0, 0, 0, 0, 0],  # B (Punch)
     [0, 0, 1, 0, 0, 0, 0, 0, 0],  # SELECT
     [0, 0, 0, 1, 0, 0, 0, 0, 0],  # START
-    [0, 0, 0, 0, 1, 0, 0, 0, 0],  # UP
-    [0, 0, 0, 0, 0, 1, 0, 0, 0],  # DOWN
+    [0, 0, 0, 0, 1, 0, 0, 0, 0],  # UP (Jump)
+    [0, 0, 0, 0, 0, 1, 0, 0, 0],  # DOWN (Crouch)
     [0, 0, 0, 0, 0, 0, 1, 0, 0],  # LEFT
     [0, 0, 0, 0, 0, 0, 0, 1, 0],  # RIGHT
-    [0, 0, 0, 0, 0, 0, 0, 0, 1],  # A
-    [1, 0, 0, 0, 0, 0, 0, 0, 1],  # B + A
-    [0, 0, 0, 0, 1, 0, 0, 1, 0],  # UP + RIGHT
+    [0, 0, 0, 0, 0, 0, 0, 0, 1],  # A (Kick)
+    [1, 0, 0, 0, 0, 0, 0, 0, 1],  # B + A (Punch + Kick)
+    [0, 0, 0, 0, 1, 0, 0, 1, 0],  # UP + RIGHT (Jump + Right)
+    [0, 0, 0, 0, 0, 1, 0, 0, 1],  # DOWN + A (Crouch Kick)
+    [1, 0, 0, 0, 0, 1, 0, 0, 0],  # DOWN + B (Crouch Punch)
 ]
 KUNGFU_ACTION_NAMES = [
-    "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
-    "Crouch", "Jump", "Jump+Punch", "Crouch+Punch", "Right", "Left"
+    "No-op", "Punch", "Select", "Start", "Jump",
+    "Crouch", "Left", "Right", "Kick", "Punch + Kick",
+    "Jump + Right", "Crouch Kick", "Crouch Punch"
 ]
 
 # Define observation space outside the class for export
@@ -135,7 +138,7 @@ class KungFuWrapper(Wrapper):
         dodge_reward = 0
         for i, (curr_dist, last_dist) in enumerate(zip(projectile_distances, self.last_projectile_distances)):
             if last_dist < 20 and curr_dist > last_dist:
-                if action in [5, 6]:
+                if action in [5, 6]:  # Crouch or Left dodge
                     dodge_reward += 3
         reward += dodge_reward
         self.last_projectile_distances = projectile_distances
@@ -156,7 +159,7 @@ class KungFuWrapper(Wrapper):
         
         if min_enemy_dist > close_range_threshold:
             movement_reward = 8.0
-            valid_actions = [9, 10]
+            valid_actions = [9, 10]  # Punch + Kick, Jump + Right
             if action in valid_actions:
                 if (action == 9 and closest_enemy_dir == 1) or (action == 10 and closest_enemy_dir == -1):
                     reward += movement_reward * (1 + min_enemy_dist/255) * 1.5
@@ -169,16 +172,16 @@ class KungFuWrapper(Wrapper):
                 reward -= 50.0
                 print(f"Invalid action {self.action_names[action]} taken when far (dist={min_enemy_dist}), reward={reward}")
         else:
-            if action in [1, 2, 8]:
+            if action in [1, 8, 11, 12]:  # Punch, Kick, Crouch Kick, Crouch Punch
                 reward += 2.0
-            elif action in [3, 4]:
+            elif action in [3, 4]:  # Start, Jump
                 if (action == 3 and closest_enemy_dir == 1) or (action == 4 and closest_enemy_dir == -1):
                     reward += 2.5
                 else:
                     reward += 0.5
-            elif action in [9, 10]:
+            elif action in [9, 10]:  # Punch + Kick, Jump + Right
                 reward -= 0.5
-            elif action in [0, 5, 6]:
+            elif action in [0, 5, 6]:  # No-op, Crouch, Left
                 reward -= 0.5
 
         self.prev_min_enemy_dist = min_enemy_dist
