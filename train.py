@@ -22,7 +22,6 @@ from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch.nn as nn
 import torch.nn.functional as F
-import pickle
 
 current_model = None
 global_logger = None
@@ -35,30 +34,18 @@ def emergency_save_handler(signum, frame):
         try:
             current_model.save(global_model_path)
             experience_count = len(experience_data)
-            if global_logger:
-                global_logger.info(f"Emergency save triggered. Model saved at {global_model_path}")
-                global_logger.info(f"Collected experience: {experience_count} steps")
-            else:
-                print(f"Emergency save triggered. Model saved at {global_model_path}")
-                print(f"Collected experience: {experience_count} steps")
-            
+            global_logger.info(f"Emergency save triggered. Model saved at {global_model_path}")
+            global_logger.info(f"Collected experience: {experience_count} steps")
             with open(f"{global_model_path}_experience_count.txt", "w") as f:
                 f.write(f"Total experience collected: {experience_count} steps\n")
                 f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         except Exception as e:
-            if global_logger:
-                global_logger.error(f"Emergency save failed: {e}")
-            else:
-                print(f"Emergency save failed: {e}")
-        
+            global_logger.error(f"Emergency save failed: {e}")
         if hasattr(current_model, 'env'):
             try:
                 current_model.env.close()
             except Exception as e:
-                if global_logger:
-                    global_logger.warning(f"Failed to close environment: {e}")
-                else:
-                    print(f"Failed to close environment: {e}")
+                global_logger.warning(f"Failed to close environment: {e}")
         if args.cuda:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -106,19 +93,19 @@ class SaveBestModelCallback(BaseCallback):
                 try:
                     self.model.save(self.save_path)
                     if self.verbose > 0:
-                        print(f"Behaviour model saved at step {self.num_timesteps}")
+                        global_logger.info(f"Behaviour model saved at step {self.num_timesteps}")
                 except Exception as e:
-                    print(f"Failed to save model: {e}")
+                    global_logger.error(f"Failed to save model: {e}")
             return True
             
         infos = self.locals.get('infos', [{}])
         
-        total_hits = sum([info.get('enemy_hit', 0) for info in infos])
-        total_hp = sum([info.get('hp', 0) for info in infos])
-        total_dodge_reward = sum([info.get('dodge_reward', 0) for info in infos])
-        total_survival_reward = sum([info.get('survival_reward_total', 0) for info in infos])
-        avg_normalized_reward = sum([info.get('normalized_reward', 0) for info in infos]) / max(1, len(infos))
-        avg_min_enemy_dist = sum([info.get('min_enemy_dist', 255) for info in infos]) / max(1, len(infos))
+        total_hits = sum(info.get('enemy_hit', 0) for info in infos)
+        total_hp = sum(info.get('hp', 0) for info in infos)
+        total_dodge_reward = sum(info.get('dodge_reward', 0) for info in infos)
+        total_survival_reward = sum(info.get('survival_reward_total', 0) for info in infos)
+        avg_normalized_reward = sum(info.get('normalized_reward', 0) for info in infos) / max(1, len(infos))
+        avg_min_enemy_dist = sum(info.get('min_enemy_dist', 255) for info in infos) / max(1, len(infos))
         
         action_diversity = 0
         if infos and 'action_percentages' in infos[0]:
@@ -127,9 +114,7 @@ class SaveBestModelCallback(BaseCallback):
                 action_diversity = -sum(p * np.log(p + 1e-6) for p in action_percentages if p > 0)
                 action_diversity = action_diversity / np.log(len(action_percentages))
         
-        close_combat_bonus = 0
-        if avg_min_enemy_dist <= 30:
-            close_combat_bonus = 10.0
+        close_combat_bonus = 10.0 if avg_min_enemy_dist <= 30 else 0
         
         score = (
             total_hits * 10 +
@@ -145,27 +130,25 @@ class SaveBestModelCallback(BaseCallback):
             self.best_score = score
             try:
                 self.model.save(self.save_path)
-                if self.verbose > 0:
-                    print(f"Saved best model with score {self.best_score:.2f} at step {self.num_timesteps}")
-                    print(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Dodge: {total_dodge_reward:.2f}, "
-                          f"Survival: {total_survival_reward:.2f}, Norm. Reward: {avg_normalized_reward:.2f}, "
-                          f"Action Diversity: {action_diversity:.2f}, Min Enemy Dist: {avg_min_enemy_dist:.1f}")
-                    
-                    if infos and 'action_percentages' in infos[0] and 'action_names' in infos[0]:
-                        action_percentages = infos[0].get('action_percentages', [])
-                        action_names = infos[0].get('action_names', [])
-                        if len(action_percentages) == len(action_names):
-                            print("  Action Percentages:")
-                            for name, perc in zip(action_names, action_percentages):
-                                print(f"    {name}: {perc * 100:.1f}%")
+                global_logger.info(f"Saved best model with score {self.best_score:.2f} at step {self.num_timesteps}")
+                global_logger.info(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Dodge: {total_dodge_reward:.2f}, "
+                                  f"Survival: {total_survival_reward:.2f}, Norm. Reward: {avg_normalized_reward:.2f}, "
+                                  f"Action Diversity: {action_diversity:.2f}, Min Enemy Dist: {avg_min_enemy_dist:.1f}")
+                if infos and 'action_percentages' in infos[0] and 'action_names' in infos[0]:
+                    action_percentages = infos[0].get('action_percentages', [])
+                    action_names = infos[0].get('action_names', [])
+                    if len(action_percentages) == len(action_names):
+                        global_logger.info("  Action Percentages:")
+                        for name, perc in zip(action_names, action_percentages):
+                            global_logger.info(f"    {name}: {perc * 100:.1f}%")
             except Exception as e:
-                print(f"Failed to save model: {e}")
+                global_logger.error(f"Failed to save model: {e}")
         
-        if self.num_timesteps % 5000 == 0 and self.verbose > 0:
-            print(f"Step {self.num_timesteps} Progress:")
-            print(f"  Current Score: {score:.2f}, Best Score: {self.best_score:.2f}")
-            print(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Norm. Reward: {avg_normalized_reward:.2f}, "
-                  f"Min Enemy Dist: {avg_min_enemy_dist:.1f}, Survival: {total_survival_reward:.2f}")
+        if self.num_timesteps % 5000 == 0:
+            global_logger.info(f"Step {self.num_timesteps} Progress:")
+            global_logger.info(f"  Current Score: {score:.2f}, Best Score: {self.best_score:.2f}")
+            global_logger.info(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Norm. Reward: {avg_normalized_reward:.2f}, "
+                              f"Min Enemy Dist: {avg_min_enemy_dist:.1f}, Survival: {total_survival_reward:.2f}")
         
         return True
 
@@ -236,13 +219,25 @@ def setup_logging(log_dir):
     )
     return logging.getLogger()
 
-class BehaviourCloningLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.loss_fn = nn.BCEWithLogitsLoss()
-        
-    def forward(self, model_output, target_actions):
-        return self.loss_fn(model_output, target_actions.float())
+class CustomPPO(PPO):
+    def __init__(self, *args, expert_actions=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.expert_actions = expert_actions
+        self.bc_loss_fn = nn.CrossEntropyLoss()
+
+    def train(self):
+        super().train()
+        if self.expert_actions is not None:
+            bc_loss = 0
+            for rollout_data in self.rollout_buffer.get():
+                obs = rollout_data.observations
+                actions = rollout_data.actions
+                action_logits = self.policy.get_distribution(obs).distribution.logits
+                expert_actions = self.expert_actions[:len(actions)]  # Trim to match batch
+                bc_loss += self.bc_loss_fn(action_logits, expert_actions.to(self.device))
+            self.policy.optimizer.zero_grad()
+            bc_loss.backward()
+            self.policy.optimizer.step()
 
 class ExpertReplayEnvironment(gym.Env):
     def __init__(self, npz_directory):
@@ -358,7 +353,7 @@ def extract_expert_data(npz_dir):
                     action_counts[action_key] = 0
                 action_counts[action_key] += 1
         except Exception as e:
-            print(f"Error processing {npz_file}: {e}")
+            global_logger.error(f"Error processing {npz_file}: {e}")
     
     return action_counts, total_frames
 
@@ -368,6 +363,7 @@ class BehaviourCloningCallback(BaseCallback):
         self.matches = 0
         self.total = 0
         self.last_print_time = time.time()
+        self.action_counts = np.zeros(len(KUNGFU_ACTIONS))
         
     def _on_step(self) -> bool:
         infos = self.locals.get('infos', [{}])
@@ -376,12 +372,17 @@ class BehaviourCloningCallback(BaseCallback):
                 if 'action_match' in info:
                     self.matches += 1 if info['action_match'] else 0
                     self.total += 1
+                if 'expert_action' in info:
+                    self.action_counts[info['expert_action']] += 1
         
         current_time = time.time()
-        if current_time - self.last_print_time >= 10:
-            if self.total > 0:
-                match_rate = self.matches / self.total * 100
-                print(f"Behaviour cloning: {self.matches}/{self.total} actions matched ({match_rate:.2f}%)")
+        if current_time - self.last_print_time >= 10 and self.total > 0:
+            match_rate = self.matches / self.total * 100
+            global_logger.info(f"Behaviour cloning: {self.matches}/{self.total} actions matched ({match_rate:.2f}%)")
+            global_logger.info("Action distribution:")
+            for i, count in enumerate(self.action_counts):
+                if count > 0:
+                    global_logger.info(f"  {KUNGFU_ACTION_NAMES[i]}: {count:.0f} ({count/self.total*100:.2f}%)")
             self.last_print_time = current_time
         
         return True
@@ -439,35 +440,45 @@ def train(args):
         "activation_fn": nn.ReLU,
     }
     
-    learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
-    ent_coef = 0.1
+    learning_rate_schedule = get_linear_fn(start=3e-4, end=1e-5, end_fraction=0.5)
+    ent_coef = 0.01
     params = {
         "learning_rate": learning_rate_schedule,
         "clip_range": args.clip_range,
         "ent_coef": ent_coef,
-        "n_steps": 512,
-        "batch_size": 32,
-        "n_epochs": 5,
+        "n_steps": 2048,
+        "batch_size": 64,
+        "n_epochs": 10,
     }
 
     def initialize_model(env):
+        expert_actions = None
+        if training_mode == "behaviour":
+            npz_files = glob.glob(os.path.join(args.npz_dir, '*.npz'))
+            if npz_files:
+                actions = []
+                for npz_file in npz_files:
+                    npz_data = np.load(npz_file)
+                    actions.extend(npz_data['actions'])
+                expert_actions = torch.tensor(actions, dtype=torch.long)
+                global_logger.info(f"Loaded {len(actions)} expert actions for behavioral cloning")
+        
         if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
             global_logger.info(f"Resuming training from {args.model_path}")
             try:
                 custom_objects = {"policy_kwargs": policy_kwargs}
-                model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
-                                 device="cuda" if args.cuda else "cpu")
-                expected_actions = len(KUNGFU_ACTIONS)
-                model_actions = model.policy.action_space.n
-                if model_actions != expected_actions:
-                    global_logger.warning(f"Model action space ({model_actions}) does not match environment ({expected_actions}). Retraining recommended.")
+                model = CustomPPO.load(args.model_path, env=env, custom_objects=custom_objects,
+                                      device="cuda" if args.cuda else "cpu")
+                if model.policy.action_space.n != len(KUNGFU_ACTIONS):
+                    global_logger.warning(f"Model action space ({model.policy.action_space.n}) does not match environment ({len(KUNGFU_ACTIONS)}).")
+                model.expert_actions = expert_actions
                 global_logger.info("Successfully loaded existing model")
                 return model
             except Exception as e:
                 global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
         
         global_logger.info("Starting new training session")
-        return PPO(
+        return CustomPPO(
             "MultiInputPolicy",
             env,
             learning_rate=params["learning_rate"],
@@ -480,7 +491,8 @@ def train(args):
             gae_lambda=0.95,
             verbose=1,
             policy_kwargs=policy_kwargs,
-            device="cuda" if args.cuda else "cpu"
+            device="cuda" if args.cuda else "cpu",
+            expert_actions=expert_actions
         )
 
     env_fns = [create_expert_replay_env(args.npz_dir) if training_mode == "behaviour" else make_kungfu_env for _ in range(args.num_envs)]
@@ -534,13 +546,16 @@ def train(args):
     experience_data = []
     global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
     
-    # Print final clone percentage if in behaviour cloning mode
     if training_mode == "behaviour":
         for cb in callbacks:
             if isinstance(cb, BehaviourCloningCallback):
                 if cb.total > 0:
                     final_match_rate = (cb.matches / cb.total) * 100
                     global_logger.info(f"Final behaviour cloning match rate: {cb.matches}/{cb.total} actions matched ({final_match_rate:.2f}%)")
+                    global_logger.info("Final action distribution:")
+                    for i, count in enumerate(cb.action_counts):
+                        if count > 0:
+                            global_logger.info(f"  {KUNGFU_ACTION_NAMES[i]}: {count:.0f} ({count/cb.total*100:.2f}%)")
                 else:
                     global_logger.info("No behaviour cloning data collected during training.")
                 break
@@ -555,14 +570,14 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with live RL or behaviour cloning")
     parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo", help="Path to save the trained model")
-    parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps for training")
+    parser.add_argument("--timesteps", type=int, default=1000000, help="Total timesteps for training")
     parser.add_argument("--clip_range", type=float, default=0.2, help="Default clip range for PPO")
     parser.add_argument("--num_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
-    parser.add_argument("--npz_dir", default=None, help="Directory containing NPZ recordings for behaviour cloning")
+    parser.add_argument("--npz_dir", default="recordings", help="Directory containing NPZ recordings for behaviour cloning")
     parser.add_argument("--render", action="store_true", help="Render the environment during training")
     parser.add_argument("--render_freq", type=int, default=256, help="Render every N steps")
     parser.add_argument("--render_fps", type=int, default=30, help="Target rendering FPS")
