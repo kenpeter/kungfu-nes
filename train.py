@@ -97,13 +97,11 @@ class SaveBestModelCallback(BaseCallback):
         self.save_path = save_path
         self.best_score = 0
         self.behaviour_mode = behaviour_mode
-        # Use KUNGFU_ACTIONS and KUNGFU_ACTION_NAMES from kungfu_env
         self.actions = KUNGFU_ACTIONS
         self.action_names = KUNGFU_ACTION_NAMES
 
     def _on_step(self) -> bool:
         if self.behaviour_mode:
-            # In behaviour mode, save every N steps
             if self.num_timesteps % 5000 == 0:
                 try:
                     self.model.save(self.save_path)
@@ -113,7 +111,6 @@ class SaveBestModelCallback(BaseCallback):
                     print(f"Failed to save model: {e}")
             return True
             
-        # Regular reward-based saving for RL mode
         infos = self.locals.get('infos', [{}])
         
         total_hits = sum([info.get('enemy_hit', 0) for info in infos])
@@ -242,7 +239,7 @@ def setup_logging(log_dir):
 class BehaviourCloningLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        self.loss_fn = nn.BCEWithLogitsLoss()  # For MultiBinary actions
+        self.loss_fn = nn.BCEWithLogitsLoss()
         
     def forward(self, model_output, target_actions):
         return self.loss_fn(model_output, target_actions.float())
@@ -257,7 +254,6 @@ class ExpertReplayEnvironment(gym.Env):
         self.current_file_idx = 0
         self.current_frame_idx = 0
         
-        # Initialize retro environment with KungFuWrapper
         self.base_env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array")
         self.env = KungFuWrapper(self.base_env)
         self.load_current_npz()
@@ -268,18 +264,17 @@ class ExpertReplayEnvironment(gym.Env):
     def load_current_npz(self):
         npz_data = np.load(self.npz_files[self.current_file_idx])
         self.frames = npz_data['frames']
-        self.actions = npz_data['actions']  # Discrete action indices (0-12)
-        # Clip actions to valid range (0-12) for compatibility with old recordings
+        self.actions = npz_data['actions']
         if np.max(self.actions) >= len(KUNGFU_ACTIONS):
             global_logger.warning(f"Clipping invalid action indices in {self.npz_files[self.current_file_idx]} (max={np.max(self.actions)})")
             self.actions = np.clip(self.actions, 0, len(KUNGFU_ACTIONS) - 1)
-        self.rewards = np.ones_like(npz_data['rewards'])  # Override rewards
+        self.rewards = np.ones_like(npz_data['rewards'])
         self.current_frame_idx = 0
         global_logger.debug(f"Loaded NPZ file {self.npz_files[self.current_file_idx]} with {len(self.actions)} actions")
     
     def _setup_spaces(self):
         self.observation_space = KUNGFU_OBSERVATION_SPACE
-        self.action_space = spaces.Discrete(len(KUNGFU_ACTIONS))  # 13 actions
+        self.action_space = spaces.Discrete(len(KUNGFU_ACTIONS))
     
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -287,25 +282,19 @@ class ExpertReplayEnvironment(gym.Env):
         self.current_file_idx = np.random.randint(0, len(self.npz_files))
         self.load_current_npz()
         
-        # Reset the wrapped environment
         obs, info = self.env.reset()
-        # Override viewport with NPZ frame
         obs['viewport'] = self.frames[0]
         expert_action = int(self.actions[0]) if len(self.actions) > 0 else 0
         return obs, {"behaviour_training": True, "expert_action": expert_action}
     
     def step(self, action):
-        # Use the wrapped environment to get full observation
         frame = self.frames[self.current_frame_idx]
         expert_action = int(self.actions[self.current_frame_idx]) if self.current_frame_idx < len(self.actions) else 0
         
-        # Map discrete action to KUNGFU_ACTIONS for env.step
         action_vector = KUNGFU_ACTIONS[action]
         expert_action_vector = KUNGFU_ACTIONS[expert_action]
         
-        # Step the wrapped environment
         obs, _, terminated, truncated, info = self.env.step(action)
-        # Override viewport with NPZ frame
         obs['viewport'] = frame
         
         reward = 1.0 if action == expert_action else 0.0
@@ -320,7 +309,6 @@ class ExpertReplayEnvironment(gym.Env):
         
         next_frame_idx = min(self.current_frame_idx, len(self.frames) - 1)
         next_expert_action = int(self.actions[next_frame_idx]) if next_frame_idx < len(self.actions) else 0
-        # Update observation for next frame
         obs['viewport'] = self.frames[next_frame_idx]
         
         info.update({
@@ -404,14 +392,12 @@ def make_kungfu_env():
     return env
 
 def map_multibinary_to_discrete(action):
-    """Map MultiBinary(9) action to Discrete(13) action index."""
     for i, predefined_action in enumerate(KUNGFU_ACTIONS):
         if np.array_equal(action, predefined_action):
             return i
-    return 0  # Default to No-op if no match
+    return 0
 
 def map_discrete_to_multibinary(action_idx):
-    """Map Discrete(13) action index to MultiBinary(9) action."""
     return np.array(KUNGFU_ACTIONS[action_idx], dtype=np.uint8)
 
 def train(args):
@@ -471,7 +457,6 @@ def train(args):
                 custom_objects = {"policy_kwargs": policy_kwargs}
                 model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
                                  device="cuda" if args.cuda else "cpu")
-                # Check action space compatibility
                 expected_actions = len(KUNGFU_ACTIONS)
                 model_actions = model.policy.action_space.n
                 if model_actions != expected_actions:
@@ -548,6 +533,17 @@ def train(args):
     experience_count = len(experience_data)
     experience_data = []
     global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
+    
+    # Print final clone percentage if in behaviour cloning mode
+    if training_mode == "behaviour":
+        for cb in callbacks:
+            if isinstance(cb, BehaviourCloningCallback):
+                if cb.total > 0:
+                    final_match_rate = (cb.matches / cb.total) * 100
+                    global_logger.info(f"Final behaviour cloning match rate: {cb.matches}/{cb.total} actions matched ({final_match_rate:.2f}%)")
+                else:
+                    global_logger.info("No behaviour cloning data collected during training.")
+                break
     
     with open(f"{global_model_path}_experience_count.txt", "w") as f:
         f.write(f"Total experience collected: {experience_count} steps\n")
