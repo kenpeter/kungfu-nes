@@ -11,14 +11,25 @@ from pyglet import clock
 from pyglet.window import key as keycodes
 from pyglet.gl import *
 import retro
+from kungfu_env import KUNGFU_ACTIONS  # Import actions from kungfu_env
 
 # Constants
 SAVE_PERIOD = 60  # frames
-DEFAULT_GAME_SPEED = 1.0
+DEFAULT_GAME_SPEED = 0.5
 STATE_SAVE_DIR = "saved_states"
 RECORDING_DIR = "recordings"
 MIN_RECORDING_LENGTH = 60  # Minimum frames to save a recording
 FRAME_SKIP = 2  # Record every Nth frame
+
+def map_input_to_discrete_action(inputs, buttons):
+    """Map keyboard inputs to a discrete action index (0-10) based on KUNGFU_ACTIONS."""
+    action_vector = [inputs.get(b, False) for b in buttons]
+    # Truncate to 9 buttons to match KUNGFU_ACTIONS
+    action_vector = action_vector[:9]
+    for i, predefined_action in enumerate(KUNGFU_ACTIONS):
+        if action_vector == predefined_action:
+            return i
+    return 0  # Default to No-op if no match
 
 def main():
     parser = argparse.ArgumentParser()
@@ -28,11 +39,11 @@ def main():
     parser.add_argument('--frame-skip', type=int, help='record every N frames', default=FRAME_SKIP)
     args = parser.parse_args()
 
-    # Create directories if they don't exist
+    # Create directories
     os.makedirs(STATE_SAVE_DIR, exist_ok=True)
     os.makedirs(RECORDING_DIR, exist_ok=True)
 
-    # Initialize game environment - ONLY create one environment instance
+    # Initialize game environment
     game = 'KungFu-Nes'
     state = '1Player.Level1'
     game_state_path = os.path.join(STATE_SAVE_DIR, f"{game}_{state}.state")
@@ -43,30 +54,30 @@ def main():
         state=state,
         use_restricted_actions=retro.Actions.ALL,
         scenario=args.scenario,
-        render_mode="rgb_array"  # Make sure this is the only render call
+        render_mode="rgb_array"
     )
     
-    # Fix for newer Gymnasium/Retro API: properly unpack tuple return value
+    # Handle reset
     print("Resetting environment...")
     result = env.reset()
     if isinstance(result, tuple):
-        obs, info = result  # Unpack if it's a tuple (new API)
+        obs, info = result
         print("Using new API (tuple return from reset)")
     else:
-        obs = result  # For backward compatibility
+        obs = result
         print("Using old API (single value return from reset)")
         
     screen_height, screen_width = obs.shape[:2]
     print(f"Screen dimensions: {screen_width}x{screen_height}")
     
-    # Verify button order matches training wrapper
-    EXPECTED_BUTTON_ORDER = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A', 'B', 'C', 'X', 'Y', 'Z', 'MODE', 'START', 'SELECT']
+    # Verify button order
+    EXPECTED_BUTTON_ORDER = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A', 'B', 'C', 'X', 'Y']  # Match KUNGFU_ACTIONS
     print("Button order verification:")
     print(f"  Environment: {env.buttons}")
     print(f"  Expected:    {EXPECTED_BUTTON_ORDER}")
-    if list(env.buttons) != EXPECTED_BUTTON_ORDER:
+    if env.buttons[:9] != EXPECTED_BUTTON_ORDER:
         print("\nWARNING: Button order mismatch! This will cause training problems!")
-        print("Modify either capture.py or your training wrapper to use consistent button ordering.\n")
+        print("Modify either capture.py or kungfu_env.py to use consistent button ordering.\n")
 
     # Window setup
     win_width = args.width
@@ -144,7 +155,7 @@ def main():
         recording_path = os.path.join(RECORDING_DIR, f"{game}_{state}_{timestamp}.npz")
         
         frames_array = np.array(recording_frames, dtype=np.uint8)
-        actions_array = np.array(recording_actions)
+        actions_array = np.array(recording_actions, dtype=np.uint8)  # Discrete action indices
         rewards_array = np.array(recording_rewards)
 
         np.savez_compressed(
@@ -152,7 +163,7 @@ def main():
             frames=frames_array,
             actions=actions_array,
             rewards=rewards_array,
-            buttons=list(env.buttons),
+            buttons=EXPECTED_BUTTON_ORDER,
             scenario=args.scenario,
             timestamp=timestamp,
             game_speed=args.speed,
@@ -165,9 +176,7 @@ def main():
         recording_rewards = []
 
     print("Starting main game loop...")
-    # Main game loop
     while not win.has_exit:
-        # Frame timing control
         current_time = time.time()
         elapsed = current_time - last_frame_time
         if elapsed < frame_duration:
@@ -232,18 +241,20 @@ def main():
             'SELECT': keycodes.SPACE in keys_pressed,
         }
 
-        action = [inputs.get(b, False) for b in env.buttons]
+        # Map inputs to discrete action
+        discrete_action = map_input_to_discrete_action(inputs, env.buttons)
+        action = KUNGFU_ACTIONS[discrete_action]  # Convert to 9-dimensional vector for env.step
         
         # Debug input handling
-        if any(action):
-            print("Pressed buttons:", [btn for btn, pressed in zip(env.buttons, action) if pressed])
+        if discrete_action != 0:
+            print(f"Action: {discrete_action} ({[btn for btn, pressed in zip(env.buttons[:9], action) if pressed]})")
         
-        # Handle step return value for new API
+        # Handle step return value
         step_result = env.step(action)
-        if len(step_result) == 5:  # New API (obs, rew, terminated, truncated, info)
+        if len(step_result) == 5:
             obs, rew, terminated, truncated, info = step_result
             done = terminated or truncated
-        else:  # Old API (obs, rew, done, info)
+        else:
             obs, rew, done, info = step_result
 
         # Handle game over during recording
@@ -260,7 +271,7 @@ def main():
         frame_counter += 1
         if is_recording and frame_counter % args.frame_skip == 0:
             recording_frames.append(obs.copy())
-            recording_actions.append(action.copy())
+            recording_actions.append(discrete_action)  # Save discrete action index
             recording_rewards.append(rew)
 
         # Rendering
@@ -281,12 +292,10 @@ def main():
         fps_display.draw()
         win.flip()
 
-        # Handle Pyglet event loop
         timeout = clock.get_sleep_time(False)
         pyglet.app.platform_event_loop.step(timeout)
         clock.tick()
 
-    # Cleanup
     print("Closing environment...")
     env.close()
 

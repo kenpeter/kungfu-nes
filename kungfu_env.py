@@ -12,19 +12,19 @@ import retro
 KUNGFU_MAX_ENEMIES = 5
 MAX_PROJECTILES = 2
 
-# Define actions outside the class for export
+# Define actions with 9 buttons to match retro environment
 KUNGFU_ACTIONS = [
-    [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (0)
-    [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (1)
-    [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick (2)
-    [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch (3)
-    [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch (4)
-    [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch (5)
-    [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump (6)
-    [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch (7)
-    [0,0,1,0,0,0,1,0,0,0,0,0],  # Crouch+Punch (8)
-    [1,0,0,0,0,0,0,0,0,0,0,0],  # Right (9)
-    [0,1,0,0,0,0,0,0,0,0,0,0]   # Left (10)
+    [0,0,0,0,0,0,0,0,0],  # No-op (0)
+    [0,0,0,0,0,0,1,0,0],  # Punch (1)
+    [0,0,0,0,0,0,0,0,1],  # Kick (2)
+    [1,0,0,0,0,0,1,0,0],  # Right+Punch (3)
+    [0,1,0,0,0,0,1,0,0],  # Left+Punch (4)
+    [0,0,1,0,0,0,0,0,0],  # Crouch (5)
+    [0,0,0,0,0,1,0,0,0],  # Jump (6)
+    [0,0,0,0,0,1,1,0,0],  # Jump+Punch (7)
+    [0,0,1,0,0,0,1,0,0],  # Crouch+Punch (8)
+    [1,0,0,0,0,0,0,0,0],  # Right (9)
+    [0,1,0,0,0,0,0,0,0]   # Left (10)
 ]
 
 KUNGFU_ACTION_NAMES = [

@@ -5,7 +5,14 @@ python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timest
 
 
 
-nohup your_command_here & disown
+
+nohup python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timesteps 400000 --resume & 
+
+
+tail -f nohup.out  # Check output (if still writing, it's running)
+ps aux | grep "long-task.sh"  # Check if process exists
+
+
 
 
 

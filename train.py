@@ -14,7 +14,7 @@ import sys
 import signal
 import time
 import glob
-from kungfu_env import KungFuWrapper, SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES
+from kungfu_env import KungFuWrapper, SimpleCNN, KUNGFU_MAX_ENEMIES, MAX_PROJECTILES, KUNGFU_OBSERVATION_SPACE, KUNGFU_ACTIONS
 import threading
 import queue
 import gymnasium as gym
@@ -262,6 +262,7 @@ class BehaviourCloningLoss(nn.Module):
     def forward(self, model_output, target_actions):
         return self.loss_fn(model_output, target_actions.float())
 
+
 class ExpertReplayEnvironment(gym.Env):
     def __init__(self, npz_directory):
         super().__init__()
@@ -271,6 +272,10 @@ class ExpertReplayEnvironment(gym.Env):
         
         self.current_file_idx = 0
         self.current_frame_idx = 0
+        
+        # Initialize retro environment with KungFuWrapper
+        self.base_env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array")
+        self.env = KungFuWrapper(self.base_env)
         self.load_current_npz()
         
         self.num_envs = 1
@@ -279,25 +284,14 @@ class ExpertReplayEnvironment(gym.Env):
     def load_current_npz(self):
         npz_data = np.load(self.npz_files[self.current_file_idx])
         self.frames = npz_data['frames']
-        self.actions = npz_data['actions']
-        self.rewards = np.ones_like(npz_data['rewards'])  # Override rewards to all be 1.0 for expert actions
+        self.actions = npz_data['actions']  # Discrete action indices (0-10)
+        self.rewards = np.ones_like(npz_data['rewards'])  # Override rewards
         self.current_frame_idx = 0
         global_logger.debug(f"Loaded NPZ file {self.npz_files[self.current_file_idx]} with {len(self.actions)} actions")
     
     def _setup_spaces(self):
-        first_frame = self.frames[0]
-        
-        self.observation_space = spaces.Dict({
-            'viewport': spaces.Box(low=0, high=255, shape=first_frame.shape, dtype=np.uint8),
-            'enemy_vector': spaces.Box(low=-255, high=255, shape=(KUNGFU_MAX_ENEMIES * 2,), dtype=np.float32),
-            'combat_status': spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32),
-            'projectile_vectors': spaces.Box(low=-255, high=255, shape=(MAX_PROJECTILES * 4,), dtype=np.float32),
-            'enemy_proximity': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
-            'boss_info': spaces.Box(low=-255, high=255, shape=(3,), dtype=np.float32),
-            'closest_enemy_direction': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
-        })
-        
-        self.action_space = spaces.MultiBinary(9)  # 9 buttons for Kung Fu
+        self.observation_space = KUNGFU_OBSERVATION_SPACE
+        self.action_space = spaces.Discrete(11)  # Match KungFuWrapper
     
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -305,26 +299,28 @@ class ExpertReplayEnvironment(gym.Env):
         self.current_file_idx = np.random.randint(0, len(self.npz_files))
         self.load_current_npz()
         
-        obs = {
-            'viewport': self.frames[0],
-            'enemy_vector': np.zeros(KUNGFU_MAX_ENEMIES * 2, dtype=np.float32),
-            'combat_status': np.zeros(2, dtype=np.float32),
-            'projectile_vectors': np.zeros(MAX_PROJECTILES * 4, dtype=np.float32),
-            'enemy_proximity': np.zeros(1, dtype=np.float32),
-            'boss_info': np.zeros(3, dtype=np.float32),
-            'closest_enemy_direction': np.zeros(1, dtype=np.float32),
-        }
-        expert_action = self.actions[0] if len(self.actions) > 0 else np.zeros(9, dtype=np.uint8)
+        # Reset the wrapped environment
+        obs, info = self.env.reset()
+        # Override viewport with NPZ frame
+        obs['viewport'] = self.frames[0]
+        expert_action = int(self.actions[0]) if len(self.actions) > 0 else 0
         return obs, {"behaviour_training": True, "expert_action": expert_action}
     
     def step(self, action):
+        # Use the wrapped environment to get full observation
         frame = self.frames[self.current_frame_idx]
-        expert_action = self.actions[self.current_frame_idx] if self.current_frame_idx < len(self.actions) else np.zeros(9, dtype=np.uint8)
+        expert_action = int(self.actions[self.current_frame_idx]) if self.current_frame_idx < len(self.actions) else 0
         
-        action = np.array(action, dtype=np.uint8)
-        expert_action = np.array(expert_action, dtype=np.uint8)
+        # Map discrete action to KUNGFU_ACTIONS for env.step
+        action_vector = KUNGFU_ACTIONS[action]
+        expert_action_vector = KUNGFU_ACTIONS[expert_action]
         
-        reward = 1.0 if np.array_equal(action, expert_action) else 0.0
+        # Step the wrapped environment
+        obs, _, terminated, truncated, info = self.env.step(action)
+        # Override viewport with NPZ frame
+        obs['viewport'] = frame
+        
+        reward = 1.0 if action == expert_action else 0.0
         
         self.current_frame_idx += 1
         terminated = self.current_frame_idx >= len(self.frames) - 1
@@ -335,23 +331,15 @@ class ExpertReplayEnvironment(gym.Env):
             self.load_current_npz()
         
         next_frame_idx = min(self.current_frame_idx, len(self.frames) - 1)
-        next_expert_action = self.actions[next_frame_idx] if next_frame_idx < len(self.actions) else np.zeros(9, dtype=np.uint8)
+        next_expert_action = int(self.actions[next_frame_idx]) if next_frame_idx < len(self.actions) else 0
+        # Update observation for next frame
+        obs['viewport'] = self.frames[next_frame_idx]
         
-        obs = {
-            'viewport': self.frames[next_frame_idx],
-            'enemy_vector': np.zeros(KUNGFU_MAX_ENEMIES * 2, dtype=np.float32),
-            'combat_status': np.zeros(2, dtype=np.float32),
-            'projectile_vectors': np.zeros(MAX_PROJECTILES * 4, dtype=np.float32),
-            'enemy_proximity': np.zeros(1, dtype=np.float32),
-            'boss_info': np.zeros(3, dtype=np.float32),
-            'closest_enemy_direction': np.zeros(1, dtype=np.float32),
-        }
-        
-        info = {
+        info.update({
             "behaviour_training": True,
             "expert_action": next_expert_action,
-            "action_match": np.array_equal(action, expert_action)
-        }
+            "action_match": action == expert_action
+        })
         
         return obs, reward, terminated, truncated, info
     
@@ -361,7 +349,43 @@ class ExpertReplayEnvironment(gym.Env):
         return None
     
     def close(self):
-        pass
+        self.env.close()
+
+def create_expert_replay_env(npz_dir):
+    return lambda: ExpertReplayEnvironment(npz_dir)
+
+def extract_expert_data(npz_dir):
+    npz_files = glob.glob(os.path.join(npz_dir, '*.npz'))
+    if not npz_files:
+        return None, 0
+    
+    total_frames = 0
+    total_actions = 0
+    action_counts = {}
+    
+    for npz_file in npz_files:
+        try:
+            npz_data = np.load(npz_file)
+            frames = npz_data['frames']
+            actions = npz_data['actions']
+            
+            total_frames += len(frames)
+            total_actions += len(actions)
+            
+            for action in actions:
+                action_idx = int(action)
+                if action_idx < 0 or action_idx >= 11:
+                    global_logger.warning(f"Invalid action index in {npz_file}: {action_idx}")
+                    continue
+                action_key = action_idx
+                if action_key not in action_counts:
+                    action_counts[action_key] = 0
+                action_counts[action_key] += 1
+        except Exception as e:
+            print(f"Error processing {npz_file}: {e}")
+    
+    return action_counts, total_frames
+
 
 class BehaviourCloningCallback(BaseCallback):
     def __init__(self, verbose=0):
@@ -479,12 +503,11 @@ def train(args):
     training_mode = "behaviour" if args.npz_dir and os.path.exists(args.npz_dir) else "live"
     if training_mode == "behaviour":
         global_logger.info(f"Training in behaviour cloning mode using NPZ directory: {args.npz_dir}")
-        
         action_counts, total_frames = extract_expert_data(args.npz_dir)
         if action_counts:
             global_logger.info(f"Expert data contains {total_frames} frames with action distribution:")
             for action, count in sorted(action_counts.items()):
-                global_logger.info(f"  Action {action}: {count} occurrences ({count/total_frames*100:.2f}%)")
+                global_logger.info(f"  Action {action} ({KUNGFU_ACTION_NAMES[action]}): {count} occurrences ({count/total_frames*100:.2f}%)")
     else:
         global_logger.info("Training in live reinforcement learning mode")
     
@@ -503,53 +526,32 @@ def train(args):
         "activation_fn": nn.ReLU,
     }
     
-    if training_mode == "behaviour":
-        learning_rate_schedule = get_linear_fn(start=5e-4, end=1e-4, end_fraction=0.5)
-        ent_coef = 0.01
-    else:
-        learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
-        ent_coef = 0.1
-
+    learning_rate_schedule = get_linear_fn(start=2.5e-4, end=1e-5, end_fraction=0.5)
+    ent_coef = 0.1
     params = {
         "learning_rate": learning_rate_schedule,
         "clip_range": args.clip_range,
         "ent_coef": ent_coef,
         "n_steps": 512,
         "batch_size": 32,
-        "n_epochs": 10 if training_mode == "behaviour" else 5,
+        "n_epochs": 5,
     }
 
-    def initialize_model(env, action_space_type):
+    def initialize_model(env):
         if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
             global_logger.info(f"Resuming training from {args.model_path}")
             try:
                 custom_objects = {"policy_kwargs": policy_kwargs}
                 model = PPO.load(args.model_path, env=env, custom_objects=custom_objects,
                                  device="cuda" if args.cuda else "cpu")
-                # Check action space compatibility
-                model_action_space = model.policy.action_space
-                env_action_space = env.action_space
-                if model_action_space != env_action_space:
-                    global_logger.warning(f"Action space mismatch: Model {model_action_space} != Env {env_action_space}")
-                    if isinstance(model_action_space, spaces.MultiBinary) and isinstance(env_action_space, spaces.Discrete):
-                        global_logger.info("Converting MultiBinary model to Discrete action space")
-                        model.policy.action_space = env_action_space
-                        model.policy.pi_features_extractor = None  # Reset to force reinitialization
-                    elif isinstance(model_action_space, spaces.Discrete) and isinstance(env_action_space, spaces.MultiBinary):
-                        global_logger.info("Converting Discrete model to MultiBinary action space")
-                        model.policy.action_space = env_action_space
-                        model.policy.pi_features_extractor = None  # Reset to force reinitialization
-                    else:
-                        raise ValueError(f"Unsupported action space conversion: {model_action_space} to {env_action_space}")
                 global_logger.info("Successfully loaded existing model")
                 return model
             except Exception as e:
                 global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
         
         global_logger.info("Starting new training session")
-        policy = "MultiInputPolicy"  # Use MultiInputPolicy for Dict observation space
         return PPO(
-            policy,
+            "MultiInputPolicy",
             env,
             learning_rate=params["learning_rate"],
             clip_range=params["clip_range"],
@@ -564,12 +566,7 @@ def train(args):
             device="cuda" if args.cuda else "cpu"
         )
 
-    if training_mode == "behaviour":
-        env_fns = [create_expert_replay_env(args.npz_dir) for _ in range(args.num_envs)]
-        action_space_type = "multibinary"
-    else:
-        env_fns = [make_kungfu_env for _ in range(args.num_envs)]
-        action_space_type = "discrete"
+    env_fns = [create_expert_replay_env(args.npz_dir) if training_mode == "behaviour" else make_kungfu_env for _ in range(args.num_envs)]
     
     if args.render:
         env = DummyVecEnv([make_kungfu_env])
@@ -579,7 +576,7 @@ def train(args):
     env = VecFrameStack(env, n_stack=4, channels_order='last')
     env = VecTransposeImage(env, skip=True)
     
-    current_model = initialize_model(env, action_space_type)
+    current_model = initialize_model(env)
     
     save_callback = SaveBestModelCallback(save_path=args.model_path, behaviour_mode=(training_mode == "behaviour"))
     exp_callback = ExperienceCollectionCallback()
@@ -617,7 +614,7 @@ def train(args):
         global_logger.warning(f"Failed to close environment during cleanup: {e}")
     
     experience_count = len(experience_data)
-    experience_data = []  # Clear experience data to free memory
+    experience_data = []
     global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
     
     with open(f"{global_model_path}_experience_count.txt", "w") as f:
@@ -627,6 +624,7 @@ def train(args):
         if args.npz_dir and training_mode == "behaviour":
             f.write(f"NPZ directory: {args.npz_dir}\n")
 
+            
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with live RL or behaviour cloning")
     parser.add_argument("--model_path", default="models/kungfu_ppo/kungfu_ppo", help="Path to save the trained model")
