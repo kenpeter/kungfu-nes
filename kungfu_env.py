@@ -14,19 +14,18 @@ MAX_PROJECTILES = 2
 
 # Define actions with 9 buttons to match retro environment
 KUNGFU_ACTIONS = [
-    [0,0,0,0,0,0,0,0,0],  # No-op (0)
-    [0,0,0,0,0,0,1,0,0],  # Punch (1)
-    [0,0,0,0,0,0,0,0,1],  # Kick (2)
-    [1,0,0,0,0,0,1,0,0],  # Right+Punch (3)
-    [0,1,0,0,0,0,1,0,0],  # Left+Punch (4)
-    [0,0,1,0,0,0,0,0,0],  # Crouch (5)
-    [0,0,0,0,0,1,0,0,0],  # Jump (6)
-    [0,0,0,0,0,1,1,0,0],  # Jump+Punch (7)
-    [0,0,1,0,0,0,1,0,0],  # Crouch+Punch (8)
-    [1,0,0,0,0,0,0,0,0],  # Right (9)
-    [0,1,0,0,0,0,0,0,0]   # Left (10)
+    [0, 0, 0, 0, 0, 0, 0, 0, 0],  # No-op
+    [1, 0, 0, 0, 0, 0, 0, 0, 0],  # B
+    [0, 0, 1, 0, 0, 0, 0, 0, 0],  # SELECT
+    [0, 0, 0, 1, 0, 0, 0, 0, 0],  # START
+    [0, 0, 0, 0, 1, 0, 0, 0, 0],  # UP
+    [0, 0, 0, 0, 0, 1, 0, 0, 0],  # DOWN
+    [0, 0, 0, 0, 0, 0, 1, 0, 0],  # LEFT
+    [0, 0, 0, 0, 0, 0, 0, 1, 0],  # RIGHT
+    [0, 0, 0, 0, 0, 0, 0, 0, 1],  # A
+    [1, 0, 0, 0, 0, 0, 0, 0, 1],  # B + A
+    [0, 0, 0, 0, 1, 0, 0, 1, 0],  # UP + RIGHT
 ]
-
 KUNGFU_ACTION_NAMES = [
     "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
     "Crouch", "Jump", "Jump+Punch", "Crouch+Punch", "Right", "Left"

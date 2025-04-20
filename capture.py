@@ -11,7 +11,7 @@ from pyglet import clock
 from pyglet.window import key as keycodes
 from pyglet.gl import *
 import retro
-from kungfu_env import KUNGFU_ACTIONS  # Import actions from kungfu_env
+from kungfu_env import KUNGFU_ACTIONS, KUNGFU_ACTION_NAMES  # Import actions from kungfu_env
 
 # Constants
 SAVE_PERIOD = 60  # frames
@@ -21,15 +21,45 @@ RECORDING_DIR = "recordings"
 MIN_RECORDING_LENGTH = 60  # Minimum frames to save a recording
 FRAME_SKIP = 2  # Record every Nth frame
 
-def map_input_to_discrete_action(inputs, buttons):
+def map_input_to_discrete_action(inputs, buttons, keys_pressed):
     """Map keyboard inputs to a discrete action index (0-10) based on KUNGFU_ACTIONS."""
-    action_vector = [inputs.get(b, False) for b in buttons]
-    # Truncate to 9 buttons to match KUNGFU_ACTIONS
-    action_vector = action_vector[:9]
-    for i, predefined_action in enumerate(KUNGFU_ACTIONS):
-        if action_vector == predefined_action:
+    # Direct mapping of numeric keys (0-9) to specific action indices
+    number_keys = [
+        keycodes._0, keycodes._1, keycodes._2, keycodes._3, keycodes._4,
+        keycodes._5, keycodes._6, keycodes._7, keycodes._8, keycodes._9
+    ]
+    for i, num_key in enumerate(number_keys):
+        if num_key in keys_pressed:
+            print(f"DEBUG - Testing action {i}")
             return i
-    return 0  # Default to No-op if no match
+    
+    # Map game inputs to actions based on KUNGFU_ACTIONS indices
+    if inputs.get('UP', False):
+        print("DEBUG - UP pressed - using action 4")
+        return 4  # UP
+    
+    if inputs.get('DOWN', False):
+        print("DEBUG - DOWN pressed - using action 5")
+        return 5  # DOWN
+    
+    if inputs.get('LEFT', False):
+        print("DEBUG - LEFT pressed - using action 6")
+        return 6  # LEFT
+    
+    if inputs.get('RIGHT', False):
+        print("DEBUG - RIGHT pressed - using action 7")
+        return 7  # RIGHT
+    
+    if inputs.get('A', False):  # Z key
+        print("DEBUG - A pressed - using action 8")
+        return 8  # A
+    
+    if inputs.get('B', False):  # X key
+        print("DEBUG - B pressed - using action 1")
+        return 1  # B
+    
+    # Default to no-op
+    return 0
 
 def main():
     parser = argparse.ArgumentParser()
@@ -70,8 +100,8 @@ def main():
     screen_height, screen_width = obs.shape[:2]
     print(f"Screen dimensions: {screen_width}x{screen_height}")
     
-    # Verify button order
-    EXPECTED_BUTTON_ORDER = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A', 'B', 'C', 'X', 'Y']  # Match KUNGFU_ACTIONS
+    # Verify button order (8-button NES layout)
+    EXPECTED_BUTTON_ORDER = ['B', None, 'SELECT', 'START', 'UP', 'DOWN', 'LEFT', 'RIGHT', 'A']
     print("Button order verification:")
     print(f"  Environment: {env.buttons}")
     print(f"  Expected:    {EXPECTED_BUTTON_ORDER}")
@@ -196,6 +226,12 @@ def main():
                 keys_clicked.add(key_code)
             key_previous_states[key_code] = pressed
 
+        # Debug key presses
+        if keycodes.UP in keys_pressed:
+            print("UP key pressed")
+        if keycodes.RIGHT in keys_pressed:
+            print("RIGHT key pressed")
+
         # Handle recording toggle
         if keycodes.R in keys_clicked:
             is_recording = not is_recording
@@ -240,15 +276,18 @@ def main():
             'START': keycodes.ENTER in keys_pressed,
             'SELECT': keycodes.SPACE in keys_pressed,
         }
+        
+        # Debug raw inputs
+        print(f"DEBUG - Raw inputs: UP={inputs.get('UP')}, RIGHT={inputs.get('RIGHT')}")
 
         # Map inputs to discrete action
-        discrete_action = map_input_to_discrete_action(inputs, env.buttons)
+        discrete_action = map_input_to_discrete_action(inputs, env.buttons, keys_pressed)
         action = KUNGFU_ACTIONS[discrete_action]  # Convert to 9-dimensional vector for env.step
         
-        # Debug input handling
+        # Debug action
         if discrete_action != 0:
-            print(f"Action: {discrete_action} ({[btn for btn, pressed in zip(env.buttons[:9], action) if pressed]})")
-        
+            print(f"Action: {discrete_action} ({KUNGFU_ACTION_NAMES[discrete_action]}) -> {action}")
+
         # Handle step return value
         step_result = env.step(action)
         if len(step_result) == 5:
