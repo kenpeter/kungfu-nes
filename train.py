@@ -23,10 +23,35 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Global variables
 current_model = None
 global_logger = None
 global_model_path = None
-experience_data = []
+experience_data = []  # Moved to module scope to avoid scoping issues
+
+def cleanup_resources(model=None, env=None, cuda=False):
+    """Centralized cleanup function for resources"""
+    global experience_data
+    try:
+        if model and hasattr(model, 'env'):
+            try:
+                model.env.close()
+            except Exception as e:
+                global_logger.warning(f"Failed to close model environment: {e}")
+        if env:
+            try:
+                env.close()
+            except Exception as e:
+                global_logger.warning(f"Failed to close environment: {e}")
+        if cuda and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        experience_data = []  # Clear experience data
+    except Exception as e:
+        global_logger.error(f"Error during resource cleanup: {e}")
+    finally:
+        global current_model
+        current_model = None
 
 def emergency_save_handler(signum, frame):
     global current_model, global_logger, global_model_path, experience_data
@@ -41,26 +66,19 @@ def emergency_save_handler(signum, frame):
                 f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         except Exception as e:
             global_logger.error(f"Emergency save failed: {e}")
-        if hasattr(current_model, 'env'):
-            try:
-                current_model.env.close()
-            except Exception as e:
-                global_logger.warning(f"Failed to close environment: {e}")
-        if args.cuda:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        del current_model
-        current_model = None
+        finally:
+            cleanup_resources(current_model, cuda=args.cuda)
     sys.exit(0)
 
 signal.signal(signal.SIGINT, emergency_save_handler)
+signal.signal(signal.SIGTERM, emergency_save_handler)
 
 class ExperienceCollectionCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        self.experience_data = []
         
     def _on_step(self) -> bool:
+        global experience_data
         obs = self.locals.get('new_obs')
         actions = self.locals.get('actions')
         rewards = self.locals.get('rewards')
@@ -75,7 +93,7 @@ class ExperienceCollectionCallback(BaseCallback):
                 "done": dones,
                 "info": infos
             }
-            self.experience_data.append(experience)
+            experience_data.append(experience)
         return True
 
 class SaveBestModelCallback(BaseCallback):
@@ -320,7 +338,11 @@ class ExpertReplayEnvironment(gym.Env):
         return None
     
     def close(self):
-        self.env.close()
+        try:
+            self.env.close()
+            self.base_env.close()
+        except Exception as e:
+            global_logger.warning(f"Error closing ExpertReplayEnvironment: {e}")
 
 def create_expert_replay_env(npz_dir):
     return lambda: ExpertReplayEnvironment(npz_dir)
@@ -403,169 +425,164 @@ def map_discrete_to_multibinary(action_idx):
 
 def train(args):
     global current_model, global_logger, global_model_path, experience_data
-    experience_data = []
-    
     global_logger = setup_logging(args.log_dir)
     global_logger.info(f"Starting training with {args.num_envs} envs and {args.timesteps} total timesteps")
     global_logger.info(f"Maximum number of enemies: {KUNGFU_MAX_ENEMIES}")
     global_model_path = args.model_path
     current_model = None
+    env = None
 
-    if args.num_envs < 1:
-        raise ValueError("Number of environments must be at least 1")
-    
-    training_mode = "behaviour" if args.npz_dir and os.path.exists(args.npz_dir) else "live"
-    if training_mode == "behaviour":
-        global_logger.info(f"Training in behaviour cloning mode using NPZ directory: {args.npz_dir}")
-        action_counts, total_frames = extract_expert_data(args.npz_dir)
-        if action_counts:
-            global_logger.info(f"Expert data contains {total_frames} frames with action distribution:")
-            for action, count in sorted(action_counts.items()):
-                global_logger.info(f"  Action {action} ({KUNGFU_ACTION_NAMES[action]}): {count} occurrences ({count/total_frames*100:.2f}%)")
-    else:
-        global_logger.info("Training in live reinforcement learning mode")
-    
-    if args.render:
-        if training_mode == "behaviour":
-            global_logger.warning("Rendering is not supported in behaviour cloning mode. Ignoring --render flag.")
-            args.render = False
-        else:
-            global_logger.info("Rendering enabled. Using a single environment for visualization.")
-            args.num_envs = 1
-
-    policy_kwargs = {
-        "features_extractor_class": SimpleCNN,
-        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},
-        "net_arch": dict(pi=[128, 128], vf=[256, 256]),
-        "activation_fn": nn.ReLU,
-    }
-    
-    learning_rate_schedule = get_linear_fn(start=3e-4, end=1e-5, end_fraction=0.5)
-    ent_coef = 0.01
-    params = {
-        "learning_rate": learning_rate_schedule,
-        "clip_range": args.clip_range,
-        "ent_coef": ent_coef,
-        "n_steps": 2048,
-        "batch_size": 64,
-        "n_epochs": 10,
-    }
-
-    def initialize_model(env):
-        expert_actions = None
-        if training_mode == "behaviour":
-            npz_files = glob.glob(os.path.join(args.npz_dir, '*.npz'))
-            if npz_files:
-                actions = []
-                for npz_file in npz_files:
-                    npz_data = np.load(npz_file)
-                    actions.extend(npz_data['actions'])
-                expert_actions = torch.tensor(actions, dtype=torch.long)
-                global_logger.info(f"Loaded {len(actions)} expert actions for behavioral cloning")
-        
-        if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
-            global_logger.info(f"Resuming training from {args.model_path}")
-            try:
-                custom_objects = {"policy_kwargs": policy_kwargs}
-                model = CustomPPO.load(args.model_path, env=env, custom_objects=custom_objects,
-                                      device="cuda" if args.cuda else "cpu")
-                if model.policy.action_space.n != len(KUNGFU_ACTIONS):
-                    global_logger.warning(f"Model action space ({model.policy.action_space.n}) does not match environment ({len(KUNGFU_ACTIONS)}).")
-                model.expert_actions = expert_actions
-                global_logger.info("Successfully loaded existing model")
-                return model
-            except Exception as e:
-                global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
-        
-        global_logger.info("Starting new training session")
-        return CustomPPO(
-            "MultiInputPolicy",
-            env,
-            learning_rate=params["learning_rate"],
-            clip_range=params["clip_range"],
-            ent_coef=params["ent_coef"],
-            n_steps=params["n_steps"],
-            batch_size=params["batch_size"],
-            n_epochs=params["n_epochs"],
-            gamma=0.99,
-            gae_lambda=0.95,
-            verbose=1,
-            policy_kwargs=policy_kwargs,
-            device="cuda" if args.cuda else "cpu",
-            expert_actions=expert_actions
-        )
-
-    env_fns = [create_expert_replay_env(args.npz_dir) if training_mode == "behaviour" else make_kungfu_env for _ in range(args.num_envs)]
-    
-    if args.render:
-        env = DummyVecEnv([make_kungfu_env])
-    else:
-        env = SubprocVecEnv(env_fns)
-    
-    env = VecFrameStack(env, n_stack=4, channels_order='last')
-    env = VecTransposeImage(env, skip=True)
-    
-    current_model = initialize_model(env)
-    
-    save_callback = SaveBestModelCallback(save_path=args.model_path, behaviour_mode=(training_mode == "behaviour"))
-    exp_callback = ExperienceCollectionCallback()
-    callbacks = [save_callback, exp_callback]
-    
-    if training_mode == "behaviour":
-        bc_callback = BehaviourCloningCallback()
-        callbacks.append(bc_callback)
-    
-    if args.render:
-        callbacks.append(RenderCallback(render_freq=args.render_freq, fps=30))
-    
-    callback = CallbackList(callbacks)
-    
     try:
+        if args.num_envs < 1:
+            raise ValueError("Number of environments must be at least 1")
+        
+        training_mode = "behaviour" if args.npz_dir and os.path.exists(args.npz_dir) else "live"
+        if training_mode == "behaviour":
+            global_logger.info(f"Training in behaviour cloning mode using NPZ directory: {args.npz_dir}")
+            action_counts, total_frames = extract_expert_data(args.npz_dir)
+            if action_counts:
+                global_logger.info(f"Expert data contains {total_frames} frames with action distribution:")
+                for action, count in sorted(action_counts.items()):
+                    global_logger.info(f"  Action {action} ({KUNGFU_ACTION_NAMES[action]}): {count} occurrences ({count/total_frames*100:.2f}%)")
+        else:
+            global_logger.info("Training in live reinforcement learning mode")
+        
+        if args.render:
+            if training_mode == "behaviour":
+                global_logger.warning("Rendering is not supported in behaviour cloning mode. Ignoring --render flag.")
+                args.render = False
+            else:
+                global_logger.info("Rendering enabled. Using a single environment for visualization.")
+                args.num_envs = 1
+
+        policy_kwargs = {
+            "features_extractor_class": SimpleCNN,
+            "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},
+            "net_arch": dict(pi=[128, 128], vf=[256, 256]),
+            "activation_fn": nn.ReLU,
+        }
+        
+        learning_rate_schedule = get_linear_fn(start=3e-4, end=1e-5, end_fraction=0.5)
+        ent_coef = 0.01
+        params = {
+            "learning_rate": learning_rate_schedule,
+            "clip_range": args.clip_range,
+            "ent_coef": ent_coef,
+            "n_steps": 2048,
+            "batch_size": 64,
+            "n_epochs": 10,
+        }
+
+
+        def initialize_model(vec_env):
+            global current_model  # Use 'global' instead of 'nonlocal'
+            expert_actions = None
+            if training_mode == "behaviour":
+                npz_files = glob.glob(os.path.join(args.npz_dir, '*.npz'))
+                if npz_files:
+                    actions = []
+                    for npz_file in npz_files:
+                        npz_data = np.load(npz_file)
+                        actions.extend(npz_data['actions'])
+                    expert_actions = torch.tensor(actions, dtype=torch.long)
+                    global_logger.info(f"Loaded {len(actions)} expert actions for behavioral cloning")
+            
+            if args.resume and os.path.exists(args.model_path + ".zip") and zipfile.is_zipfile(args.model_path + ".zip"):
+                global_logger.info(f"Resuming training from {args.model_path}")
+                try:
+                    custom_objects = {"policy_kwargs": policy_kwargs}
+                    current_model = CustomPPO.load(args.model_path, env=vec_env, custom_objects=custom_objects,
+                                                device="cuda" if args.cuda else "cpu")
+                    if current_model.policy.action_space.n != len(KUNGFU_ACTIONS):
+                        global_logger.warning(f"Model action space ({current_model.policy.action_space.n}) does not match environment ({len(KUNGFU_ACTIONS)}).")
+                    current_model.expert_actions = expert_actions
+                    global_logger.info("Successfully loaded existing model")
+                    return current_model
+                except Exception as e:
+                    global_logger.warning(f"Failed to load model: {e}. Starting new training session.")
+            
+            global_logger.info("Starting new training session")
+            current_model = CustomPPO(
+                "MultiInputPolicy",
+                vec_env,
+                learning_rate=params["learning_rate"],
+                clip_range=params["clip_range"],
+                ent_coef=params["ent_coef"],
+                n_steps=params["n_steps"],
+                batch_size=params["batch_size"],
+                n_epochs=params["n_epochs"],
+                gamma=0.99,
+                gae_lambda=0.95,
+                verbose=1,
+                policy_kwargs=policy_kwargs,
+                device="cuda" if args.cuda else "cpu",
+                expert_actions=expert_actions
+            )
+            return current_model
+
+
+        env_fns = [create_expert_replay_env(args.npz_dir) if training_mode == "behaviour" else make_kungfu_env for _ in range(args.num_envs)]
+        
+        if args.render:
+            env = DummyVecEnv([make_kungfu_env])
+        else:
+            env = SubprocVecEnv(env_fns)
+        
+        env = VecFrameStack(env, n_stack=4, channels_order='last')
+        env = VecTransposeImage(env, skip=True)
+        
+        current_model = initialize_model(env)
+        
+        save_callback = SaveBestModelCallback(save_path=args.model_path, behaviour_mode=(training_mode == "behaviour"))
+        exp_callback = ExperienceCollectionCallback()
+        callbacks = [save_callback, exp_callback]
+        
+        if training_mode == "behaviour":
+            bc_callback = BehaviourCloningCallback()
+            callbacks.append(bc_callback)
+        
+        if args.render:
+            callbacks.append(RenderCallback(render_freq=args.render_freq, fps=30))
+        
+        callback = CallbackList(callbacks)
+        
         current_model.learn(total_timesteps=args.timesteps, callback=callback, progress_bar=args.progress_bar)
-        experience_data.extend(exp_callback.experience_data)
+        
+        try:
+            current_model.save(args.model_path)
+            global_logger.info(f"Final model saved at {args.model_path}")
+        except Exception as e:
+            global_logger.error(f"Failed to save final model: {e}")
+
+        experience_count = len(experience_data)
+        global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
+        
+        if training_mode == "behaviour":
+            for cb in callbacks:
+                if isinstance(cb, BehaviourCloningCallback):
+                    if cb.total > 0:
+                        final_match_rate = (cb.matches / cb.total) * 100
+                        global_logger.info(f"Final behaviour cloning match rate: {cb.matches}/{cb.total} actions matched ({final_match_rate:.2f}%)")
+                        global_logger.info("Final action distribution:")
+                        for i, count in enumerate(cb.action_counts):
+                            if count > 0:
+                                global_logger.info(f"  {KUNGFU_ACTION_NAMES[i]}: {count:.0f} ({count/cb.total*100:.2f}%)")
+                    else:
+                        global_logger.info("No behaviour cloning data collected during training.")
+                    break
+        
+        with open(f"{global_model_path}_experience_count.txt", "w") as f:
+            f.write(f"Total experience collected: {experience_count} steps\n")
+            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Training parameters: num_envs={args.num_envs}, total_timesteps={args.timesteps}, mode={training_mode}\n")
+            if args.npz_dir and training_mode == "behaviour":
+                f.write(f"NPZ directory: {args.npz_dir}\n")
+
     except Exception as e:
         global_logger.error(f"Training failed: {e}")
-        try:
-            env.close()
-        except Exception as close_e:
-            global_logger.warning(f"Failed to close environment: {close_e}")
         raise
-    
-    try:
-        current_model.save(args.model_path)
-        global_logger.info(f"Final model saved at {args.model_path}")
-    except Exception as e:
-        global_logger.error(f"Failed to save final model: {e}")
-    
-    try:
-        env.close()
-    except Exception as e:
-        global_logger.warning(f"Failed to close environment during cleanup: {e}")
-    
-    experience_count = len(experience_data)
-    experience_data = []
-    global_logger.info(f"Training completed. Total experience collected: {experience_count} steps")
-    
-    if training_mode == "behaviour":
-        for cb in callbacks:
-            if isinstance(cb, BehaviourCloningCallback):
-                if cb.total > 0:
-                    final_match_rate = (cb.matches / cb.total) * 100
-                    global_logger.info(f"Final behaviour cloning match rate: {cb.matches}/{cb.total} actions matched ({final_match_rate:.2f}%)")
-                    global_logger.info("Final action distribution:")
-                    for i, count in enumerate(cb.action_counts):
-                        if count > 0:
-                            global_logger.info(f"  {KUNGFU_ACTION_NAMES[i]}: {count:.0f} ({count/cb.total*100:.2f}%)")
-                else:
-                    global_logger.info("No behaviour cloning data collected during training.")
-                break
-    
-    with open(f"{global_model_path}_experience_count.txt", "w") as f:
-        f.write(f"Total experience collected: {experience_count} steps\n")
-        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Training parameters: num_envs={args.num_envs}, total_timesteps={args.timesteps}, mode={training_mode}\n")
-        if args.npz_dir and training_mode == "behaviour":
-            f.write(f"NPZ directory: {args.npz_dir}\n")
+    finally:
+        cleanup_resources(current_model, env, args.cuda)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO model for Kung Fu with live RL or behaviour cloning")
@@ -585,11 +602,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         train(args)
+    except Exception as e:
+        if global_logger is not None:
+            global_logger.error(f"Main execution failed: {e}")
+        else:
+            print(f"Main execution failed: {e}", file=sys.stderr)
+        raise
     finally:
-        if current_model and hasattr(current_model, 'env'):
-            try:
-                current_model.env.close()
-            except Exception as e:
-                global_logger.error(f"Failed to close environment during final cleanup: {e}")
-        if args.cuda:
-            torch.cuda.empty_cache()
+        cleanup_resources(current_model, cuda=args.cuda)
