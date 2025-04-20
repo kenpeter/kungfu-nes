@@ -9,9 +9,9 @@ NO_OP_INDEX = 0  # No-op action index
 MAX_CONSECUTIVE_NO_OPS = 3  # Max consecutive No-ops allowed
 NO_OP_KEEP_PROB = 0.1  # Keep 10% of No-op actions
 MIN_FRAMES = 100  # Minimum frames to save a file
-MAX_ACTION_PERCENTAGE = 0.4  # Cap any action at 40% of total
-AUGMENT_ACTIONS = [8, 11, 12]  # Kick, Crouch Kick, Crouch Punch
-AUGMENT_FACTOR = 2  # Duplicate these actions twice
+MAX_ACTION_PERCENTAGE = 0.5  # Cap any action at 50% of total
+AUGMENT_ACTIONS = [1, 7, 8, 11, 12]  # Punch, Right, Kick, Crouch Kick, Crouch Punch
+AUGMENT_FACTOR = 3  # Triple these actions
 
 def filter_recording(input_path, output_path):
     """Filter a single .npz file to reduce No-op and balance actions."""
@@ -48,10 +48,28 @@ def filter_recording(input_path, output_path):
             else:
                 no_op_count = 0
 
+        # Prioritize attack actions (assume attacks needed when enemies are close)
+        attack_indices = np.isin(actions, [1, 8, 11, 12])  # Punch, Kick, Crouch Kick, Crouch Punch
+        keep_mask[attack_indices] = True  # Keep all attack actions
+
         # Apply initial mask
         filtered_frames = frames[keep_mask]
         filtered_actions = actions[keep_mask]
         filtered_rewards = rewards[keep_mask]
+
+        # Augment underrepresented actions
+        aug_frames, aug_actions, aug_rewards = [], [], []
+        for i in AUGMENT_ACTIONS:
+            indices = np.where(filtered_actions == i)[0]
+            for idx in indices:
+                for _ in range(AUGMENT_FACTOR - 1):
+                    aug_frames.append(filtered_frames[idx])
+                    aug_actions.append(filtered_actions[idx])
+                    aug_rewards.append(filtered_rewards[idx])
+        if aug_frames:
+            filtered_frames = np.concatenate([filtered_frames, aug_frames])
+            filtered_actions = np.concatenate([filtered_actions, aug_actions])
+            filtered_rewards = np.concatenate([filtered_rewards, aug_rewards])
 
         # Balance action distribution
         if len(filtered_actions) > 0:
@@ -61,28 +79,14 @@ def filter_recording(input_path, output_path):
             for i in range(len(action_counts)):
                 if action_counts[i] / total > MAX_ACTION_PERCENTAGE:
                     indices = np.where(filtered_actions == i)[0]
-                    keep_prob = (MAX_ACTION_PERCENTAGE * total) / action_counts[i]
-                    for idx in indices:
-                        if np.random.rand() > keep_prob:
-                            new_keep_mask[idx] = False
+                    max_allowed = int(MAX_ACTION_PERCENTAGE * total)
+                    if len(indices) > max_allowed:
+                        np.random.shuffle(indices)
+                        new_keep_mask[indices[max_allowed:]] = False
+                        print(f"Capped action {KUNGFU_ACTION_NAMES[i]} from {action_counts[i]} to {max_allowed}")
             filtered_frames = filtered_frames[new_keep_mask]
             filtered_actions = filtered_actions[new_keep_mask]
             filtered_rewards = filtered_rewards[new_keep_mask]
-
-        # Augment underrepresented attack actions
-        if len(filtered_actions) > 0:
-            aug_frames, aug_actions, aug_rewards = [], [], []
-            for i in AUGMENT_ACTIONS:
-                indices = np.where(filtered_actions == i)[0]
-                for idx in indices:
-                    for _ in range(AUGMENT_FACTOR - 1):
-                        aug_frames.append(filtered_frames[idx])
-                        aug_actions.append(filtered_actions[idx])
-                        aug_rewards.append(filtered_rewards[idx])
-            if aug_frames:
-                filtered_frames = np.concatenate([filtered_frames, aug_frames])
-                filtered_actions = np.concatenate([filtered_actions, aug_actions])
-                filtered_rewards = np.concatenate([filtered_rewards, aug_rewards])
 
         # Debugging output
         print(f"\nProcessing {input_path}:")
