@@ -577,7 +577,7 @@ if __name__ == "__main__":
     parser.add_argument("--progress_bar", action="store_true", help="Show progress bar during training")
     parser.add_argument("--resume", action="store_true", help="Resume training from the saved model")
     parser.add_argument("--log_dir", default="logs", help="Directory for logs")
-    parser.add_argument("--npz_dir", default="recordings", help="Directory containing NPZ recordings for behaviour cloning")
+    parser.add_argument("--npz_dir", default="recordings_filtered", help="Directory containing NPZ recordings for behaviour cloning")
     parser.add_argument("--render", action="store_true", help="Render the environment during training")
     parser.add_argument("--render_freq", type=int, default=256, help="Render every N steps")
     parser.add_argument("--render_fps", type=int, default=30, help="Target rendering FPS")
