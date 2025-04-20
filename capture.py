@@ -100,7 +100,7 @@ def main():
     screen_height, screen_width = obs.shape[:2]
     print(f"Screen dimensions: {screen_width}x{screen_height}")
     
-    # Verify button order (8-button NES layout)
+    # Verify button order
     EXPECTED_BUTTON_ORDER = ['B', None, 'SELECT', 'START', 'UP', 'DOWN', 'LEFT', 'RIGHT', 'A']
     print("Button order verification:")
     print(f"  Environment: {env.buttons}")
@@ -127,6 +127,7 @@ def main():
     print("- O: Save current game state")
     print("- P: Load previously saved game state")
     print("- Game controls: Arrow keys, Z(A), X(B), C, A(X), S(Y), D(Z), ENTER(START), SPACE(SELECT), TAB(MODE)")
+    print("- Numeric keys (0-9): Select specific actions for debugging")
     print("- Press CTRL+C in terminal to force quit\n")
 
     # Handle high DPI displays
@@ -176,9 +177,9 @@ def main():
         
         if len(recording_frames) < MIN_RECORDING_LENGTH:
             print(f"Recording too short ({len(recording_frames)} frames) - discarded")
-            recording_frames = []
-            recording_actions = []
-            recording_rewards = []
+            recording_frames.clear()
+            recording_actions.clear()
+            recording_rewards.clear()
             return
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -201,9 +202,9 @@ def main():
         )
         
         print(f"Saved recording with {len(recording_frames)} frames to {recording_path}")
-        recording_frames = []
-        recording_actions = []
-        recording_rewards = []
+        recording_frames.clear()
+        recording_actions.clear()
+        recording_rewards.clear()
 
     print("Starting main game loop...")
     while not win.has_exit:
@@ -234,11 +235,13 @@ def main():
 
         # Handle recording toggle
         if keycodes.R in keys_clicked:
+            print("DEBUG - R key pressed")  # Debug to confirm detection
             is_recording = not is_recording
             if is_recording:
                 print("Recording started for ML training data")
                 frame_counter = 0
             else:
+                print("Recording stopped")
                 save_recording()
             update_caption()
 
