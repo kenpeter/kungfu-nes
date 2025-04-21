@@ -1,4 +1,11 @@
-python train.py --num_envs 4 --cuda --progress_bar --timesteps 1000 --resume
+python train.py --num_envs 4 --cuda --progress_bar --timesteps 10000 --resume
+
+
+
+
+
+
+
 
 python train.py --num_envs 4 --npz_dir recordings_filtered --cuda --progress_bar --timesteps 10000 --resume
 

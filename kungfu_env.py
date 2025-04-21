@@ -34,9 +34,9 @@ KUNGFU_ACTION_NAMES = [
     "Jump + Right", "Crouch Kick", "Crouch Punch"
 ]
 
-# Define observation space outside the class for export
+# Define observation space with 160x160 viewport
 KUNGFU_OBSERVATION_SPACE = spaces.Dict({
-    "viewport": spaces.Box(0, 255, (224, 240, 3), np.uint8),
+    "viewport": spaces.Box(0, 255, (160, 160, 3), np.uint8),
     "enemy_vector": spaces.Box(-255, 255, (KUNGFU_MAX_ENEMIES * 2,), np.float32),
     "projectile_vectors": spaces.Box(-255, 255, (MAX_PROJECTILES * 4,), np.float32),
     "combat_status": spaces.Box(-1, 1, (2,), np.float32),
@@ -56,7 +56,7 @@ class KungFuWrapper(Wrapper):
             obs = result
             
         self.true_height, self.true_width = obs.shape[:2]
-        self.viewport_size = (self.true_width, self.true_height)
+        self.viewport_size = (160, 160)
         
         self.actions = KUNGFU_ACTIONS
         self.action_names = KUNGFU_ACTION_NAMES
@@ -232,7 +232,7 @@ class KungFuWrapper(Wrapper):
         return np.zeros(3, dtype=np.float32)
 
     def _detect_projectiles(self, obs):
-        frame = obs
+        frame = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
         if self.prev_frame is not None:
             frame_diff = cv2.absdiff(frame, self.prev_frame)
             diff_sum = np.sum(frame_diff, axis=2).astype(np.uint8)
@@ -261,7 +261,7 @@ class KungFuWrapper(Wrapper):
         return [0] * (self.max_projectiles * 4)
 
     def _get_obs(self, obs):
-        viewport = obs
+        viewport = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
         ram = self.env.get_ram()
         hero_x = int(ram[0x0094])
         enemy_info = []

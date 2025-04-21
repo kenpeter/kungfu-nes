@@ -1,2 +1,7 @@
 logs
 kungfu_ppo_final.zip
+recordings
+__pycache__/
+recordings_filtered
+models
+saved_states
