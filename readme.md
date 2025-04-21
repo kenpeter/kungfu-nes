@@ -101,27 +101,46 @@ python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timest
 
 
 
-figo2@kenpeter-pc-2 MINGW64 ~/work/gym-retro/kungfu-nes (main-simple)
-$ python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timesteps 10000 --resume
-2025-04-13 07:42:18,706 - INFO - Starting training with 4 envs and 10000 timesteps
-2025-04-13 07:42:18,706 - INFO - Maximum number of enemies: 5
-2025-04-13 07:42:18,706 - INFO - Training mode: mimic
-2025-04-13 07:42:18,706 - INFO - Loading NPZ data from: recordings
-2025-04-13 07:42:20,874 - INFO - Resuming training from models/kungfu_ppo/kungfu_ppo_best
-Using cuda device
-Traceback (most recent call last):
-  File "train.py", line 383, in <module>
-    train(args)
-  File "train.py", line 334, in train
-    model.policy.load_state_dict(old_model.policy.state_dict())
-  File "C:\Users\figo2\anaconda3\envs\gym-retro\lib\site-packages\torch\nn\modules\module.py", line 1672, in load_state_dict
-    self.__class__.__name__, "\n\t".join(error_msgs)))
-RuntimeError: Error(s) in loading state_dict for MultiInputActorCriticPolicy:
-        size mismatch for features_extractor.non_visual.0.weight: copying a param with shape torch.Size([256, 100]) from checkpoint, the shape in current model is torch.Size([256, 144]).
-        size mismatch for pi_features_extractor.non_visual.0.weight: copying a param with shape torch.Size([256, 100]) from checkpoint, the shape in current model is torch.Size([256, 144]).
-        size mismatch for vf_features_extractor.non_visual.0.weight: copying a param with shape torch.Size([256, 100]) from checkpoint, the shape in current model is torch.Size([256, 144]).
-        size mismatch for action_net.weight: copying a param with shape torch.Size([11, 128]) from checkpoint, the shape in current model is torch.Size([9, 128]).
-        size mismatch for action_net.bias: copying a param with shape torch.Size([11]) from checkpoint, the shape in current model is torch.Size([9]).
-(gym-retro)
-figo2@kenpeter-pc-2 MINGW64 ~/work/gym-retro/kungfu-nes (main-simple)
-$
+
+
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi        16Gi        11Gi        57Mi       2.4Gi        13Gi
+Swap:          8.0Gi          0B       8.0Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi        17Gi        10Gi        57Mi       2.4Gi        12Gi
+Swap:          8.0Gi          0B       8.0Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi        18Gi       9.8Gi        57Mi       2.4Gi        11Gi
+Swap:          8.0Gi          0B       8.0Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi        19Gi       8.9Gi        57Mi       2.4Gi        10Gi
+Swap:          8.0Gi          0B       8.0Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi        20Gi       8.1Gi        57Mi       2.4Gi        10Gi
+Swap:          8.0Gi          0B       8.0Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi        21Gi       7.2Gi        57Mi       2.4Gi       9.1Gi
+Swap:          8.0Gi          0B       8.0Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi        27Gi       279Mi        77Mi       3.6Gi       3.4Gi
+Swap:          8.0Gi       256Ki       8.0Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi        30Gi       241Mi        36Mi       753Mi       541Mi
+Swap:          8.0Gi       4.4Gi       3.6Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi        30Gi       112Mi        36Mi       456Mi       119Mi
+Swap:          8.0Gi       6.7Gi       1.3Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ sudo free -h
+               total        used        free      shared  buff/cache   available
+Mem:            30Gi       1.6Gi        29Gi        23Mi       365Mi        28Gi
+Swap:          8.0Gi       2.1Gi       5.9Gi
+(base) kenpeter@kenpeter-ubuntu:~/work/kungfu-nes$ 

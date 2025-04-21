@@ -70,20 +70,22 @@ class KungFuWrapper(Wrapper):
         self.prev_min_enemy_dist = 255
         self.last_movement = None
 
+
     def reset(self, seed=None, options=None, **kwargs):
+        self.prev_frame = None
+        self.last_projectile_distances = [float('inf')] * self.max_projectiles
+        self.action_counts = np.zeros(len(self.actions))
         result = self.env.reset(seed=seed, options=options, **kwargs)
         obs, info = result if isinstance(result, tuple) else (result, {})
         self.last_hp = float(self.env.get_ram()[0x04A6])
         self.last_hp_change = 0
-        self.action_counts = np.zeros(len(self.actions))
         self.last_enemies = [0] * self.max_enemies
         self.total_steps = 0
-        self.prev_frame = None
-        self.last_projectile_distances = [float('inf')] * self.max_projectiles
         self.survival_reward_total = 0
         self.prev_min_enemy_dist = 255
         self.last_movement = None
         return self._get_obs(obs), info
+
 
     def step(self, action):
         self.total_steps += 1
@@ -201,6 +203,7 @@ class KungFuWrapper(Wrapper):
             return np.array([boss_pos_x - int(ram[0x0094]), boss_action / 255.0, boss_hp / 255.0], dtype=np.float32)
         return np.zeros(3, dtype=np.float32)
 
+
     def _detect_projectiles(self, obs):
         frame = obs
         if self.prev_frame is not None:
@@ -226,9 +229,12 @@ class KungFuWrapper(Wrapper):
             while len(projectile_info) < self.max_projectiles * 4:
                 projectile_info.append(0)
             self.prev_frame = frame.copy()
+            # Clean up temporary arrays
+            del frame_diff, diff_sum, motion_mask, white_mask, combined_mask
             return projectile_info
         self.prev_frame = frame.copy()
         return [0] * (self.max_projectiles * 4)
+
 
     def _get_obs(self, obs):
         viewport = obs

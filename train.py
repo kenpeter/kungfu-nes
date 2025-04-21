@@ -30,7 +30,6 @@ global_model_path = None
 experience_data = []  # Moved to module scope to avoid scoping issues
 
 def cleanup_resources(model=None, env=None, cuda=False):
-    """Centralized cleanup function for resources"""
     global experience_data
     try:
         if model and hasattr(model, 'env'):
@@ -40,13 +39,18 @@ def cleanup_resources(model=None, env=None, cuda=False):
                 global_logger.warning(f"Failed to close model environment: {e}")
         if env:
             try:
-                env.close()
+                if isinstance(env, SubprocVecEnv):
+                    env.close()  # Terminates subprocesses
+                elif isinstance(env, DummyVecEnv):
+                    env.close()
+                else:
+                    env.close()
             except Exception as e:
                 global_logger.warning(f"Failed to close environment: {e}")
         if cuda and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-        experience_data = []  # Clear experience data
+        experience_data = []
     except Exception as e:
         global_logger.error(f"Error during resource cleanup: {e}")
     finally:
@@ -73,10 +77,13 @@ def emergency_save_handler(signum, frame):
 signal.signal(signal.SIGINT, emergency_save_handler)
 signal.signal(signal.SIGTERM, emergency_save_handler)
 
+
 class ExperienceCollectionCallback(BaseCallback):
-    def __init__(self, verbose=0):
+    def __init__(self, max_steps=1000, verbose=0):
         super().__init__(verbose)
-        
+        self.max_steps = max_steps
+        self.experience_data = []
+
     def _on_step(self) -> bool:
         global experience_data
         obs = self.locals.get('new_obs')
@@ -93,7 +100,9 @@ class ExperienceCollectionCallback(BaseCallback):
                 "done": dones,
                 "info": infos
             }
-            experience_data.append(experience)
+            self.experience_data.append(experience)
+            if len(self.experience_data) > self.max_steps:
+                self.experience_data.pop(0)  # Remove oldest experience
         return True
 
 class SaveBestModelCallback(BaseCallback):
@@ -221,9 +230,15 @@ class RenderCallback(BaseCallback):
         if self.render_env:
             try:
                 self.render_env.close()
-                global_logger.info("Closed render environment")
+                self.render_env = None
+                while not self.render_queue.empty():
+                    self.render_queue.get()
+                    self.render_queue.task_done()
+                global_logger.info("Closed render environment and cleared queue")
             except Exception as e:
                 global_logger.warning(f"Error closing render env: {e}")
+
+
 
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
@@ -232,10 +247,16 @@ def setup_logging(log_dir):
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(os.path.join(log_dir, 'training.log'))
+            logging.FileHandler(os.path.join(log_dir, 'training.log'), mode='w')
         ]
     )
-    return logging.getLogger()
+    logger = logging.getLogger()
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.flush()
+    return logger
+
+
 
 class CustomPPO(PPO):
     def __init__(self, *args, expert_actions=None, **kwargs):
