@@ -12,51 +12,42 @@ import retro
 KUNGFU_MAX_ENEMIES = 5
 MAX_PROJECTILES = 2
 
-KUNGFU_ACTIONS = [
-    [0, 0, 0, 0, 0, 0, 0, 0, 0],  # No-op
-    [1, 0, 0, 0, 0, 0, 0, 0, 0],  # B (Punch)
-    [0, 0, 1, 0, 0, 0, 0, 0, 0],  # SELECT
-    [0, 0, 0, 1, 0, 0, 0, 0, 0],  # START
-    [0, 0, 0, 0, 1, 0, 0, 0, 0],  # UP (Jump)
-    [0, 0, 0, 0, 0, 1, 0, 0, 0],  # DOWN (Crouch)
-    [0, 0, 0, 0, 0, 0, 1, 0, 0],  # LEFT
-    [0, 0, 0, 0, 0, 0, 0, 1, 0],  # RIGHT
-    [0, 0, 0, 0, 0, 0, 0, 0, 1],  # A (Kick)
-    [1, 0, 0, 0, 0, 0, 0, 0, 1],  # B + A (Punch + Kick)
-    [0, 0, 0, 0, 1, 0, 0, 1, 0],  # UP + RIGHT (Jump + Right)
-    [0, 0, 0, 0, 0, 1, 0, 0, 1],  # DOWN + A (Crouch Kick)
-    [1, 0, 0, 0, 0, 1, 0, 0, 0],  # DOWN + B (Crouch Punch)
-]
-KUNGFU_ACTION_NAMES = [
-    "No-op", "Punch", "Select", "Start", "Jump",
-    "Crouch", "Left", "Right", "Kick", "Punch + Kick",
-    "Jump + Right", "Crouch Kick", "Crouch Punch"
-]
-
-KUNGFU_OBSERVATION_SPACE = spaces.Dict({
-    "viewport": spaces.Box(0, 255, (224, 240, 3), np.uint8),
-    "enemy_vector": spaces.Box(-255, 255, (KUNGFU_MAX_ENEMIES * 2,), np.float32),
-    "projectile_vectors": spaces.Box(-255, 255, (MAX_PROJECTILES * 4,), np.float32),
-    "combat_status": spaces.Box(-1, 1, (2,), np.float32),
-    "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
-    "boss_info": spaces.Box(-255, 255, (3,), np.float32),
-    "closest_enemy_direction": spaces.Box(-1, 1, (1,), np.float32)
-})
-
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        result = env.reset()
-        obs = result[0] if isinstance(result, tuple) else result
+        obs, _ = env.reset()
         self.true_height, self.true_width = obs.shape[:2]
         self.viewport_size = (self.true_width, self.true_height)
         
-        self.actions = KUNGFU_ACTIONS
-        self.action_names = KUNGFU_ACTION_NAMES
+        self.actions = [
+            [0,0,0,0,0,0,0,0,0,0,0,0],  # No-op (0)
+            [0,0,0,0,0,0,1,0,0,0,0,0],  # Punch (1)
+            [0,0,0,0,0,0,0,0,1,0,0,0],  # Kick (2)
+            [1,0,0,0,0,0,1,0,0,0,0,0],  # Right+Punch (3)
+            [0,1,0,0,0,0,1,0,0,0,0,0],  # Left+Punch (4)
+            [0,0,1,0,0,0,0,0,0,0,0,0],  # Crouch (5)
+            [0,0,0,0,0,1,0,0,0,0,0,0],  # Jump (6)
+            [0,0,0,0,0,1,1,0,0,0,0,0],  # Jump+Punch (7)
+            [0,0,1,0,0,0,1,0,0,0,0,0],  # Crouch+Punch (8)
+            [1,0,0,0,0,0,0,0,0,0,0,0],  # Right (9)
+            [0,1,0,0,0,0,0,0,0,0,0,0]   # Left (10)
+        ]
+        self.action_names = [
+            "No-op", "Punch", "Kick", "Right+Punch", "Left+Punch",
+            "Crouch", "Jump", "Jump+Punch", "Crouch+Punch", "Right", "Left"
+        ]
         self.action_space = spaces.Discrete(len(self.actions))
         self.max_enemies = KUNGFU_MAX_ENEMIES
         self.max_projectiles = MAX_PROJECTILES
-        self.observation_space = KUNGFU_OBSERVATION_SPACE
+        self.observation_space = spaces.Dict({
+            "viewport": spaces.Box(0, 255, (self.true_height, self.true_width, 3), np.uint8),
+            "enemy_vector": spaces.Box(-255, 255, (self.max_enemies * 2,), np.float32),
+            "projectile_vectors": spaces.Box(-255, 255, (self.max_projectiles * 4,), np.float32),
+            "combat_status": spaces.Box(-1, 1, (2,), np.float32),
+            "enemy_proximity": spaces.Box(0, 1, (1,), np.float32),
+            "boss_info": spaces.Box(-255, 255, (3,), np.float32),
+            "closest_enemy_direction": spaces.Box(-1, 1, (1,), np.float32)
+        })
         self.last_hp = 0
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
@@ -71,8 +62,7 @@ class KungFuWrapper(Wrapper):
         self.last_movement = None
 
     def reset(self, seed=None, options=None, **kwargs):
-        result = self.env.reset(seed=seed, options=options, **kwargs)
-        obs, info = result if isinstance(result, tuple) else (result, {})
+        obs, info = self.env.reset(seed=seed, options=options, **kwargs)
         self.last_hp = float(self.env.get_ram()[0x04A6])
         self.last_hp_change = 0
         self.action_counts = np.zeros(len(self.actions))
@@ -88,23 +78,23 @@ class KungFuWrapper(Wrapper):
     def step(self, action):
         self.total_steps += 1
         self.action_counts[action] += 1
-        result = self.env.step(self.actions[action])
-        obs, reward, terminated, truncated, info = result if len(result) == 5 else (*result, False)
-        done = terminated or truncated
+        obs, reward, terminated, truncated, info = self.env.step(self.actions[action])
         ram = self.env.get_ram()
         
         hp = float(ram[0x04A6])
-        curr_enemies = [int(ram[addr]) for addr in [0x008E, 0x008F, 0x0090, 0x0091, 0x0092]]
+        curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091]), int(ram[0x0092])]
         enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
 
         reward = 0
         hp_change_rate = (hp - self.last_hp) / 255.0
+        
         if hp_change_rate < 0:
             reward += (hp_change_rate ** 2) * 50
         else:
             reward += hp_change_rate * 5
+
         reward += enemy_hit * 10
-        if done:
+        if terminated or truncated:
             reward -= 50
 
         projectile_info = self._detect_projectiles(obs)
@@ -123,45 +113,48 @@ class KungFuWrapper(Wrapper):
         hero_x = int(ram[0x0094])
         enemy_distances = [(enemy_x - hero_x) for enemy_x in curr_enemies if enemy_x != 0]
         min_enemy_dist = min([abs(d) for d in enemy_distances] or [255])
+        
         closest_enemy_dir = 0
         if enemy_distances:
             closest_dist = min([abs(d) for d in enemy_distances])
             closest_enemy_dir = 1 if [d for d in enemy_distances if abs(d) == closest_dist][0] > 0 else -1
         
         close_range_threshold = 30
+        
         if min_enemy_dist > close_range_threshold:
-            if action == 6 and closest_enemy_dir == -1:  # Left when enemy is left
-                reward += 8.0 * (1 + min_enemy_dist/255)
-                if self.last_movement == action:
-                    reward += 3.0
-                self.last_movement = action
-            elif action == 7 and closest_enemy_dir == 1:  # Right when enemy is right
-                reward += 8.0 * (1 + min_enemy_dist/255)
-                if self.last_movement == action:
-                    reward += 3.0
-                self.last_movement = action
-            elif action == 0:  # No-op
-                reward -= 1.0
-                print(f"Invalid action {self.action_names[action]} taken when far (dist={min_enemy_dist}), reward={reward}")
+            movement_reward = 8.0
+            valid_actions = [9, 10]
+            if action in valid_actions:
+                if (action == 9 and closest_enemy_dir == 1) or (action == 10 and closest_enemy_dir == -1):
+                    reward += movement_reward * (1 + min_enemy_dist/255) * 1.5
+                    if hasattr(self, 'last_movement') and self.last_movement == action:
+                        reward += 3.0
+                    self.last_movement = action
+                else:
+                    reward -= 10.0
             else:
-                reward -= 0.5
+                reward -= 50.0
                 print(f"Invalid action {self.action_names[action]} taken when far (dist={min_enemy_dist}), reward={reward}")
         else:
-            if action in [1, 8, 11, 12]:
+            if action in [1, 2, 8]:
                 reward += 2.0
-            elif action in [6, 7]:
-                reward += 0.5 if ((action == 6 and closest_enemy_dir == -1) or (action == 7 and closest_enemy_dir == 1)) else -0.5
-            elif action == 0:
+            elif action in [3, 4]:
+                if (action == 3 and closest_enemy_dir == 1) or (action == 4 and closest_enemy_dir == -1):
+                    reward += 2.5
+                else:
+                    reward += 0.5
+            elif action in [9, 10]:
                 reward -= 0.5
-            else:
+            elif action in [0, 5, 6]:
                 reward -= 0.5
 
         self.prev_min_enemy_dist = min_enemy_dist
+
         action_entropy = -np.sum((self.action_counts / (self.total_steps + 1e-6)) * 
-                                 np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
+                                np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
         reward += action_entropy * 0.1
         
-        if not done and hp > 0:
+        if not (terminated or truncated) and hp > 0:
             reward += 0.05
             self.survival_reward_total += 0.05
 
