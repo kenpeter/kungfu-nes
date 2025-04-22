@@ -5,7 +5,7 @@ import torch
 import zipfile
 import retro
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecFrameStack, VecTransposeImage
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.utils import get_linear_fn
 import logging
@@ -99,6 +99,8 @@ class SaveBestModelCallback(BaseCallback):
         total_dodge_reward = sum(info.get('dodge_reward', 0) for info in infos)
         total_survival_reward = sum(info.get('survival_reward_total', 0) for info in infos)
         avg_normalized_reward = sum(info.get('normalized_reward', 0) for info in infos) / max(1, len(infos))
+        total_progression_reward = sum(info.get('progression_reward', 0) for info in infos)
+        max_stage = max(info.get('stage', 0) for info in infos)
         
         action_diversity = 0
         if infos and 'action_percentages' in infos[0]:
@@ -113,7 +115,9 @@ class SaveBestModelCallback(BaseCallback):
             total_dodge_reward * 15 +
             total_survival_reward * 12 +
             avg_normalized_reward * 200 +
-            action_diversity * 25
+            action_diversity * 25 +
+            total_progression_reward * 50 +  # Emphasize progression
+            max_stage * 100  # Large reward for reaching higher stages
         )
         
         if score > self.best_score:
@@ -124,6 +128,7 @@ class SaveBestModelCallback(BaseCallback):
                     print(f"Saved best model with score {self.best_score:.2f} at step {self.num_timesteps}")
                     print(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Dodge: {total_dodge_reward:.2f}, "
                           f"Survival: {total_survival_reward:.2f}, Norm. Reward: {avg_normalized_reward:.2f}, "
+                          f"Progression: {total_progression_reward:.2f}, Stage: {max_stage}, "
                           f"Action Diversity: {action_diversity:.2f}")
                     
                     if infos and 'action_percentages' in infos[0] and 'action_names' in infos[0]:
@@ -140,7 +145,7 @@ class SaveBestModelCallback(BaseCallback):
             print(f"Step {self.num_timesteps} Progress:")
             print(f"  Current Score: {score:.2f}, Best Score: {self.best_score:.2f}")
             print(f"  Hits: {total_hits}, HP: {total_hp:.1f}/255, Norm. Reward: {avg_normalized_reward:.2f}, "
-                  f"Survival: {total_survival_reward:.2f}")
+                  f"Survival: {total_survival_reward:.2f}, Progression: {total_progression_reward:.2f}, Stage: {max_stage}")
         
         return True
 
@@ -233,7 +238,7 @@ def train(args):
 
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
-        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},  # n_stack unused with current SimpleCNN
+        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},
         "net_arch": dict(pi=[128, 128], vf=[256, 256]),
         "activation_fn": torch.nn.ReLU,
     }
@@ -291,10 +296,9 @@ def train(args):
     else:
         env = SubprocVecEnv(env_fns)
     
-    # Note: VecFrameStack and VecTransposeImage omitted since SimpleCNN uses placeholder
-    # To enable visual input, update SimpleCNN and add:
-    # env = VecFrameStack(env, n_stack=4, channels_order='last')
-    # env = VecTransposeImage(env, skip=True)
+    # Add frame stacking and image transposition
+    env = VecFrameStack(env, n_stack=4, channels_order='last')
+    env = VecTransposeImage(env, skip=True)
     
     current_model = initialize_model(env)
     
