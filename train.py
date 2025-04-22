@@ -233,7 +233,7 @@ def train(args):
 
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
-        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},  # n_stack unused with current env
+        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},  # n_stack unused with current SimpleCNN
         "net_arch": dict(pi=[128, 128], vf=[256, 256]),
         "activation_fn": torch.nn.ReLU,
     }
@@ -291,8 +291,8 @@ def train(args):
     else:
         env = SubprocVecEnv(env_fns)
     
-    # Note: VecFrameStack and VecTransposeImage omitted since observation is a scalar dictionary
-    # To enable visual input, add viewport to KUNGFU_OBSERVATION_SPACE in env.py and restore:
+    # Note: VecFrameStack and VecTransposeImage omitted since SimpleCNN uses placeholder
+    # To enable visual input, update SimpleCNN and add:
     # env = VecFrameStack(env, n_stack=4, channels_order='last')
     # env = VecTransposeImage(env, skip=True)
     

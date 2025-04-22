@@ -34,11 +34,13 @@ KUNGFU_ACTION_NAMES = [
     "Jump + Right", "Crouch Kick", "Crouch Punch"
 ]
 
-# Define minimal observation space as an empty-like spaces.Dict
+# Define observation space with viewport for rendering
 KUNGFU_OBSERVATION_SPACE = spaces.Dict({
+    "viewport": spaces.Box(low=0, high=255, shape=(160, 160, 3), dtype=np.uint8),
     "placeholder": spaces.Box(low=0, high=0, shape=(), dtype=np.float32)
 })
-# Note: Add observation components (e.g., viewport, enemy_vector) here for scaling
+# Note: Add projectile_vectors for scaling, e.g.:
+# "projectile_vectors": spaces.Box(-255, 255, (MAX_PROJECTILES * 4,), np.float32)
 
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
@@ -57,7 +59,7 @@ class KungFuWrapper(Wrapper):
         self.action_names = KUNGFU_ACTION_NAMES
         self.action_space = spaces.Discrete(len(self.actions))
         
-        # Use minimal observation space
+        # Use updated observation space
         self.observation_space = KUNGFU_OBSERVATION_SPACE
         
         # State tracking for rewards and projectile detection
@@ -175,12 +177,17 @@ class KungFuWrapper(Wrapper):
         return self._get_obs(obs), normalized_reward, terminated, truncated, info
 
     def _get_obs(self, obs):
-        # Return minimal observation
-        # Note: Add observation processing (e.g., viewport, enemy_vector) here for scaling
-        return {"placeholder": np.array(0.0, dtype=np.float32)}
+        # Include viewport for rendering
+        viewport = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
+        return {
+            "viewport": viewport.astype(np.uint8),
+            "placeholder": np.array(0.0, dtype=np.float32)
+        }
+        # Note: Add projectile_vectors for scaling, e.g.:
+        # "projectile_vectors": np.array(self._detect_projectiles(obs), dtype=np.float32)
 
     def _detect_projectiles(self, obs):
-        # Note: Currently used for rewards only; can be integrated into observation space later
+        # Note: Currently used for rewards only; can be integrated into observation space
         frame = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
         if self.prev_frame is not None:
             frame_diff = cv2.absdiff(frame, self.prev_frame)
@@ -212,7 +219,7 @@ class KungFuWrapper(Wrapper):
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=256, n_stack=4):
         super().__init__(observation_space, features_dim)
-        # Note: Currently processes minimal placeholder; update for scaled observation space
+        # Note: Processes only placeholder; update for viewport/projectile_vectors
         self.linear = nn.Sequential(
             nn.Linear(1, 128),  # Input is single placeholder value
             nn.ReLU(),
@@ -222,9 +229,13 @@ class SimpleCNN(BaseFeaturesExtractor):
 
     def forward(self, observations):
         # Process minimal placeholder
-        # Note: Add viewport and vector processing here when scaling
         placeholder = observations["placeholder"].float().unsqueeze(-1)
         return self.linear(placeholder)
+        # Note: For scaled observation, process viewport and vectors:
+        # viewport = observations["viewport"].float() / 255.0
+        # viewport = viewport.permute(0, 3, 1, 2)
+        # proj_vectors = observations["projectile_vectors"].float()
+        # ... (add CNN and linear layers)
 
 def make_env():
     env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array")

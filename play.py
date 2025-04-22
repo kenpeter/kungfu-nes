@@ -5,7 +5,6 @@ import ctypes
 import os
 import time
 import numpy as np
-from collections import deque
 from pyglet import clock
 from pyglet.window import key as keycodes
 from pyglet.gl import *
@@ -15,7 +14,6 @@ from kungfu_env import KUNGFU_ACTIONS, KUNGFU_ACTION_NAMES, make_env
 # Constants
 DEFAULT_GAME_SPEED = 1.0
 MODEL_PATH = "models/kungfu_ppo/kungfu_ppo.zip"
-N_STACK = 4  # Number of frames to stack, matching training
 
 def map_input_to_discrete_action(inputs):
     """Map keyboard inputs to a discrete action index (0-12) based on KUNGFU_ACTIONS."""
@@ -140,12 +138,6 @@ def main():
     last_frame_time = time.time()
     frame_duration = 1/60.0 / args.speed
 
-    # Initialize frame stack
-    obs_stack = {key: deque(maxlen=N_STACK) for key in obs.keys()}
-    for _ in range(N_STACK):
-        for key in obs.keys():
-            obs_stack[key].append(obs[key].copy())
-
     print("Starting main game loop...")
     step_count = 0
     while not win.has_exit:
@@ -181,10 +173,8 @@ def main():
             }
             discrete_action = map_input_to_discrete_action(inputs)
         else:
-            model_obs = {key: np.concatenate(obs_stack[key], axis=-1) for key in obs_stack.keys()}
-            for key, value in model_obs.items():
-                print(f"Observation {key}: shape={value.shape}, dtype={value.dtype}")
-            action, _ = model.predict(model_obs, deterministic=False)
+            print(f"Observation: {obs}")
+            action, _ = model.predict(obs, deterministic=False)
             discrete_action = action.item()
             print(f"Model Action: {discrete_action} ({KUNGFU_ACTION_NAMES[discrete_action]})")
 
@@ -193,32 +183,21 @@ def main():
         done = terminated or truncated
         step_count += 1
 
-        # Update frame stack
-        for key in obs.keys():
-            obs_stack[key].append(obs[key].copy())
-
         # Log step info
         if step_count % 10 == 0 or done:
             print(f"Step {step_count}: Action={KUNGFU_ACTION_NAMES[discrete_action]}, Reward={reward:.2f}, "
-                  f"HP={info.get('hp', 0):.1f}, MinDist={info.get('min_enemy_dist', 255):.1f}, "
-                  f"EnemyHit={info.get('enemy_hit', 0)}, Done={done}")
+                  f"HP={info.get('hp', 0):.1f}, EnemyHit={info.get('enemy_hit', 0)}, Done={done}")
 
         # Handle reset
         if done:
             print("Game over detected - resetting")
             obs, info = env.reset()
-            for key in obs.keys():
-                obs_stack[key].clear()
-                for _ in range(N_STACK):
-                    obs_stack[key].append(obs[key].copy())
 
         # Rendering
         glBindTexture(GL_TEXTURE_2D, texture_id)
         try:
-            # Verify viewport data
             viewport = obs['viewport']
             print(f"Rendering viewport: shape={viewport.shape}, dtype={viewport.dtype}, min={viewport.min()}, max={viewport.max()}")
-            # Ensure contiguous array for tobytes()
             video_buffer = ctypes.cast(viewport.tobytes(), ctypes.POINTER(ctypes.c_ubyte))
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, screen_width, screen_height, GL_RGB, GL_UNSIGNED_BYTE, video_buffer)
         except Exception as e:
