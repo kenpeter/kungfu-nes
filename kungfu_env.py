@@ -7,10 +7,16 @@ import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.monitor import Monitor
 import retro
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # Constants
-KUNGFU_MAX_ENEMIES = 5
+KUNGFU_MAX_ENEMIES = 4
 MAX_PROJECTILES = 2
+N_STACK = 4  # Match VecFrameStack in train.py
 
 # Define actions
 KUNGFU_ACTIONS = [
@@ -34,7 +40,6 @@ KUNGFU_ACTION_NAMES = [
     "Jump + Right", "Crouch Kick", "Crouch Punch"
 ]
 
-# Observation space (no stage, player_x, timer)
 KUNGFU_OBSERVATION_SPACE = spaces.Dict({
     "viewport": spaces.Box(low=0, high=255, shape=(160, 160, 3), dtype=np.uint8),
     "projectile_vectors": spaces.Box(low=-255, high=255, shape=(MAX_PROJECTILES * 4,), dtype=np.float32)
@@ -70,10 +75,16 @@ class KungFuWrapper(Wrapper):
         self.reward_std = 1
         self.player_x = 0
         self.last_player_x = 0
-        self.timer = 0  # Initialize to 0; set in reset
-        self.last_timer = 0  # Initialize to 0; set in reset
+        self.timer = 0
+        self.last_timer = 0
         self.stage = 0
         self.last_stage = 0
+        self.boss_hp = 0
+        self.last_boss_hp = 0
+        self.boss_pos_x = 0
+        self.boss_action = 0
+        self.enemy_action_timers = [0] * KUNGFU_MAX_ENEMIES
+        self.enemy_actions = [0] * KUNGFU_MAX_ENEMIES
 
     def reset(self, seed=None, options=None, **kwargs):
         result = self.env.reset(seed=seed, options=options, **kwargs)
@@ -94,10 +105,16 @@ class KungFuWrapper(Wrapper):
         self.survival_reward_total = 0
         self.player_x = float(ram[0x0094])
         self.last_player_x = self.player_x
-        self.timer = float(ram[0x0391])  # Timer at 0x0391
+        self.timer = float(ram[0x0391])
         self.last_timer = self.timer
-        self.stage = int(ram[0x0058])  # Stage at 0x0058
+        self.stage = int(ram[0x0058])
         self.last_stage = self.stage
+        self.boss_hp = float(ram[0x04A5])
+        self.last_boss_hp = self.boss_hp
+        self.boss_pos_x = float(ram[0x0093])
+        self.boss_action = int(ram[0x004E])
+        self.enemy_action_timers = [int(ram[0x002B]), int(ram[0x002C]), int(ram[0x002D]), int(ram[0x002E])]
+        self.enemy_actions = [int(ram[0x0080]), int(ram[0x0081]), int(ram[0x0082]), int(ram[0x0083])]
         return self._get_obs(obs), info
 
     def step(self, action):
@@ -115,11 +132,16 @@ class KungFuWrapper(Wrapper):
 
         ram = self.env.get_ram()
         hp = float(ram[0x04A6])
-        curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091]), int(ram[0x0092])]
+        curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
         enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
         self.player_x = float(ram[0x0094])
         self.timer = float(ram[0x0391])
         self.stage = int(ram[0x0058])
+        self.boss_hp = float(ram[0x04A5])
+        self.boss_pos_x = float(ram[0x0093])
+        self.boss_action = int(ram[0x004E])
+        self.enemy_action_timers = [int(ram[0x002B]), int(ram[0x002C]), int(ram[0x002D]), int(ram[0x002E])]
+        self.enemy_actions = [int(ram[0x0080]), int(ram[0x0081]), int(ram[0x0082]), int(ram[0x0083])]
 
         # Reward structure
         reward = 0
@@ -135,11 +157,11 @@ class KungFuWrapper(Wrapper):
 
         # Progression reward based on stage
         x_change = self.player_x - self.last_player_x
-        desired_direction = -1 if self.stage in [1, 3, 5] else 1  # Left for stages 1, 3, 5; right for 2, 4
+        desired_direction = -1 if self.stage in [1, 3, 5] else 1
         progression_reward = x_change * desired_direction * 0.2
-        if action in [7, 10] and desired_direction > 0:  # Right or Jump + Right
+        if action in [7, 10] and desired_direction > 0:
             progression_reward += 3.0
-        elif action == 6 and desired_direction < 0:  # Left
+        elif action == 6 and desired_direction < 0:
             progression_reward += 3.0
         reward += progression_reward
 
@@ -153,13 +175,25 @@ class KungFuWrapper(Wrapper):
         if timer_change > 0:
             reward -= timer_change * 0.5
 
+        # Boss HP reward
+        boss_hp_decrease = self.last_boss_hp - self.boss_hp
+        if boss_hp_decrease > 0:
+            reward += boss_hp_decrease * 10
+
+        # Boss distance reward
+        boss_distance = abs(self.player_x - self.boss_pos_x)
+        last_boss_distance = abs(self.last_player_x - self.boss_pos_x)
+        distance_change = last_boss_distance - boss_distance
+        boss_distance_reward = distance_change * 0.1
+        reward += boss_distance_reward
+
         # Projectile-based dodge reward
         projectile_info = self._detect_projectiles(obs)
         projectile_distances = [projectile_info[i] for i in range(0, len(projectile_info), 4)]
         dodge_reward = 0
         for i, (curr_dist, last_dist) in enumerate(zip(projectile_distances, self.last_projectile_distances)):
             if last_dist < 20 and curr_dist > last_dist:
-                if action in [4, 5]:  # Jump or Crouch
+                if action in [4, 5]:
                     dodge_reward += 3
         reward += dodge_reward
         self.last_projectile_distances = projectile_distances
@@ -193,6 +227,7 @@ class KungFuWrapper(Wrapper):
         self.last_enemies = curr_enemies
         self.last_player_x = self.player_x
         self.last_timer = self.timer
+        self.last_boss_hp = self.boss_hp
 
         info.update({
             "hp": hp,
@@ -206,7 +241,13 @@ class KungFuWrapper(Wrapper):
             "progression_reward": progression_reward,
             "stage": self.stage,
             "player_x": self.player_x,
-            "timer": self.timer
+            "timer": self.timer,
+            "boss_hp": self.boss_hp,
+            "boss_hp_decrease": boss_hp_decrease,
+            "boss_pos_x": self.boss_pos_x,
+            "boss_action": self.boss_action,
+            "enemy_action_timers": self.enemy_action_timers,
+            "enemy_actions": self.enemy_actions
         })
 
         return self._get_obs(obs), normalized_reward, terminated, truncated, info
@@ -249,10 +290,24 @@ class KungFuWrapper(Wrapper):
         return [0] * (MAX_PROJECTILES * 4)
 
 class SimpleCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=256, n_stack=4):
+    def __init__(self, observation_space, features_dim=256):
         super().__init__(observation_space, features_dim)
+        # Infer n_stack from viewport channels
+        viewport_shape = observation_space["viewport"].shape
+        
+        # Handle the case where shape is (H, W, C) instead of (C, H, W)
+        if len(viewport_shape) == 3 and viewport_shape[2] < viewport_shape[0]:
+            # Shape is (H, W, C)
+            C = viewport_shape[2]
+        else:
+            # Shape is (C, H, W)
+            C = viewport_shape[0]
+            
+        n_stack = C // 3  # Assuming 3 channels per frame
+        logger.info(f"Inferred n_stack={n_stack} from viewport shape={viewport_shape}")
+
         self.cnn = nn.Sequential(
-            nn.Conv2d(3 * n_stack, 32, kernel_size=8, stride=4, padding=0),
+            nn.Conv2d(C, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
             nn.ReLU(),
@@ -260,25 +315,44 @@ class SimpleCNN(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Flatten(),
         )
+        
+        # Get correct shape for sample input based on viewport shape
+        if len(viewport_shape) == 3 and viewport_shape[2] < viewport_shape[0]:
+            # For (H, W, C) format - need to transpose
+            sample_shape = (1, C, viewport_shape[0], viewport_shape[1])
+        else:
+            # For (C, H, W) format
+            sample_shape = (1,) + viewport_shape
+            
         with torch.no_grad():
-            sample_input = torch.zeros(1, 3 * n_stack, 160, 160)
+            sample_input = torch.zeros(sample_shape)
             n_flatten = self.cnn(sample_input).shape[1]
         
+        proj_vectors_size = observation_space["projectile_vectors"].shape[0]
         self.linear = nn.Sequential(
-            nn.Linear(n_flatten + MAX_PROJECTILES * 4, 512),  # Only projectile_vectors
+            nn.Linear(n_flatten + proj_vectors_size, 512),
             nn.ReLU(),
             nn.Linear(512, features_dim),
             nn.ReLU()
         )
+        logger.info(f"SimpleCNN initialized: n_flatten={n_flatten}, proj_vectors_size={proj_vectors_size}, total_input={n_flatten + proj_vectors_size}")
 
     def forward(self, observations):
-        viewport = observations["viewport"].float() / 255.0
-        viewport = viewport.permute(0, 3, 1, 2)  # [batch, C, H, W]
+        viewport = observations["viewport"]
+        viewport_shape = viewport.shape
+        
+        # Check if we need to transpose
+        if len(viewport_shape) == 4 and viewport_shape[1] > viewport_shape[3]:
+            # Input is (batch, H, W, C) - need to transpose to (batch, C, H, W)
+            viewport = viewport.permute(0, 3, 1, 2)
+        
+        viewport = viewport.float() / 255.0
         proj_vectors = observations["projectile_vectors"].float()
         
         cnn_features = self.cnn(viewport)
         combined = torch.cat([cnn_features, proj_vectors], dim=1)
         return self.linear(combined)
+    
 
 def make_env():
     env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array")

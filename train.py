@@ -238,7 +238,7 @@ def train(args):
 
     policy_kwargs = {
         "features_extractor_class": SimpleCNN,
-        "features_extractor_kwargs": {"features_dim": 256, "n_stack": 4},
+        "features_extractor_kwargs": {"features_dim": 256},
         "net_arch": dict(pi=[128, 128], vf=[256, 256]),
         "activation_fn": torch.nn.ReLU,
     }
@@ -298,7 +298,7 @@ def train(args):
     
     # Add frame stacking and image transposition
     env = VecFrameStack(env, n_stack=4, channels_order='last')
-    env = VecTransposeImage(env, skip=True)
+    env = VecTransposeImage(env)
     
     current_model = initialize_model(env)
     
