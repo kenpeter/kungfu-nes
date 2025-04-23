@@ -35,15 +35,30 @@ KUNGFU_ACTIONS = [
     [1, 0, 0, 0, 0, 1, 0, 0, 0],  # DOWN + B (Crouch Punch)
 ]
 KUNGFU_ACTION_NAMES = [
-    "No-op", "Punch", "Select", "Start", "Jump",
-    "Crouch", "Left", "Right", "Kick", "Punch + Kick",
-    "Jump + Right", "Crouch Kick", "Crouch Punch"
+    "No-op",
+    "Punch",
+    "Select",
+    "Start",
+    "Jump",
+    "Crouch",
+    "Left",
+    "Right",
+    "Kick",
+    "Punch + Kick",
+    "Jump + Right",
+    "Crouch Kick",
+    "Crouch Punch",
 ]
 
-KUNGFU_OBSERVATION_SPACE = spaces.Dict({
-    "viewport": spaces.Box(low=0, high=255, shape=(160, 160, 3), dtype=np.uint8),
-    "projectile_vectors": spaces.Box(low=-255, high=255, shape=(MAX_PROJECTILES * 4,), dtype=np.float32)
-})
+KUNGFU_OBSERVATION_SPACE = spaces.Dict(
+    {
+        "viewport": spaces.Box(low=0, high=255, shape=(160, 160, 3), dtype=np.uint8),
+        "projectile_vectors": spaces.Box(
+            low=-255, high=255, shape=(MAX_PROJECTILES * 4,), dtype=np.float32
+        ),
+    }
+)
+
 
 class KungFuWrapper(Wrapper):
     def __init__(self, env):
@@ -56,12 +71,14 @@ class KungFuWrapper(Wrapper):
 
         self.true_height, self.true_width = obs.shape[:2]
         self.viewport_size = (160, 160)
-        
+
         self.actions = KUNGFU_ACTIONS
         self.action_names = KUNGFU_ACTION_NAMES
         self.action_space = spaces.Discrete(len(self.actions))
         self.observation_space = KUNGFU_OBSERVATION_SPACE
-        
+
+        self.furthest_left_position = float("inf")
+
         # State tracking
         self.last_hp = 0
         self.last_hp_change = 0
@@ -69,7 +86,7 @@ class KungFuWrapper(Wrapper):
         self.last_enemies = [0] * KUNGFU_MAX_ENEMIES
         self.total_steps = 0
         self.prev_frame = None
-        self.last_projectile_distances = [float('inf')] * MAX_PROJECTILES
+        self.last_projectile_distances = [float("inf")] * MAX_PROJECTILES
         self.survival_reward_total = 0
         self.reward_mean = 0
         self.reward_std = 1
@@ -99,6 +116,8 @@ class KungFuWrapper(Wrapper):
         for _ in range(5):  # Press start multiple times to ensure it registers
             obs, _, _, _, _ = self.env.step(self.actions[3])  # START action
 
+        self.furthest_left_position = float("inf")
+
         ram = self.env.get_ram()
         self.last_hp = float(ram[0x04A6])
         self.last_hp_change = 0
@@ -106,7 +125,7 @@ class KungFuWrapper(Wrapper):
         self.last_enemies = [0] * KUNGFU_MAX_ENEMIES
         self.total_steps = 0
         self.prev_frame = None
-        self.last_projectile_distances = [float('inf')] * MAX_PROJECTILES
+        self.last_projectile_distances = [float("inf")] * MAX_PROJECTILES
         self.survival_reward_total = 0
         self.player_x = float(ram[0x0094])
         self.last_player_x = self.player_x
@@ -118,8 +137,18 @@ class KungFuWrapper(Wrapper):
         self.last_boss_hp = self.boss_hp
         self.boss_pos_x = float(ram[0x0093])
         self.boss_action = int(ram[0x004E])
-        self.enemy_action_timers = [int(ram[0x002B]), int(ram[0x002C]), int(ram[0x002D]), int(ram[0x002E])]
-        self.enemy_actions = [int(ram[0x0080]), int(ram[0x0081]), int(ram[0x0082]), int(ram[0x0083])]
+        self.enemy_action_timers = [
+            int(ram[0x002B]),
+            int(ram[0x002C]),
+            int(ram[0x002D]),
+            int(ram[0x002E]),
+        ]
+        self.enemy_actions = [
+            int(ram[0x0080]),
+            int(ram[0x0081]),
+            int(ram[0x0082]),
+            int(ram[0x0083]),
+        ]
         return self._get_obs(obs), info
 
     def step(self, action):
@@ -137,21 +166,38 @@ class KungFuWrapper(Wrapper):
 
         ram = self.env.get_ram()
         hp = float(ram[0x04A6])
-        curr_enemies = [int(ram[0x008E]), int(ram[0x008F]), int(ram[0x0090]), int(ram[0x0091])]
-        enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
+        curr_enemies = [
+            int(ram[0x008E]),
+            int(ram[0x008F]),
+            int(ram[0x0090]),
+            int(ram[0x0091]),
+        ]
+        enemy_hit = sum(
+            1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0
+        )
         self.player_x = float(ram[0x0094])
         self.timer = float(ram[0x0391])
         self.boss_hp = float(ram[0x04A5])
         self.boss_pos_x = float(ram[0x0093])
         self.boss_action = int(ram[0x004E])
-        self.enemy_action_timers = [int(ram[0x002B]), int(ram[0x002C]), int(ram[0x002D]), int(ram[0x002E])]
-        self.enemy_actions = [int(ram[0x0080]), int(ram[0x0081]), int(ram[0x0082]), int(ram[0x0083])]
+        self.enemy_action_timers = [
+            int(ram[0x002B]),
+            int(ram[0x002C]),
+            int(ram[0x002D]),
+            int(ram[0x002E]),
+        ]
+        self.enemy_actions = [
+            int(ram[0x0080]),
+            int(ram[0x0081]),
+            int(ram[0x0082]),
+            int(ram[0x0083]),
+        ]
 
         # Reward structure
         reward = 0
         hp_change_rate = (hp - self.last_hp) / 255.0
         if hp_change_rate < 0:
-            reward += (hp_change_rate ** 2) * 50
+            reward += (hp_change_rate**2) * 50
         else:
             reward += hp_change_rate * 5
 
@@ -160,10 +206,13 @@ class KungFuWrapper(Wrapper):
             reward -= 50
 
         # Progression reward (always right for stage 1)
-        x_change = self.last_player_x - self.player_x 
-        progression_reward = x_change * 0.2  # Simple reward for moving right
+        x_change = (
+            self.last_player_x - self.player_x
+        )  # In Kung Fu, moving left is progress
+        progression_reward = x_change * 0.2  # Basic reward for movement
+
         if action in [6]:  # left or Jump+Right
-            progression_reward += 3.0
+            progression_reward += 0.5
         reward += progression_reward
 
         # Timer penalty
@@ -185,9 +234,13 @@ class KungFuWrapper(Wrapper):
 
         # Projectile-based dodge reward
         projectile_info = self._detect_projectiles(obs)
-        projectile_distances = [projectile_info[i] for i in range(0, len(projectile_info), 4)]
+        projectile_distances = [
+            projectile_info[i] for i in range(0, len(projectile_info), 4)
+        ]
         dodge_reward = 0
-        for i, (curr_dist, last_dist) in enumerate(zip(projectile_distances, self.last_projectile_distances)):
+        for i, (curr_dist, last_dist) in enumerate(
+            zip(projectile_distances, self.last_projectile_distances)
+        ):
             if last_dist < 20 and curr_dist > last_dist:
                 if action in [4, 5]:
                     dodge_reward += 3
@@ -203,8 +256,10 @@ class KungFuWrapper(Wrapper):
             reward -= 0.5
 
         # Action entropy
-        action_entropy = -np.sum((self.action_counts / (self.total_steps + 1e-6)) * 
-                                 np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6))
+        action_entropy = -np.sum(
+            (self.action_counts / (self.total_steps + 1e-6))
+            * np.log(self.action_counts / (self.total_steps + 1e-6) + 1e-6)
+        )
         reward += action_entropy * 0.1
 
         # Survival reward
@@ -214,9 +269,26 @@ class KungFuWrapper(Wrapper):
 
         # Normalize reward
         self.reward_mean = 0.99 * self.reward_mean + 0.01 * reward
-        self.reward_std = 0.99 * self.reward_std + 0.01 * (reward - self.reward_mean) ** 2
-        normalized_reward = (reward - self.reward_mean) / (np.sqrt(self.reward_std) + 1e-6)
+        self.reward_std = (
+            0.99 * self.reward_std + 0.01 * (reward - self.reward_mean) ** 2
+        )
+        normalized_reward = (reward - self.reward_mean) / (
+            np.sqrt(self.reward_std) + 1e-6
+        )
         normalized_reward = np.clip(normalized_reward, -10, 10)
+
+        # And add combat incentives:
+        if action in [1, 8, 9]:  # punches and kicks
+            if any(
+                enemy != 0 for enemy in curr_enemies
+            ):  # only reward if enemies present
+                reward += 1.0
+
+        # further get reward
+        if self.player_x < self.furthest_left_position:
+            self.furthest_left_position = self.player_x
+            progression_bonus = 5.0  # Big reward for reaching new territory
+            reward += progression_bonus
 
         self.last_hp = hp
         self.last_hp_change = hp_change_rate
@@ -225,26 +297,28 @@ class KungFuWrapper(Wrapper):
         self.last_timer = self.timer
         self.last_boss_hp = self.boss_hp
 
-        info.update({
-            "hp": hp,
-            "enemy_hit": enemy_hit,
-            "action_percentages": self.action_counts / (self.total_steps + 1e-6),
-            "action_names": self.action_names,
-            "dodge_reward": dodge_reward,
-            "survival_reward_total": self.survival_reward_total,
-            "raw_reward": reward,
-            "normalized_reward": normalized_reward,
-            "progression_reward": progression_reward,
-            "stage": self.stage,
-            "player_x": self.player_x,
-            "timer": self.timer,
-            "boss_hp": self.boss_hp,
-            "boss_hp_decrease": boss_hp_decrease,
-            "boss_pos_x": self.boss_pos_x,
-            "boss_action": self.boss_action,
-            "enemy_action_timers": self.enemy_action_timers,
-            "enemy_actions": self.enemy_actions
-        })
+        info.update(
+            {
+                "hp": hp,
+                "enemy_hit": enemy_hit,
+                "action_percentages": self.action_counts / (self.total_steps + 1e-6),
+                "action_names": self.action_names,
+                "dodge_reward": dodge_reward,
+                "survival_reward_total": self.survival_reward_total,
+                "raw_reward": reward,
+                "normalized_reward": normalized_reward,
+                "progression_reward": progression_reward,
+                "stage": self.stage,
+                "player_x": self.player_x,
+                "timer": self.timer,
+                "boss_hp": self.boss_hp,
+                "boss_hp_decrease": boss_hp_decrease,
+                "boss_pos_x": self.boss_pos_x,
+                "boss_action": self.boss_action,
+                "enemy_action_timers": self.enemy_action_timers,
+                "enemy_actions": self.enemy_actions,
+            }
+        )
 
         return self._get_obs(obs), normalized_reward, terminated, truncated, info
 
@@ -252,7 +326,9 @@ class KungFuWrapper(Wrapper):
         viewport = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
         return {
             "viewport": viewport.astype(np.uint8),
-            "projectile_vectors": np.array(self._detect_projectiles(obs), dtype=np.float32)
+            "projectile_vectors": np.array(
+                self._detect_projectiles(obs), dtype=np.float32
+            ),
         }
 
     def _detect_projectiles(self, obs):
@@ -265,7 +341,9 @@ class KungFuWrapper(Wrapper):
             upper_white = np.array([255, 255, 255])
             white_mask = cv2.inRange(frame, lower_white, upper_white)
             combined_mask = cv2.bitwise_and(motion_mask, white_mask)
-            contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(
+                combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
             projectile_info = []
             hero_x = int(self.env.get_ram()[0x0094])
             for contour in contours:
@@ -277,7 +355,7 @@ class KungFuWrapper(Wrapper):
                     distance = proj_x - hero_x
                     velocity = (proj_x - hero_x) - (self.last_player_x - hero_x)
                     projectile_info.extend([distance, proj_y, velocity, 0])
-            projectile_info = projectile_info[:MAX_PROJECTILES * 4]
+            projectile_info = projectile_info[: MAX_PROJECTILES * 4]
             while len(projectile_info) < MAX_PROJECTILES * 4:
                 projectile_info.append(0)
             self.prev_frame = frame.copy()
@@ -285,12 +363,13 @@ class KungFuWrapper(Wrapper):
         self.prev_frame = frame.copy()
         return [0] * (MAX_PROJECTILES * 4)
 
+
 class SimpleCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=256):
         super().__init__(observation_space, features_dim)
         # Infer n_stack from viewport channels
         viewport_shape = observation_space["viewport"].shape
-        
+
         # Handle the case where shape is (H, W, C) instead of (C, H, W)
         if len(viewport_shape) == 3 and viewport_shape[2] < viewport_shape[0]:
             # Shape is (H, W, C)
@@ -298,7 +377,7 @@ class SimpleCNN(BaseFeaturesExtractor):
         else:
             # Shape is (C, H, W)
             C = viewport_shape[0]
-            
+
         n_stack = C // 3  # Assuming 3 channels per frame
         logger.info(f"Inferred n_stack={n_stack} from viewport shape={viewport_shape}")
 
@@ -311,7 +390,7 @@ class SimpleCNN(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Flatten(),
         )
-        
+
         # Get correct shape for sample input based on viewport shape
         if len(viewport_shape) == 3 and viewport_shape[2] < viewport_shape[0]:
             # For (H, W, C) format - need to transpose
@@ -319,38 +398,42 @@ class SimpleCNN(BaseFeaturesExtractor):
         else:
             # For (C, H, W) format
             sample_shape = (1,) + viewport_shape
-            
+
         with torch.no_grad():
             sample_input = torch.zeros(sample_shape)
             n_flatten = self.cnn(sample_input).shape[1]
-        
+
         proj_vectors_size = observation_space["projectile_vectors"].shape[0]
         self.linear = nn.Sequential(
             nn.Linear(n_flatten + proj_vectors_size, 512),
             nn.ReLU(),
             nn.Linear(512, features_dim),
-            nn.ReLU()
+            nn.ReLU(),
         )
-        logger.info(f"SimpleCNN initialized: n_flatten={n_flatten}, proj_vectors_size={proj_vectors_size}, total_input={n_flatten + proj_vectors_size}")
+        logger.info(
+            f"SimpleCNN initialized: n_flatten={n_flatten}, proj_vectors_size={proj_vectors_size}, total_input={n_flatten + proj_vectors_size}"
+        )
 
     def forward(self, observations):
         viewport = observations["viewport"]
         viewport_shape = viewport.shape
-        
+
         # Check if we need to transpose
         if len(viewport_shape) == 4 and viewport_shape[1] > viewport_shape[3]:
             # Input is (batch, H, W, C) - need to transpose to (batch, C, H, W)
             viewport = viewport.permute(0, 3, 1, 2)
-        
+
         viewport = viewport.float() / 255.0
         proj_vectors = observations["projectile_vectors"].float()
-        
+
         cnn_features = self.cnn(viewport)
         combined = torch.cat([cnn_features, proj_vectors], dim=1)
         return self.linear(combined)
-    
+
 
 def make_env():
-    env = retro.make('KungFu-Nes', use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array")
+    env = retro.make(
+        "KungFu-Nes", use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array"
+    )
     env = Monitor(KungFuWrapper(env))
     return env

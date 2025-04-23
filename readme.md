@@ -5,7 +5,7 @@ python train.py --num_envs 4 --cuda --progress_bar --timesteps 10000
 
 
 
-python train.py --num_envs 4 --cuda --progress_bar --timesteps 60000 --resume
+python train.py --num_envs 4 --cuda --progress_bar --timesteps 10000 --resume
 
 
 
