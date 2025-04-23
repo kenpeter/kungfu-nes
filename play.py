@@ -9,6 +9,7 @@ from pyglet import clock
 from pyglet.window import key as keycodes
 from pyglet.gl import *
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from kungfu_env import KUNGFU_ACTIONS, KUNGFU_ACTION_NAMES, make_env
 
 # Constants
@@ -62,20 +63,47 @@ def main():
     parser.add_argument('--manual', action='store_true', help='use manual keyboard controls instead of model')
     args = parser.parse_args()
 
-    # Initialize environment
-    print("Creating game environment with KungFuWrapper...")
-    env = make_env()
-    print("Resetting environment...")
-    obs, info = env.reset()
-    screen_height, screen_width = obs['viewport'].shape[:2]
-    print(f"Screen dimensions: {screen_width}x{screen_height} (160x160 from KungFuWrapper)")
+    # Initialize raw environment for debugging
+    print("Creating raw game environment with KungFuWrapper...")
+    raw_env = make_env()
+    print("Resetting raw environment...")
+    raw_obs, raw_info = raw_env.reset()
+    print(f"Raw env reset - Type of obs: {type(raw_obs)}")
+    print(f"Raw env reset - Obs content: {raw_obs}")
+    
+    # Close raw environment before making another one
+    raw_env.close()
+
+    # Initialize wrapped environment
+    print("Creating wrapped game environment...")
+    env = DummyVecEnv([lambda: make_env()])
+    env = VecFrameStack(env, n_stack=4, channels_order='last')
+    
+    # Do NOT use VecTransposeImage with dictionary observations
+    
+    print("Resetting wrapped environment...")
+    obs = env.reset()
+    
+    # Debug observation
+    print(f"Wrapped env reset - Type of obs: {type(obs)}")
+    print(f"Wrapped env reset - Obs keys: {obs.keys() if isinstance(obs, dict) else 'Not a dict'}")
+    
+    # Ensure obs is a dictionary
+    if not isinstance(obs, dict):
+        raise ValueError(f"Expected obs to be a dictionary, got {type(obs)}: {obs}")
+    
+    # Extract screen dimensions
+    viewport = obs['viewport']
+    print(f"Viewport shape: {viewport.shape}")
+    screen_height, screen_width = viewport.shape[1:3]  # Shape is (1, H, W, C*n_stack)
+    print(f"Screen dimensions: {screen_width}x{screen_height}")
 
     # Load model
     model = None
     if not args.manual:
         if os.path.exists(args.model):
             print(f"Loading model from {args.model}...")
-            model = PPO.load(args.model)
+            model = PPO.load(args.model, env=env)
             expected_actions = len(KUNGFU_ACTIONS)
             model_actions = model.policy.action_space.n
             if model_actions != expected_actions:
@@ -172,33 +200,52 @@ def main():
                 'SELECT': keycodes.SPACE in keys_pressed,
             }
             discrete_action = map_input_to_discrete_action(inputs)
+            action_array = [discrete_action]  # Create an array with one element for DummyVecEnv
         else:
             print(f"Observation: {obs}")
             action, _ = model.predict(obs, deterministic=False)
             discrete_action = action.item()
+            action_array = [discrete_action]  # Create an array with one element for DummyVecEnv
             print(f"Model Action: {discrete_action} ({KUNGFU_ACTION_NAMES[discrete_action]})")
 
-        # Step environment
-        obs, reward, terminated, truncated, info = env.step(discrete_action)
-        done = terminated or truncated
+        # Step environment with action array
+        obs, reward, done, info = env.step(action_array)
+        
+
+        # Extract scalar values since we have only one environment
+        reward_value = reward[0] if isinstance(reward, (list, np.ndarray)) else reward
+        terminated = done  # In older API, "done" is what we now call "terminated"
+        truncated = False  # Set truncated to False as it's not provided in older API
+        terminated_value = terminated if isinstance(terminated, bool) else terminated[0]
+        truncated_value = truncated if isinstance(truncated, bool) else truncated[0]
+        done_value = terminated_value or truncated_value
+        info_value = info[0] if isinstance(info, list) else info
+
+
         step_count += 1
 
         # Log step info
         if step_count % 10 == 0 or done:
-            print(f"Step {step_count}: Action={KUNGFU_ACTION_NAMES[discrete_action]}, Reward={reward:.2f}, "
-                  f"HP={info.get('hp', 0):.1f}, EnemyHit={info.get('enemy_hit', 0)}, Done={done}")
+            print(f"Step {step_count}: Action={KUNGFU_ACTION_NAMES[discrete_action]}, Reward={reward_value:.2f}, "
+                  f"HP={info_value.get('hp', 0):.1f}, EnemyHit={info_value.get('enemy_hit', 0)}, Done={done}")
 
         # Handle reset
         if done:
             print("Game over detected - resetting")
-            obs, info = env.reset()
+            obs = env.reset()
 
         # Rendering
         glBindTexture(GL_TEXTURE_2D, texture_id)
         try:
-            viewport = obs['viewport']
-            print(f"Rendering viewport: shape={viewport.shape}, dtype={viewport.dtype}, min={viewport.min()}, max={viewport.max()}")
-            video_buffer = ctypes.cast(viewport.tobytes(), ctypes.POINTER(ctypes.c_ubyte))
+            # Extract the viewport from the first environment (index 0)
+            viewport = obs['viewport'][0]  # First environment
+            
+            # Use the last RGB frame from the stacked frames
+            # The shape is (height, width, channels*n_stack)
+            viewport_rgb = viewport[:, :, -3:]  # Get the last 3 RGB channels
+            
+            print(f"Rendering viewport: shape={viewport_rgb.shape}, dtype={viewport_rgb.dtype}, min={viewport_rgb.min()}, max={viewport_rgb.max()}")
+            video_buffer = ctypes.cast(viewport_rgb.tobytes(), ctypes.POINTER(ctypes.c_ubyte))
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, screen_width, screen_height, GL_RGB, GL_UNSIGNED_BYTE, video_buffer)
         except Exception as e:
             print(f"Rendering error: {e}")
