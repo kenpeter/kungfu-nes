@@ -77,8 +77,8 @@ class KungFuWrapper(Wrapper):
         self.last_player_x = 0
         self.timer = 0
         self.last_timer = 0
-        self.stage = 0
-        self.last_stage = 0
+        self.stage = 1  # Hardcoded to stage 1
+        self.last_stage = 1  # Hardcoded to stage 1
         self.boss_hp = 0
         self.last_boss_hp = 0
         self.boss_pos_x = 0
@@ -87,12 +87,17 @@ class KungFuWrapper(Wrapper):
         self.enemy_actions = [0] * KUNGFU_MAX_ENEMIES
 
     def reset(self, seed=None, options=None, **kwargs):
+        # First reset the environment
         result = self.env.reset(seed=seed, options=options, **kwargs)
         if isinstance(result, tuple):
             obs, info = result
         else:
             obs = result
             info = {}
+
+        # Press start to begin the game
+        for _ in range(5):  # Press start multiple times to ensure it registers
+            obs, _, _, _, _ = self.env.step(self.actions[3])  # START action
 
         ram = self.env.get_ram()
         self.last_hp = float(ram[0x04A6])
@@ -107,8 +112,8 @@ class KungFuWrapper(Wrapper):
         self.last_player_x = self.player_x
         self.timer = float(ram[0x0391])
         self.last_timer = self.timer
-        self.stage = int(ram[0x0058])
-        self.last_stage = self.stage
+        self.stage = 1  # Hardcoded to stage 1
+        self.last_stage = 1  # Hardcoded to stage 1
         self.boss_hp = float(ram[0x04A5])
         self.last_boss_hp = self.boss_hp
         self.boss_pos_x = float(ram[0x0093])
@@ -136,7 +141,6 @@ class KungFuWrapper(Wrapper):
         enemy_hit = sum(1 for p, c in zip(self.last_enemies, curr_enemies) if p != 0 and c == 0)
         self.player_x = float(ram[0x0094])
         self.timer = float(ram[0x0391])
-        self.stage = int(ram[0x0058])
         self.boss_hp = float(ram[0x04A5])
         self.boss_pos_x = float(ram[0x0093])
         self.boss_action = int(ram[0x004E])
@@ -155,20 +159,12 @@ class KungFuWrapper(Wrapper):
         if done:
             reward -= 50
 
-        # Progression reward based on stage
-        x_change = self.player_x - self.last_player_x
-        desired_direction = -1 if self.stage in [1, 3, 5] else 1
-        progression_reward = x_change * desired_direction * 0.2
-        if action in [7, 10] and desired_direction > 0:
-            progression_reward += 3.0
-        elif action == 6 and desired_direction < 0:
+        # Progression reward (always right for stage 1)
+        x_change = self.last_player_x - self.player_x 
+        progression_reward = x_change * 0.2  # Simple reward for moving right
+        if action in [6]:  # left or Jump+Right
             progression_reward += 3.0
         reward += progression_reward
-
-        # Stage transition reward
-        if self.stage > self.last_stage:
-            reward += 50
-            self.last_stage = self.stage
 
         # Timer penalty
         timer_change = self.last_timer - self.timer
