@@ -1,85 +1,185 @@
 import pyglet
 import numpy as np
-from pyglet import clock
+import retro
+import time
+import cv2
 from pyglet.gl import *
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
-from kungfu_env import KUNGFU_ACTION_NAMES, make_env
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    VecFrameStack,
+    VecTransposeImage,
+)
+from kungfu_env import KungFuWrapper, SimpleCNN, N_STACK
 
 # Constants
 MODEL_PATH = "models/kungfu_ppo/kungfu_ppo.zip"
-WINDOW_WIDTH = 400
-GAME_SPEED = 1.0
+WINDOW_WIDTH = 640
+WINDOW_HEIGHT = 480
 
 
 def main():
-    # Initialize environment
-    env = DummyVecEnv([lambda: make_env()])
-    env = VecFrameStack(env, n_stack=4, channels_order="last")
+    print("Initializing Kung Fu environment...")
+
+    # Create a base Retro environment first
+    base_env = retro.make(
+        "KungFu-Nes", use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array"
+    )
+
+    # Apply our wrapper
+    env = KungFuWrapper(base_env)
+
+    # Create a dummy vec env for frame stacking
+    env = DummyVecEnv([lambda: env])
+    env = VecFrameStack(env, n_stack=N_STACK, channels_order="last")
+    env = VecTransposeImage(env)
+
+    # First reset to get initial observation
     obs = env.reset()
 
-    # Validate observation
-    if not isinstance(obs, dict) or "viewport" not in obs:
-        raise ValueError("Invalid observation")
+    # Get initial screen shape from raw environment render
+    screen = base_env.render()
+    screen_height, screen_width = screen.shape[:2]
 
-    # Extract screen dimensions
-    viewport = obs["viewport"]
-    screen_height, screen_width = viewport.shape[1:3]
-
-    # Load model
-    model = PPO.load(MODEL_PATH, env=env)
-
-    # Setup window
+    # Calculate window dimensions to maintain aspect ratio
     win_height = int(WINDOW_WIDTH * screen_height / screen_width)
+
+    # Create window
     win = pyglet.window.Window(
         width=WINDOW_WIDTH,
         height=win_height,
-        vsync=False,
-        caption="KungFu-Nes",
-        resizable=False,
+        caption="KungFu-Nes Direct Render",
     )
 
-    # Setup texture
+    # Create texture for rendering
     texture = pyglet.image.Texture.create(screen_width, screen_height)
-    viewport_buffer = np.zeros((screen_height, screen_width, 3), dtype=np.uint8)
 
-    # Game state
-    last_action = 0
-    frame_count = 0  # Manual frame counter
+    # Create rendering buffer
+    buffer = np.zeros((screen_height, screen_width, 3), dtype=np.uint8)
 
-    # Update game state
+    # Variables for game state
+    action = 0  # Start with no-op
+
+    try:
+        # Try to load the model
+        print("Attempting to load model from", MODEL_PATH)
+        custom_objects = {
+            "features_extractor_class": SimpleCNN,
+            "features_extractor_kwargs": {"features_dim": 256},
+        }
+        model = PPO.load(MODEL_PATH, custom_objects=custom_objects)
+        print("Model loaded successfully")
+        ai_mode = True
+    except Exception as e:
+        print(f"Couldn't load model: {e}")
+        print("Running in manual mode")
+        ai_mode = False
+
+    # Keys for manual control
+    keys = {
+        pyglet.window.key.LEFT: 6,  # LEFT
+        pyglet.window.key.RIGHT: 7,  # RIGHT
+        pyglet.window.key.UP: 4,  # UP (Jump)
+        pyglet.window.key.DOWN: 5,  # DOWN (Crouch)
+        pyglet.window.key.Z: 1,  # B (Punch)
+        pyglet.window.key.X: 8,  # A (Kick)
+        pyglet.window.key.SPACE: 9,  # B + A (Punch + Kick)
+    }
+
+    key_pressed = set()
+
+    # Handle key press
+    @win.event
+    def on_key_press(symbol, modifiers):
+        if symbol == pyglet.window.key.ESCAPE:
+            pyglet.app.exit()
+        elif symbol in keys:
+            key_pressed.add(symbol)
+
+    # Handle key release
+    @win.event
+    def on_key_release(symbol, modifiers):
+        if symbol in key_pressed:
+            key_pressed.remove(symbol)
+
+    # Toggle AI mode
+    @win.event
+    def on_key_press(symbol, modifiers):
+        nonlocal ai_mode
+        if symbol == pyglet.window.key.ESCAPE:
+            pyglet.app.exit()
+        elif symbol in keys:
+            key_pressed.add(symbol)
+        elif symbol == pyglet.window.key.TAB:
+            ai_mode = not ai_mode
+            print(f"Switched to {'AI' if ai_mode else 'Manual'} mode")
+
+    fps_display = pyglet.window.FPSDisplay(window=win)
+    frame_counter = 0
+    last_frame_time = time.time()
+
+    # Update function
     def update(dt):
-        nonlocal obs, last_action, frame_count
+        nonlocal action, obs, frame_counter, last_frame_time
+        frame_counter += 1
 
-        frame_count += 1  # Increment frame counter
+        # FPS calculation
+        if frame_counter % 60 == 0:
+            current_time = time.time()
+            elapsed = current_time - last_frame_time
+            fps = 60 / elapsed if elapsed > 0 else 0
+            print(f"FPS: {fps:.1f}")
+            last_frame_time = current_time
 
-        # Predict action every 4 frames
-        if frame_count % 4 == 0:
+        # Determine action
+        if ai_mode:
+            # Get model prediction using vectorized observation
             action, _ = model.predict(obs, deterministic=True)
-            last_action = int(action.item())
-            print(
-                f"Step {frame_count}: Predicted action {last_action} ({KUNGFU_ACTION_NAMES[last_action]})"
-            )
+            # Convert from array to scalar for the environment
+            action = action[0]
+        else:
+            # Use keyboard input
+            if key_pressed:
+                for key in key_pressed:
+                    if key in keys:
+                        action = keys[key]
+                        break
+            else:
+                action = 0  # No-op
 
-        # Step environment
-        obs, _, done, _ = env.step([last_action])
-        if done:
-            obs = env.reset()
+        # Step environment with chosen action
+        obs, rewards, dones, infos = env.step([action])
+
+        # Get raw screen from unwrapped env for rendering
+        screen = base_env.render()
+
+        # Copy to buffer for display
+        if screen.shape == buffer.shape:
+            np.copyto(buffer, screen)
+        else:
+            print(
+                f"Warning: Shape mismatch - buffer: {buffer.shape}, screen: {screen.shape}"
+            )
+            # Handle resize if needed
+            resized = cv2.resize(screen, (screen_width, screen_height))
+            np.copyto(buffer, resized)
 
         # Update texture
-        viewport_rgb = np.flipud(obs["viewport"][0][:, :, -3:])
-        np.copyto(viewport_buffer, viewport_rgb)
-        raw_data = viewport_buffer.tobytes()
-        texture.blit_into(
-            pyglet.image.ImageData(
-                screen_width, screen_height, "RGB", raw_data, pitch=screen_width * 3
-            ),
-            0,
-            0,
-            0,
+        image_data = pyglet.image.ImageData(
+            screen_width,
+            screen_height,
+            "RGB",
+            np.flipud(buffer).tobytes(),  # Flip vertically for OpenGL
+            pitch=screen_width * 3,
         )
+        texture.blit_into(image_data, 0, 0, 0)
 
-    # Draw game screen
+        # Reset if done
+        if dones[0]:
+            obs = env.reset()
+            print("Episode finished - resetting environment")
+
+    # Draw function
     @win.event
     def on_draw():
         win.clear()
@@ -87,17 +187,32 @@ def main():
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
         texture.blit(0, 0, width=WINDOW_WIDTH, height=win_height)
 
-    # Handle window close
-    @win.event
-    def on_close():
-        pyglet.app.exit()
+        # Draw mode text
+        mode_text = pyglet.text.Label(
+            f"{'AI' if ai_mode else 'Manual'} Mode - Press TAB to toggle",
+            font_name="Arial",
+            font_size=16,
+            x=10,
+            y=win_height - 10,
+            color=(255, 255, 255, 255),
+            anchor_x="left",
+            anchor_y="top",
+        )
+        mode_text.draw()
+        fps_display.draw()
 
-    # Schedule updates
-    clock.schedule_interval(update, 1 / 60.0 / GAME_SPEED)
+    # Schedule update with a faster frame rate
+    pyglet.clock.schedule_interval(update, 1 / 60.0)
 
-    print("Running in AI mode")
+    # Run the application
+    print(
+        f"Running in {'AI' if ai_mode else 'Manual'} mode. Press TAB to toggle. Press ESC to exit."
+    )
     pyglet.app.run()
+
+    # Cleanup
     env.close()
+    base_env.close()
 
 
 if __name__ == "__main__":
@@ -110,4 +225,3 @@ if __name__ == "__main__":
         import traceback
 
         traceback.print_exc()
-# endif

@@ -10,13 +10,13 @@ import retro
 import logging
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
 KUNGFU_MAX_ENEMIES = 4
 MAX_PROJECTILES = 2
-N_STACK = 4  # Match VecFrameStack in train.py
+N_STACK = 4  # Number of frames to stack for input
 
 # Define actions
 KUNGFU_ACTIONS = [
@@ -50,6 +50,7 @@ KUNGFU_ACTION_NAMES = [
     "Crouch Punch",
 ]
 
+# Define observation space with consistent dimensions
 KUNGFU_OBSERVATION_SPACE = spaces.Dict(
     {
         "viewport": spaces.Box(low=0, high=255, shape=(160, 160, 3), dtype=np.uint8),
@@ -70,7 +71,7 @@ class KungFuWrapper(Wrapper):
             obs = result
 
         self.true_height, self.true_width = obs.shape[:2]
-        self.viewport_size = (160, 160)
+        self.viewport_size = (160, 160)  # Consistent viewport size
 
         self.actions = KUNGFU_ACTIONS
         self.action_names = KUNGFU_ACTION_NAMES
@@ -94,8 +95,8 @@ class KungFuWrapper(Wrapper):
         self.last_player_x = 0
         self.timer = 0
         self.last_timer = 0
-        self.stage = 1  # Hardcoded to stage 1
-        self.last_stage = 1  # Hardcoded to stage 1
+        self.stage = 1
+        self.last_stage = 1
         self.boss_hp = 0
         self.last_boss_hp = 0
         self.boss_pos_x = 0
@@ -103,8 +104,12 @@ class KungFuWrapper(Wrapper):
         self.enemy_action_timers = [0] * KUNGFU_MAX_ENEMIES
         self.enemy_actions = [0] * KUNGFU_MAX_ENEMIES
 
+        logger.info(
+            f"KungFu wrapper initialized with viewport size {self.viewport_size}"
+        )
+
     def reset(self, seed=None, options=None, **kwargs):
-        # First reset the environment
+        # Reset the environment
         result = self.env.reset(seed=seed, options=options, **kwargs)
         if isinstance(result, tuple):
             obs, info = result
@@ -114,10 +119,12 @@ class KungFuWrapper(Wrapper):
 
         # Press start to begin the game
         for _ in range(5):  # Press start multiple times to ensure it registers
-            obs, _, _, _, _ = self.env.step(self.actions[3])  # START action
+            obs, _, done, _, _ = self.env.step(self.actions[3])  # START action
+            if done:  # If somehow pressing start causes a done signal
+                obs, info = self.env.reset()
 
+        # Reset state tracking variables
         self.furthest_left_position = float("inf")
-
         ram = self.env.get_ram()
         self.last_hp = float(ram[0x04A6])
         self.last_hp_change = 0
@@ -131,8 +138,8 @@ class KungFuWrapper(Wrapper):
         self.last_player_x = self.player_x
         self.timer = float(ram[0x0391])
         self.last_timer = self.timer
-        self.stage = 1  # Hardcoded to stage 1
-        self.last_stage = 1  # Hardcoded to stage 1
+        self.stage = 1
+        self.last_stage = 1
         self.boss_hp = float(ram[0x04A5])
         self.last_boss_hp = self.boss_hp
         self.boss_pos_x = float(ram[0x0093])
@@ -155,6 +162,7 @@ class KungFuWrapper(Wrapper):
         self.total_steps += 1
         self.action_counts[action] += 1
 
+        # Take step in environment
         result = self.env.step(self.actions[action])
         if len(result) == 5:
             obs, reward, terminated, truncated, info = result
@@ -164,6 +172,7 @@ class KungFuWrapper(Wrapper):
             terminated = done
             truncated = False
 
+        # Get game state from RAM
         ram = self.env.get_ram()
         hp = float(ram[0x04A6])
         curr_enemies = [
@@ -211,7 +220,7 @@ class KungFuWrapper(Wrapper):
         )  # In Kung Fu, moving left is progress
         progression_reward = x_change * 0.2  # Basic reward for movement
 
-        if action in [6]:  # left or Jump+Right
+        if action in [6]:  # left
             progression_reward += 0.5
         reward += progression_reward
 
@@ -277,19 +286,20 @@ class KungFuWrapper(Wrapper):
         )
         normalized_reward = np.clip(normalized_reward, -10, 10)
 
-        # And add combat incentives:
+        # Combat incentives
         if action in [1, 8, 9]:  # punches and kicks
             if any(
                 enemy != 0 for enemy in curr_enemies
             ):  # only reward if enemies present
                 reward += 1.0
 
-        # further get reward
+        # Progress reward for exploring
         if self.player_x < self.furthest_left_position:
             self.furthest_left_position = self.player_x
             progression_bonus = 5.0  # Big reward for reaching new territory
             reward += progression_bonus
 
+        # Update state tracking variables
         self.last_hp = hp
         self.last_hp_change = hp_change_rate
         self.last_enemies = curr_enemies
@@ -297,6 +307,7 @@ class KungFuWrapper(Wrapper):
         self.last_timer = self.timer
         self.last_boss_hp = self.boss_hp
 
+        # Update info dict
         info.update(
             {
                 "hp": hp,
@@ -323,6 +334,7 @@ class KungFuWrapper(Wrapper):
         return self._get_obs(obs), normalized_reward, terminated, truncated, info
 
     def _get_obs(self, obs):
+        # Resize observation to consistent viewport size
         viewport = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
         return {
             "viewport": viewport.astype(np.uint8),
@@ -332,6 +344,7 @@ class KungFuWrapper(Wrapper):
         }
 
     def _detect_projectiles(self, obs):
+        # Detect projectiles in the scene
         frame = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
         if self.prev_frame is not None:
             frame_diff = cv2.absdiff(frame, self.prev_frame)
@@ -365,12 +378,16 @@ class KungFuWrapper(Wrapper):
 
 
 class SimpleCNN(BaseFeaturesExtractor):
+    """
+    CNN feature extractor for KungFu environment
+    """
+
     def __init__(self, observation_space, features_dim=256):
         super().__init__(observation_space, features_dim)
-        # Infer n_stack from viewport channels
+        # Get viewport shape from observation space
         viewport_shape = observation_space["viewport"].shape
 
-        # Handle the case where shape is (H, W, C) instead of (C, H, W)
+        # Handle different channel formats
         if len(viewport_shape) == 3 and viewport_shape[2] < viewport_shape[0]:
             # Shape is (H, W, C)
             C = viewport_shape[2]
@@ -379,8 +396,11 @@ class SimpleCNN(BaseFeaturesExtractor):
             C = viewport_shape[0]
 
         n_stack = C // 3  # Assuming 3 channels per frame
-        logger.info(f"Inferred n_stack={n_stack} from viewport shape={viewport_shape}")
+        logger.info(
+            f"SimpleCNN initialized with n_stack={n_stack}, viewport shape={viewport_shape}"
+        )
 
+        # CNN layers
         self.cnn = nn.Sequential(
             nn.Conv2d(C, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
@@ -399,10 +419,12 @@ class SimpleCNN(BaseFeaturesExtractor):
             # For (C, H, W) format
             sample_shape = (1,) + viewport_shape
 
+        # Determine the flattened size after convolutions
         with torch.no_grad():
             sample_input = torch.zeros(sample_shape)
             n_flatten = self.cnn(sample_input).shape[1]
 
+        # Process the projectile vectors along with CNN features
         proj_vectors_size = observation_space["projectile_vectors"].shape[0]
         self.linear = nn.Sequential(
             nn.Linear(n_flatten + proj_vectors_size, 512),
@@ -411,7 +433,7 @@ class SimpleCNN(BaseFeaturesExtractor):
             nn.ReLU(),
         )
         logger.info(
-            f"SimpleCNN initialized: n_flatten={n_flatten}, proj_vectors_size={proj_vectors_size}, total_input={n_flatten + proj_vectors_size}"
+            f"SimpleCNN architecture: n_flatten={n_flatten}, proj_vectors_size={proj_vectors_size}, features_dim={features_dim}"
         )
 
     def forward(self, observations):
@@ -423,15 +445,20 @@ class SimpleCNN(BaseFeaturesExtractor):
             # Input is (batch, H, W, C) - need to transpose to (batch, C, H, W)
             viewport = viewport.permute(0, 3, 1, 2)
 
+        # Normalize and process viewport
         viewport = viewport.float() / 255.0
         proj_vectors = observations["projectile_vectors"].float()
 
+        # Extract features
         cnn_features = self.cnn(viewport)
         combined = torch.cat([cnn_features, proj_vectors], dim=1)
         return self.linear(combined)
 
 
 def make_env():
+    """
+    Create and wrap the KungFu environment
+    """
     env = retro.make(
         "KungFu-Nes", use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array"
     )

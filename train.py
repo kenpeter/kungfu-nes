@@ -19,15 +19,7 @@ import signal
 import time
 import threading
 import queue
-from kungfu_env import (
-    KungFuWrapper,
-    SimpleCNN,
-    KUNGFU_MAX_ENEMIES,
-    MAX_PROJECTILES,
-    KUNGFU_OBSERVATION_SPACE,
-    KUNGFU_ACTIONS,
-    KUNGFU_ACTION_NAMES,
-)
+from kungfu_env import KungFuWrapper, SimpleCNN, N_STACK, KUNGFU_ACTION_NAMES, make_env
 
 current_model = None
 global_logger = None
@@ -107,7 +99,6 @@ class SaveBestModelCallback(BaseCallback):
         super().__init__(verbose)
         self.save_path = save_path
         self.best_score = 0
-        self.actions = KUNGFU_ACTIONS
         self.action_names = KUNGFU_ACTION_NAMES
 
     def _on_step(self) -> bool:
@@ -197,34 +188,42 @@ class RenderCallback(BaseCallback):
         self.render_thread = threading.Thread(target=self._render_loop, daemon=True)
         self.last_render_time = time.time()
         self.render_env = None
+        self.running = True
         self.render_thread.start()
 
     def _render_loop(self):
-        while True:
+        while self.running:
             try:
                 if not self.render_queue.empty():
-                    self.render_env = self.render_queue.get()
+                    self.render_env = self.render_queue.get(block=False)
                     self.render_queue.task_done()
 
                 if self.render_env:
                     start_time = time.time()
                     target_frame_time = 1.0 / self.fps
                     if start_time - self.last_render_time >= target_frame_time:
-                        self.render_env.render(mode="human")
+                        self.render_env.render()
                         self.last_render_time = start_time
                         render_time = time.time() - start_time
-                        global_logger.debug(
-                            f"Render time: {render_time:.3f}s, Queue size: {self.render_queue.qsize()}"
-                        )
-                        if render_time > target_frame_time:
+                        if global_logger:
                             global_logger.debug(
-                                f"Render time exceeds frame target: {render_time:.3f}s vs {target_frame_time:.3f}s"
+                                f"Render time: {render_time:.3f}s, Queue size: {self.render_queue.qsize()}"
                             )
-                    time.sleep(max(0, target_frame_time - (time.time() - start_time)))
+                            if render_time > target_frame_time:
+                                global_logger.debug(
+                                    f"Render time exceeds frame target: {render_time:.3f}s vs {target_frame_time:.3f}s"
+                                )
+                    # Sleep to maintain frame rate
+                    sleep_time = max(0, target_frame_time - (time.time() - start_time))
+                    time.sleep(sleep_time)
                 else:
                     time.sleep(0.01)
+            except queue.Empty:
+                # Queue is empty, just continue
+                time.sleep(0.01)
             except Exception as e:
-                global_logger.warning(f"Render thread error: {e}")
+                if global_logger:
+                    global_logger.warning(f"Render thread error: {e}")
                 time.sleep(0.01)
 
     def _on_step(self) -> bool:
@@ -232,19 +231,37 @@ class RenderCallback(BaseCallback):
         if self.step_count % self.render_freq == 0:
             try:
                 if self.render_queue.qsize() == 0:
-                    self.render_queue.put(self.training_env)
-                    global_logger.debug(f"Queued render at step {self.step_count}")
+                    # Get the first environment from the vectorized environment
+                    if (
+                        hasattr(self.training_env, "envs")
+                        and len(self.training_env.envs) > 0
+                    ):
+                        env_to_render = self.training_env.envs[0].unwrapped
+                    else:
+                        env_to_render = self.training_env.unwrapped
+
+                    self.render_queue.put(env_to_render, block=False)
+                    if global_logger:
+                        global_logger.debug(f"Queued render at step {self.step_count}")
             except Exception as e:
-                global_logger.warning(f"Queue error: {e}")
+                if global_logger:
+                    global_logger.warning(f"Queue error: {e}")
         return True
 
     def _on_training_end(self) -> None:
+        self.running = False
+        if self.render_thread.is_alive():
+            self.render_thread.join(timeout=1.0)
+
         if self.render_env:
             try:
-                self.render_env.close()
-                global_logger.info("Closed render environment")
+                if hasattr(self.render_env, "close"):
+                    self.render_env.close()
+                if global_logger:
+                    global_logger.info("Closed render environment")
             except Exception as e:
-                global_logger.warning(f"Error closing render env: {e}")
+                if global_logger:
+                    global_logger.warning(f"Error closing render env: {e}")
 
 
 def setup_logging(log_dir):
@@ -260,12 +277,11 @@ def setup_logging(log_dir):
     return logging.getLogger()
 
 
-def make_kungfu_env():
-    base_env = retro.make(
-        "KungFu-Nes", use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array"
-    )
-    env = KungFuWrapper(base_env)
-    return env
+def make_kungfu_env_for_vec():
+    """
+    Create a KungFu environment suitable for vectorization.
+    """
+    return make_env()
 
 
 def train(args):
@@ -276,7 +292,6 @@ def train(args):
     global_logger.info(
         f"Starting training with {args.num_envs} envs and {args.timesteps} total timesteps"
     )
-    global_logger.info(f"Maximum number of enemies: {KUNGFU_MAX_ENEMIES}")
     global_model_path = args.model_path
     current_model = None
 
@@ -311,14 +326,17 @@ def train(args):
         ):
             global_logger.info(f"Resuming training from {args.model_path}")
             try:
-                custom_objects = {"policy_kwargs": policy_kwargs}
+                custom_objects = {
+                    "features_extractor_class": SimpleCNN,
+                    "features_extractor_kwargs": {"features_dim": 256},
+                }
                 model = PPO.load(
                     args.model_path,
                     env=env,
                     custom_objects=custom_objects,
                     device="cuda" if args.cuda else "cpu",
                 )
-                expected_actions = len(KUNGFU_ACTIONS)
+                expected_actions = len(KUNGFU_ACTION_NAMES)
                 model_actions = model.policy.action_space.n
                 if model_actions != expected_actions:
                     global_logger.warning(
@@ -348,32 +366,38 @@ def train(args):
             device="cuda" if args.cuda else "cpu",
         )
 
-    env_fns = [make_kungfu_env for _ in range(args.num_envs)]
-
+    # Create environment(s)
     if args.render:
         global_logger.info(
             "Rendering enabled. Using a single environment for visualization."
         )
         args.num_envs = 1
-        env = DummyVecEnv([make_kungfu_env])
+        env = DummyVecEnv([make_kungfu_env_for_vec])
     else:
+        env_fns = [make_kungfu_env_for_vec for _ in range(args.num_envs)]
         env = SubprocVecEnv(env_fns)
 
-    # Add frame stacking and image transposition
-    env = VecFrameStack(env, n_stack=4, channels_order="last")
+    # Apply frame stacking consistent with play.py
+    env = VecFrameStack(env, n_stack=N_STACK, channels_order="last")
     env = VecTransposeImage(env)
 
+    global_logger.info(f"Environment setup complete with {N_STACK} frame stacking")
+
+    # Initialize or load model
     current_model = initialize_model(env)
 
+    # Setup callbacks
     save_callback = SaveBestModelCallback(save_path=args.model_path)
     exp_callback = ExperienceCollectionCallback()
     callbacks = [save_callback, exp_callback]
 
     if args.render:
-        callbacks.append(RenderCallback(render_freq=args.render_freq, fps=30))
+        render_callback = RenderCallback(render_freq=args.render_freq, fps=30)
+        callbacks.append(render_callback)
 
     callback = CallbackList(callbacks)
 
+    # Learn
     try:
         current_model.learn(
             total_timesteps=args.timesteps,
@@ -389,12 +413,14 @@ def train(args):
             global_logger.warning(f"Failed to close environment: {close_e}")
         raise
 
+    # Save final model
     try:
         current_model.save(args.model_path)
         global_logger.info(f"Final model saved at {args.model_path}")
     except Exception as e:
         global_logger.error(f"Failed to save final model: {e}")
 
+    # Cleanup
     try:
         env.close()
     except Exception as e:
@@ -406,7 +432,7 @@ def train(args):
         f"Training completed. Total experience collected: {experience_count} steps"
     )
 
-    with open(f"{global_model_path}_experience_count.txt", "w") as f:
+    with open(f"{args.model_path}_experience_count.txt", "w") as f:
         f.write(f"Total experience collected: {experience_count} steps\n")
         f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(
@@ -450,13 +476,23 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         train(args)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user")
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+
+        traceback.print_exc()
     finally:
         if current_model and hasattr(current_model, "env"):
             try:
                 current_model.env.close()
             except Exception as e:
-                global_logger.error(
-                    f"Failed to close environment during final cleanup: {e}"
-                )
+                if global_logger:
+                    global_logger.error(
+                        f"Failed to close environment during final cleanup: {e}"
+                    )
+                else:
+                    print(f"Failed to close environment during final cleanup: {e}")
         if args.cuda:
             torch.cuda.empty_cache()
