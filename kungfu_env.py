@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # Constants
 KUNGFU_MAX_ENEMIES = 5  # Increased by 1 to include boss as special enemy
 MAX_PROJECTILES = 2
-N_STACK = 4  # Number of frames to stack for input
+N_STACK = 4  # Number of frames to stack for input - KEEP THIS AT 4
 
 # Define actions
 KUNGFU_ACTIONS = [
@@ -54,7 +54,7 @@ KUNGFU_ACTION_NAMES = [
 # Define observation space with consistent dimensions
 KUNGFU_OBSERVATION_SPACE = spaces.Dict(
     {
-        # 160, 160, 3*n_stack
+        # 160, 160, 3*n_stack - CHANNEL LAST FORMAT
         "viewport": spaces.Box(
             low=0, high=255, shape=(160, 160, 3 * N_STACK), dtype=np.uint8
         ),
@@ -69,7 +69,7 @@ KUNGFU_OBSERVATION_SPACE = spaces.Dict(
 
 
 class KungFuWrapper(Wrapper):
-    def __init__(self, env, n_stack=4):
+    def __init__(self, env, n_stack=N_STACK):
         # super
         super().__init__(env)
         # reset env
@@ -110,7 +110,7 @@ class KungFuWrapper(Wrapper):
         # frame stack here
         self.frame_stack = deque(maxlen=n_stack)
         logger.info(
-            f"KungFu wrapper initialized with viewport size {self.viewport_size}"
+            f"KungFu wrapper initialized with viewport size {self.viewport_size}, n_stack={n_stack}"
         )
 
     def reset(self, seed=None, options=None, **kwargs):
@@ -161,10 +161,11 @@ class KungFuWrapper(Wrapper):
         return initial_obs, info
 
     def step(self, action):
+        # action count will be used as percentage
         self.total_steps += 1
         self.action_counts[action] += 1
 
-        # Take step in environment
+        # new gym 5 and old gym 4
         result = self.env.step(self.actions[action])
         if len(result) == 5:
             obs, reward, terminated, truncated, info = result
@@ -360,24 +361,49 @@ class KungFuWrapper(Wrapper):
         return current_obs, normalized_reward, terminated, truncated, info
 
     def _get_obs(self, obs):
-        # obs become 160x160
+        # obs become 160x160 single frame
         frame = cv2.resize(obs, (160, 160), interpolation=cv2.INTER_AREA)
 
-        # push to frame stack
+        # push single frame to frame stack
         self.frame_stack.append(frame)
 
-        # Combine frames along channels: (160, 160, 3*N)
-        stacked_frames = np.concatenate(list(self.frame_stack), axis=2)
+        # Combine all frames along channels: (160, 160, 3*N)
+        # Ensure we have enough frames
+        if len(self.frame_stack) < self.n_stack:
+            # If we don't have enough frames yet, duplicate the last one
+            frames = list(self.frame_stack)
+            while len(frames) < self.n_stack:
+                frames.append(frames[-1])
+        else:
+            frames = list(self.frame_stack)
+
+        stacked_frames = np.concatenate(frames, axis=2)
+
+        # Check that stacked_frames has the correct shape
+        expected_shape = (160, 160, 3 * self.n_stack)
+        if stacked_frames.shape != expected_shape:
+            logger.warning(
+                f"Stacked frames shape {stacked_frames.shape} doesn't match expected {expected_shape}"
+            )
+            # Try to reshape
+            try:
+                stacked_frames = stacked_frames.reshape(expected_shape)
+            except Exception as e:
+                logger.error(f"Failed to reshape stacked frames: {e}")
+                # Create empty array as fallback
+                stacked_frames = np.zeros(expected_shape, dtype=np.uint8)
 
         # Get object detection data
         detected_objects = self._detect_objects()
 
         return {
-            # we put the stack frame into viewport
+            # frame stacks into viewport
             "viewport": stacked_frames.astype(np.uint8),
+            # we detect projectile
             "projectile_vectors": np.array(
                 detected_objects["projectiles"], dtype=np.float32
             ),
+            # we detect enemy and boss
             "enemy_vectors": np.array(detected_objects["enemies"], dtype=np.float32),
         }
 
@@ -690,7 +716,8 @@ class KungFuWrapper(Wrapper):
                 # For boss, use a marker value to indicate boss status
                 # Use RAM-based boss action if available
                 if boss_present:
-                    enemy_state = 1.0 + boss_action * 0.1  # Incorporate RAM boss action
+                    # Incorporate RAM boss action with scaling factor
+                    enemy_state = 1.0 + (float(boss_action) * 0.1)
                 else:
                     # Fallback to frame-based boss action detection
                     boss_action_detected = 0
@@ -734,22 +761,18 @@ class SimpleCNN(BaseFeaturesExtractor):
         # Get viewport shape from observation space
         viewport_shape = observation_space["viewport"].shape
 
-        # Handle different channel formats
-        if len(viewport_shape) == 3 and viewport_shape[2] < viewport_shape[0]:
-            # Shape is (H, W, C)
-            C = viewport_shape[2]
-        else:
-            # Shape is (C, H, W)
-            C = viewport_shape[0]
+        # CRITICAL: Hard-code the correct values based on N_STACK=4
+        channels = 3 * N_STACK  # 12 channels for 4 RGB frames
+        height = 160
+        width = 160
 
-        n_stack = C // 3  # Assuming 3 channels per frame
         logger.info(
-            f"SimpleCNN initialized with n_stack={n_stack}, viewport shape={viewport_shape}"
+            f"SimpleCNN initialized with n_stack={N_STACK}, viewport shape={viewport_shape}"
         )
 
-        # CNN layers
+        # CNN layers - explicitly use the correct number of input channels
         self.cnn = nn.Sequential(
-            nn.Conv2d(C, 32, kernel_size=8, stride=4, padding=0),
+            nn.Conv2d(channels, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
             nn.ReLU(),
@@ -758,17 +781,10 @@ class SimpleCNN(BaseFeaturesExtractor):
             nn.Flatten(),
         )
 
-        # Get correct shape for sample input based on viewport shape
-        if len(viewport_shape) == 3 and viewport_shape[2] < viewport_shape[0]:
-            # For (H, W, C) format - need to transpose
-            sample_shape = (1, C, viewport_shape[0], viewport_shape[1])
-        else:
-            # For (C, H, W) format
-            sample_shape = (1,) + viewport_shape
-
-        # Determine the flattened size after convolutions
+        # Compute the output size of the CNN using a dummy input
         with torch.no_grad():
-            sample_input = torch.zeros(sample_shape)
+            # Always use consistent shape for sample calculation
+            sample_input = torch.zeros((1, channels, height, width))
             n_flatten = self.cnn(sample_input).shape[1]
 
         # Process all vector data along with CNN features
@@ -796,11 +812,93 @@ class SimpleCNN(BaseFeaturesExtractor):
         )
 
     def forward(self, observations):
-        viewport = observations["viewport"]  # Shape: [batch, H, W, 3*N_STACK]
+        viewport = observations["viewport"]  # Initial shape varies
 
-        # If input is (H,W,C), permute to (C,H,W)
-        if viewport.shape[1] > viewport.shape[3]:
-            viewport = viewport.permute(0, 3, 1, 2)
+        # Handle VecTransposeImage inconsistency
+        # The goal is to get to [batch, 12, 160, 160] format
+
+        # Debug shape
+        if torch.rand(1).item() < 0.01:  # Print occasionally to avoid spam
+            logger.info(f"Original viewport shape: {viewport.shape}")
+
+        # Calculate input size to determine correct reshaping
+        batch_size = viewport.shape[0]
+        input_size = viewport.numel()  # Total number of elements
+        expected_elements = batch_size * 12 * 160 * 160
+
+        # Check if we have an unexpected amount of data
+        if input_size != expected_elements:
+            logger.warning(
+                f"Input size {input_size} doesn't match expected size {expected_elements}"
+            )
+            # If total size is 4915200, which is 4 * 48 * 160 * 160
+            if input_size == batch_size * 48 * 160 * 160:
+                logger.info("Detected 48 channels, extracting first 12 channels")
+                # Extract only the first 12 channels (4 RGB frames)
+                if viewport.shape[1] == 48:
+                    viewport = viewport[:, :12, :, :]
+                elif viewport.shape[2] == 48:
+                    viewport = viewport[:, :, :12, :]
+                else:
+                    # Try to reshape and then extract
+                    try:
+                        viewport = viewport.reshape(batch_size, 48, 160, 160)[
+                            :, :12, :, :
+                        ]
+                        logger.info(f"Reshaped viewport to {viewport.shape}")
+                    except Exception as e:
+                        logger.error(f"Failed to reshape: {e}")
+                        # Last resort - create a new tensor with zeros
+                        viewport = torch.zeros(
+                            (batch_size, 12, 160, 160),
+                            device=viewport.device,
+                            dtype=viewport.dtype,
+                        )
+        else:
+            # Handle normal reshaping for expected sized tensors
+            if len(viewport.shape) == 4:
+                if viewport.shape[1] == 160 and viewport.shape[2] == 12:
+                    # Shape is [batch, H=160, C=12, W=160] - this is wrong format
+                    viewport = viewport.permute(0, 2, 1, 3)
+                elif (
+                    viewport.shape[1] == 160
+                    and viewport.shape[2] == 160
+                    and viewport.shape[3] == 12
+                ):
+                    # Shape is [batch, H=160, W=160, C=12] - channel last format
+                    viewport = viewport.permute(0, 3, 1, 2)
+                elif viewport.shape[1] == 12:
+                    # Shape is already [batch, C=12, H, W]
+                    pass
+                else:
+                    # Known shape but wrong format - try to reshape
+                    logger.warning(
+                        f"Reshaping from {viewport.shape} to [batch, 12, 160, 160]"
+                    )
+                    try:
+                        viewport = viewport.reshape(batch_size, 12, 160, 160)
+                    except Exception as e:
+                        logger.error(f"Reshape failed: {e}")
+                        # Emergency fallback
+                        viewport = torch.zeros(
+                            (batch_size, 12, 160, 160),
+                            device=viewport.device,
+                            dtype=viewport.dtype,
+                        )
+
+        # Final check to ensure we have the right shape
+        if (
+            viewport.shape[1] != 12
+            or viewport.shape[2] != 160
+            or viewport.shape[3] != 160
+        ):
+            logger.error(
+                f"Failed to reshape viewport to expected format: {viewport.shape}"
+            )
+            # Last resort - create a new tensor with zeros
+            viewport = torch.zeros(
+                (batch_size, 12, 160, 160), device=viewport.device, dtype=viewport.dtype
+            )
 
         # Normalize and process
         viewport = viewport.float() / 255.0

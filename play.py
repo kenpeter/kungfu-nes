@@ -26,12 +26,13 @@ def main():
         "KungFu-Nes", use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array"
     )
 
-    # Apply our wrapper
-    env = KungFuWrapper(base_env)
+    # Apply our wrapper with explicit n_stack parameter to match N_STACK constant
+    env = KungFuWrapper(base_env, n_stack=N_STACK)
 
-    # Create a dummy vec env for frame stacking
+    # Create a dummy vec env for frame stacking - always use N_STACK from kungfu_env
     env = DummyVecEnv([lambda: env])
     env = VecFrameStack(env, n_stack=N_STACK, channels_order="last")
+    # Apply VecTransposeImage for conversion to PyTorch format (channels first)
     env = VecTransposeImage(env)
 
     # First reset to get initial observation
@@ -69,6 +70,7 @@ def main():
         }
         model = PPO.load(MODEL_PATH, custom_objects=custom_objects)
         print("Model loaded successfully")
+        print(f"Playing with n_stack={N_STACK}")
         ai_mode = True
     except Exception as e:
         print(f"Couldn't load model: {e}")
@@ -102,7 +104,7 @@ def main():
         if symbol in key_pressed:
             key_pressed.remove(symbol)
 
-    # Toggle AI mode
+    # Toggle AI mode with updated event handler
     @win.event
     def on_key_press(symbol, modifiers):
         nonlocal ai_mode
@@ -117,10 +119,14 @@ def main():
     fps_display = pyglet.window.FPSDisplay(window=win)
     frame_counter = 0
     last_frame_time = time.time()
+    frame_rate_target = 30.0  # Target frame rate
+
+    # Display text for visible model state
+    status_text = None
 
     # Update function
     def update(dt):
-        nonlocal action, obs, frame_counter, last_frame_time
+        nonlocal action, obs, frame_counter, last_frame_time, status_text
         frame_counter += 1
 
         # FPS calculation
@@ -174,6 +180,16 @@ def main():
         )
         texture.blit_into(image_data, 0, 0, 0)
 
+        # Update status text
+        status_text = pyglet.text.Label(
+            f"Mode: {'AI' if ai_mode else 'Manual'} | Action: {action} | N_Stack: {N_STACK}",
+            font_name="Arial",
+            font_size=12,
+            x=10,
+            y=win_height - 30,
+            color=(255, 255, 0, 255),
+        )
+
         # Reset if done
         if dones[0]:
             obs = env.reset()
@@ -199,10 +215,12 @@ def main():
             anchor_y="top",
         )
         mode_text.draw()
+        if status_text:
+            status_text.draw()
         fps_display.draw()
 
-    # Schedule update with a faster frame rate
-    pyglet.clock.schedule_interval(update, 1 / 60.0)
+    # Schedule update with a consistent frame rate
+    pyglet.clock.schedule_interval(update, 1.0 / frame_rate_target)
 
     # Run the application
     print(

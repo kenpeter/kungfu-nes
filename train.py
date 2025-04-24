@@ -134,8 +134,8 @@ class SaveBestModelCallback(BaseCallback):
             + total_survival_reward * 12
             + avg_normalized_reward * 200
             + action_diversity * 25
-            + total_progression_reward * 100  # Emphasize progression
-            + max_stage * 100  # Large reward for reaching higher stages
+            + total_progression_reward * 100
+            + max_stage * 100
         )
 
         if score > self.best_score:
@@ -213,13 +213,11 @@ class RenderCallback(BaseCallback):
                                 global_logger.debug(
                                     f"Render time exceeds frame target: {render_time:.3f}s vs {target_frame_time:.3f}s"
                                 )
-                    # Sleep to maintain frame rate
                     sleep_time = max(0, target_frame_time - (time.time() - start_time))
                     time.sleep(sleep_time)
                 else:
                     time.sleep(0.01)
             except queue.Empty:
-                # Queue is empty, just continue
                 time.sleep(0.01)
             except Exception as e:
                 if global_logger:
@@ -231,7 +229,6 @@ class RenderCallback(BaseCallback):
         if self.step_count % self.render_freq == 0:
             try:
                 if self.render_queue.qsize() == 0:
-                    # Get the first environment from the vectorized environment
                     if (
                         hasattr(self.training_env, "envs")
                         and len(self.training_env.envs) > 0
@@ -239,7 +236,6 @@ class RenderCallback(BaseCallback):
                         env_to_render = self.training_env.envs[0].unwrapped
                     else:
                         env_to_render = self.training_env.unwrapped
-
                     self.render_queue.put(env_to_render, block=False)
                     if global_logger:
                         global_logger.debug(f"Queued render at step {self.step_count}")
@@ -252,7 +248,6 @@ class RenderCallback(BaseCallback):
         self.running = False
         if self.render_thread.is_alive():
             self.render_thread.join(timeout=1.0)
-
         if self.render_env:
             try:
                 if hasattr(self.render_env, "close"):
@@ -278,9 +273,6 @@ def setup_logging(log_dir):
 
 
 def make_kungfu_env_for_vec():
-    """
-    Create a KungFu environment suitable for vectorization.
-    """
     return make_env()
 
 
@@ -313,7 +305,7 @@ def train(args):
         "learning_rate": learning_rate_schedule,
         "clip_range": args.clip_range,
         "ent_coef": ent_coef,
-        "n_steps": 512,
+        "n_steps": 128,
         "batch_size": 32,
         "n_epochs": 5,
     }
@@ -340,7 +332,7 @@ def train(args):
                 model_actions = model.policy.action_space.n
                 if model_actions != expected_actions:
                     global_logger.warning(
-                        f"Model action space ({model_actions}) does not match environment ({expected_actions}). Retraining recommended."
+                        f"Model action space ({model_actions}) does not match environment ({expected_actions})."
                     )
                 global_logger.info("Successfully loaded existing model")
                 return model
@@ -377,9 +369,18 @@ def train(args):
         env_fns = [make_kungfu_env_for_vec for _ in range(args.num_envs)]
         env = SubprocVecEnv(env_fns)
 
-    # Apply frame stacking consistent with play.py
-    env = VecFrameStack(env, n_stack=N_STACK, channels_order="last")
+    # Apply vectorized wrappers
+    env = VecFrameStack(env, n_stack=N_STACK)
     env = VecTransposeImage(env)
+
+    # Print observation space for debugging
+    dummy_obs = env.reset()
+    if isinstance(dummy_obs, dict):
+        for key, value in dummy_obs.items():
+            if hasattr(value, "shape"):
+                global_logger.info(f"Observation {key} shape: {value.shape}")
+    else:
+        global_logger.info(f"Observation shape: {dummy_obs.shape}")
 
     global_logger.info(f"Environment setup complete with {N_STACK} frame stacking")
 
