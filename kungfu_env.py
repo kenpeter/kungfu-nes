@@ -361,49 +361,27 @@ class KungFuWrapper(Wrapper):
         return current_obs, normalized_reward, terminated, truncated, info
 
     def _get_obs(self, obs):
-        # obs become 160x160 single frame
         frame = cv2.resize(obs, (160, 160), interpolation=cv2.INTER_AREA)
-
-        # push single frame to frame stack
         self.frame_stack.append(frame)
 
-        # Combine all frames along channels: (160, 160, 3*N)
-        # Ensure we have enough frames
-        if len(self.frame_stack) < self.n_stack:
-            # If we don't have enough frames yet, duplicate the last one
-            frames = list(self.frame_stack)
-            while len(frames) < self.n_stack:
-                frames.append(frames[-1])
-        else:
-            frames = list(self.frame_stack)
+        # Ensure we have enough frames in the stack
+        while len(self.frame_stack) < self.n_stack:
+            self.frame_stack.append(frame)
 
-        stacked_frames = np.concatenate(frames, axis=2)
+        # Stack frames along the channel dimension
+        stacked_frames = np.concatenate(self.frame_stack, axis=2)
 
-        # Check that stacked_frames has the correct shape
-        expected_shape = (160, 160, 3 * self.n_stack)
-        if stacked_frames.shape != expected_shape:
-            logger.warning(
-                f"Stacked frames shape {stacked_frames.shape} doesn't match expected {expected_shape}"
-            )
-            # Try to reshape
-            try:
-                stacked_frames = stacked_frames.reshape(expected_shape)
-            except Exception as e:
-                logger.error(f"Failed to reshape stacked frames: {e}")
-                # Create empty array as fallback
-                stacked_frames = np.zeros(expected_shape, dtype=np.uint8)
+        assert (
+            stacked_frames.shape[-1] == 3 * self.n_stack
+        ), f"Expected {3 * self.n_stack} channels, got {stacked_frames.shape[-1]}"
 
-        # Get object detection data
         detected_objects = self._detect_objects()
 
         return {
-            # frame stacks into viewport
             "viewport": stacked_frames.astype(np.uint8),
-            # we detect projectile
             "projectile_vectors": np.array(
                 detected_objects["projectiles"], dtype=np.float32
             ),
-            # we detect enemy and boss
             "enemy_vectors": np.array(detected_objects["enemies"], dtype=np.float32),
         }
 
@@ -815,82 +793,22 @@ class SimpleCNN(BaseFeaturesExtractor):
         )
 
     def forward(self, observations):
-        viewport = observations["viewport"]  # Initial shape varies
+        viewport = observations["viewport"]
         batch_size = viewport.shape[0]
 
-        # Handle reshaping to ensure we have the correct format
-        if len(viewport.shape) == 4:
-            if (
-                viewport.shape[1] == self.actual_channels
-            ):  # Already in NCHW format with 48 channels
-                pass  # We'll extract 12 channels later
-            elif (
-                viewport.shape[3] == self.actual_channels
-            ):  # NHWC format with 48 channels
-                viewport = viewport.permute(0, 3, 1, 2)  # Convert to NCHW
-            else:
-                # Try to reshape based on total elements
-                total_elements = viewport.numel()
-                expected_elements = batch_size * self.actual_channels * 160 * 160
+        # Check if the input is in NHWC format and convert to NCHW if necessary
+        if len(viewport.shape) == 4 and viewport.shape[-1] == 12:
+            viewport = viewport.permute(0, 3, 1, 2)
 
-                if total_elements == expected_elements:
-                    try:
-                        viewport = viewport.reshape(
-                            batch_size, self.actual_channels, 160, 160
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to reshape viewport: {e}")
-                        viewport = torch.zeros(
-                            (batch_size, self.actual_channels, 160, 160),
-                            device=viewport.device,
-                            dtype=viewport.dtype,
-                        )
-                else:
-                    logger.error(
-                        f"Unexpected viewport size: {viewport.shape}, elements: {total_elements}"
-                    )
-                    viewport = torch.zeros(
-                        (batch_size, self.actual_channels, 160, 160),
-                        device=viewport.device,
-                        dtype=viewport.dtype,
-                    )
-        else:
-            logger.error(f"Unexpected viewport shape: {viewport.shape}")
-            viewport = torch.zeros(
-                (batch_size, self.actual_channels, 160, 160),
-                device=viewport.device,
-                dtype=viewport.dtype,
-            )
+        assert viewport.shape[1] == 12, f"Expected 12 channels, got {viewport.shape[1]}"
 
-        # Extract only the first 12 channels from the 48 available channels
-        # This is based on the error message that shows 48 channels instead of the expected 12
-        if viewport.shape[1] == self.actual_channels:
-            # There are multiple ways to handle 48 channels when we expect 12:
-            # 1. Take first 12 channels
-            # viewport = viewport[:, :self.expected_channels, :, :]
-
-            # 2. Average each group of 4 channels to get 12 channels
-            viewport = viewport.reshape(batch_size, 4, self.expected_channels, 160, 160)
-            viewport = viewport.mean(dim=1)  # Average over the groups of 4
-
-            # 3. Or use a more sophisticated approach based on your domain knowledge
-            # For example, if you know which specific channels are important
-
-        # Normalize and process
         viewport = viewport.float() / 255.0
-        cnn_features = self.cnn(viewport)  # Pass through Conv layers
+        cnn_features = self.cnn(viewport)
 
-        # Combine all vector data
         proj_vectors = observations["projectile_vectors"].float()
         enemy_vectors = observations["enemy_vectors"].float()
-
-        # Concatenate all vector data
         all_vectors = torch.cat([proj_vectors, enemy_vectors], dim=1)
-
-        # Encode vector data
         encoded_vectors = self.vector_encoder(all_vectors)
-
-        # Combine CNN features with encoded vector data
         combined = torch.cat([cnn_features, encoded_vectors], dim=1)
 
         return self.linear(combined)

@@ -249,30 +249,15 @@ class GameThread(threading.Thread):
     def get_screen(self):
         """Get the game screen from the observation viewport"""
         try:
-            # Extract viewport data from observation - this is where the actual game visuals are
             if isinstance(self.obs, dict) and "viewport" in self.obs:
-                viewport = self.obs["viewport"][0]  # Get first batch item
-
-                # The viewport shape is (48, 160, 160) where 48 = 4 frames * 3 RGB channels * 4 stack
-                # We need to extract just one frame and reconstruct the RGB image
-                if viewport.shape[0] == 48:  # 48 channels as expected
-                    # Each frame has 12 channels (3 RGB channels * 4 stack frames)
-                    # Let's take the most recent frame (last 3 channels of each stack frame)
-                    # For simplicity, let's just take channels 9, 10, 11 (the last RGB frame)
-                    r_channel = viewport[9]
-                    g_channel = viewport[10]
-                    b_channel = viewport[11]
-
-                    # Combine into RGB image (160, 160, 3)
-                    rgb_image = np.stack([r_channel, g_channel, b_channel], axis=2)
-
-                    # Normalize to 0-255 if needed
-                    if rgb_image.max() <= 1.0 and rgb_image.max() > 0:
-                        rgb_image = (rgb_image * 255).astype(np.uint8)
-                    elif rgb_image.dtype != np.uint8:
-                        rgb_image = rgb_image.astype(np.uint8)
-
-                    self.screen = rgb_image
+                viewport = self.obs["viewport"][0]  # (160, 160, 12)（NHWC）
+                if viewport.shape[-1] == 12:
+                    # 最后一帧的通道索引：3*(n_stack-1) 到 3*n_stack，即 9, 10, 11（0-based）
+                    r = viewport[..., 9]
+                    g = viewport[..., 10]
+                    b = viewport[..., 11]
+                    rgb_image = np.stack([r, g, b], axis=-1)  # (160, 160, 3)
+                    self.screen = rgb_image.astype(np.uint8)
                     return
 
                 # If the viewport doesn't match expected format, try more general approach
