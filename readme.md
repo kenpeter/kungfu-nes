@@ -1,3 +1,12 @@
+
+
+python script.py train --timesteps 10000
+
+
+python script.py play
+
+===
+
 python train.py --num_envs 4 --cuda --progress_bar --timesteps 10000
 
 
