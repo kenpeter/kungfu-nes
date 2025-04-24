@@ -165,7 +165,6 @@ class GameThread(threading.Thread):
 
             # Create the environment stack
             self.env = DummyVecEnv([make_kungfu_env_for_vec])
-            self.env = VecFrameStack(self.env, n_stack=N_STACK)
             self.env = VecTransposeImage(self.env)
 
             # Reset environment
@@ -253,15 +252,11 @@ class GameThread(threading.Thread):
             if isinstance(self.obs, dict) and "viewport" in self.obs:
                 viewport = self.obs["viewport"][0]  # Get first batch item
 
-                # The viewport shape is (48, 160, 160) where 48 = 4 frames * 3 RGB channels * 4 stack
-                # We need to extract just one frame and reconstruct the RGB image
-                if viewport.shape[0] == 48:  # 48 channels as expected
-                    # Each frame has 12 channels (3 RGB channels * 4 stack frames)
-                    # Let's take the most recent frame (last 3 channels of each stack frame)
-                    # For simplicity, let's just take channels 9, 10, 11 (the last RGB frame)
-                    r_channel = viewport[9]
-                    g_channel = viewport[10]
-                    b_channel = viewport[11]
+                if viewport.shape[0] == 12:  # 4 frames * 3 channels
+                    # Extract the most recent frame (last 3 channels)
+                    r_channel = viewport[-3]
+                    g_channel = viewport[-2]
+                    b_channel = viewport[-1]
 
                     # Combine into RGB image (160, 160, 3)
                     rgb_image = np.stack([r_channel, g_channel, b_channel], axis=2)
