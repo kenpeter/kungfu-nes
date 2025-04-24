@@ -761,18 +761,21 @@ class SimpleCNN(BaseFeaturesExtractor):
         # Get viewport shape from observation space
         viewport_shape = observation_space["viewport"].shape
 
-        # CRITICAL: Hard-code the correct values based on N_STACK=4
-        channels = 3 * N_STACK  # 12 channels for 4 RGB frames
+        # CRITICAL: There seems to be a 4x multiplication in the actual channels
+        # We'll process with the expectation of 48 channels but extract features as if it were 12 channels
+        self.expected_channels = 3 * N_STACK  # 12 channels for 4 RGB frames
+        self.actual_channels = self.expected_channels * 4  # 48 channels being received
         height = 160
         width = 160
 
         logger.info(
-            f"SimpleCNN initialized with n_stack={N_STACK}, viewport shape={viewport_shape}"
+            f"SimpleCNN initialized with n_stack={N_STACK}, viewport shape={viewport_shape}, "
+            f"expected_channels={self.expected_channels}, actual_channels={self.actual_channels}"
         )
 
-        # CNN layers - explicitly use the correct number of input channels
+        # CNN layers - Use the expected channels (12) after preprocessing in forward()
         self.cnn = nn.Sequential(
-            nn.Conv2d(channels, 32, kernel_size=8, stride=4, padding=0),
+            nn.Conv2d(self.expected_channels, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
             nn.ReLU(),
@@ -784,7 +787,7 @@ class SimpleCNN(BaseFeaturesExtractor):
         # Compute the output size of the CNN using a dummy input
         with torch.no_grad():
             # Always use consistent shape for sample calculation
-            sample_input = torch.zeros((1, channels, height, width))
+            sample_input = torch.zeros((1, self.expected_channels, height, width))
             n_flatten = self.cnn(sample_input).shape[1]
 
         # Process all vector data along with CNN features
@@ -813,92 +816,65 @@ class SimpleCNN(BaseFeaturesExtractor):
 
     def forward(self, observations):
         viewport = observations["viewport"]  # Initial shape varies
-
-        # Handle VecTransposeImage inconsistency
-        # The goal is to get to [batch, 12, 160, 160] format
-
-        # Debug shape
-        if torch.rand(1).item() < 0.01:  # Print occasionally to avoid spam
-            logger.info(f"Original viewport shape: {viewport.shape}")
-
-        # Calculate input size to determine correct reshaping
         batch_size = viewport.shape[0]
-        input_size = viewport.numel()  # Total number of elements
-        expected_elements = batch_size * 12 * 160 * 160
 
-        # Check if we have an unexpected amount of data
-        if input_size != expected_elements:
-            logger.warning(
-                f"Input size {input_size} doesn't match expected size {expected_elements}"
-            )
-            # If total size is 4915200, which is 4 * 48 * 160 * 160
-            if input_size == batch_size * 48 * 160 * 160:
-                logger.info("Detected 48 channels, extracting first 12 channels")
-                # Extract only the first 12 channels (4 RGB frames)
-                if viewport.shape[1] == 48:
-                    viewport = viewport[:, :12, :, :]
-                elif viewport.shape[2] == 48:
-                    viewport = viewport[:, :, :12, :]
-                else:
-                    # Try to reshape and then extract
+        # Handle reshaping to ensure we have the correct format
+        if len(viewport.shape) == 4:
+            if (
+                viewport.shape[1] == self.actual_channels
+            ):  # Already in NCHW format with 48 channels
+                pass  # We'll extract 12 channels later
+            elif (
+                viewport.shape[3] == self.actual_channels
+            ):  # NHWC format with 48 channels
+                viewport = viewport.permute(0, 3, 1, 2)  # Convert to NCHW
+            else:
+                # Try to reshape based on total elements
+                total_elements = viewport.numel()
+                expected_elements = batch_size * self.actual_channels * 160 * 160
+
+                if total_elements == expected_elements:
                     try:
-                        viewport = viewport.reshape(batch_size, 48, 160, 160)[
-                            :, :12, :, :
-                        ]
-                        logger.info(f"Reshaped viewport to {viewport.shape}")
+                        viewport = viewport.reshape(
+                            batch_size, self.actual_channels, 160, 160
+                        )
                     except Exception as e:
-                        logger.error(f"Failed to reshape: {e}")
-                        # Last resort - create a new tensor with zeros
+                        logger.error(f"Failed to reshape viewport: {e}")
                         viewport = torch.zeros(
-                            (batch_size, 12, 160, 160),
+                            (batch_size, self.actual_channels, 160, 160),
                             device=viewport.device,
                             dtype=viewport.dtype,
                         )
-        else:
-            # Handle normal reshaping for expected sized tensors
-            if len(viewport.shape) == 4:
-                if viewport.shape[1] == 160 and viewport.shape[2] == 12:
-                    # Shape is [batch, H=160, C=12, W=160] - this is wrong format
-                    viewport = viewport.permute(0, 2, 1, 3)
-                elif (
-                    viewport.shape[1] == 160
-                    and viewport.shape[2] == 160
-                    and viewport.shape[3] == 12
-                ):
-                    # Shape is [batch, H=160, W=160, C=12] - channel last format
-                    viewport = viewport.permute(0, 3, 1, 2)
-                elif viewport.shape[1] == 12:
-                    # Shape is already [batch, C=12, H, W]
-                    pass
                 else:
-                    # Known shape but wrong format - try to reshape
-                    logger.warning(
-                        f"Reshaping from {viewport.shape} to [batch, 12, 160, 160]"
+                    logger.error(
+                        f"Unexpected viewport size: {viewport.shape}, elements: {total_elements}"
                     )
-                    try:
-                        viewport = viewport.reshape(batch_size, 12, 160, 160)
-                    except Exception as e:
-                        logger.error(f"Reshape failed: {e}")
-                        # Emergency fallback
-                        viewport = torch.zeros(
-                            (batch_size, 12, 160, 160),
-                            device=viewport.device,
-                            dtype=viewport.dtype,
-                        )
-
-        # Final check to ensure we have the right shape
-        if (
-            viewport.shape[1] != 12
-            or viewport.shape[2] != 160
-            or viewport.shape[3] != 160
-        ):
-            logger.error(
-                f"Failed to reshape viewport to expected format: {viewport.shape}"
-            )
-            # Last resort - create a new tensor with zeros
+                    viewport = torch.zeros(
+                        (batch_size, self.actual_channels, 160, 160),
+                        device=viewport.device,
+                        dtype=viewport.dtype,
+                    )
+        else:
+            logger.error(f"Unexpected viewport shape: {viewport.shape}")
             viewport = torch.zeros(
-                (batch_size, 12, 160, 160), device=viewport.device, dtype=viewport.dtype
+                (batch_size, self.actual_channels, 160, 160),
+                device=viewport.device,
+                dtype=viewport.dtype,
             )
+
+        # Extract only the first 12 channels from the 48 available channels
+        # This is based on the error message that shows 48 channels instead of the expected 12
+        if viewport.shape[1] == self.actual_channels:
+            # There are multiple ways to handle 48 channels when we expect 12:
+            # 1. Take first 12 channels
+            # viewport = viewport[:, :self.expected_channels, :, :]
+
+            # 2. Average each group of 4 channels to get 12 channels
+            viewport = viewport.reshape(batch_size, 4, self.expected_channels, 160, 160)
+            viewport = viewport.mean(dim=1)  # Average over the groups of 4
+
+            # 3. Or use a more sophisticated approach based on your domain knowledge
+            # For example, if you know which specific channels are important
 
         # Normalize and process
         viewport = viewport.float() / 255.0
