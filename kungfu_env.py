@@ -62,7 +62,7 @@ KUNGFU_OBSERVATION_SPACE = spaces.Dict(
             low=-255, high=255, shape=(MAX_PROJECTILES * 4,), dtype=np.float32
         ),
         "enemy_vectors": spaces.Box(
-            low=-255, high=255, shape=(KUNGFU_MAX_ENEMIES * 4,), dtype=np.float32
+            low=-255, high=255, shape=(80,), dtype=np.float32  # Was (20,)
         ),
     }
 )
@@ -740,8 +740,8 @@ class KungFuWrapper(Wrapper):
             enemy_info.extend([dx, dy, int(ew), enemy_state])
 
         # Ensure exact size
-        enemy_info = enemy_info[: KUNGFU_MAX_ENEMIES * 4]
-        while len(enemy_info) < KUNGFU_MAX_ENEMIES * 4:
+        enemy_info = enemy_info[:80]  # Was KUNGFU_MAX_ENEMIES*4=20
+        while len(enemy_info) < 80:
             enemy_info.append(0)
 
         # Return all detected information
@@ -764,7 +764,7 @@ class SimpleCNN(BaseFeaturesExtractor):
         # CRITICAL: There seems to be a 4x multiplication in the actual channels
         # We'll process with the expectation of 48 channels but extract features as if it were 12 channels
         self.expected_channels = 3 * N_STACK  # 12 channels for 4 RGB frames
-        self.actual_channels = self.expected_channels * 4  # 48 channels being received
+        self.actual_channels = self.expected_channels  # Remove 4x multiplier
         height = 160
         width = 160
 

@@ -164,8 +164,7 @@ class GameThread(threading.Thread):
                 return KungFuWrapper(base_env, n_stack=N_STACK)
 
             # Create the environment stack
-            self.env = DummyVecEnv([make_kungfu_env_for_vec])
-            self.env = VecTransposeImage(self.env)
+            self.env = DummyVecEnv([lambda: KungFuWrapper(retro.make("KungFu-Nes"))])
 
             # Reset environment
             self.obs = self.env.reset()
