@@ -1,6 +1,6 @@
 import pyglet
 import numpy as np
-import retro
+import retro  # stable retro, not open ai retro
 import time
 import cv2
 from pyglet.gl import *
@@ -21,22 +21,44 @@ WINDOW_HEIGHT = 480
 def main():
     print("Initializing Kung Fu environment...")
 
-    # Create a base Retro environment first
-    base_env = retro.make(
-        "KungFu-Nes", use_restricted_actions=retro.Actions.ALL, render_mode="rgb_array"
-    )
+    # Define the environment creation function
+    def make_kungfu_env_for_vec():
+        base_env = retro.make(
+            "KungFu-Nes",
+            use_restricted_actions=retro.Actions.ALL,
+            render_mode="rgb_array",
+        )
+        return KungFuWrapper(base_env, n_stack=N_STACK)
 
-    # Apply our wrapper with explicit n_stack parameter to match N_STACK constant
-    env = KungFuWrapper(base_env, n_stack=N_STACK)
-
-    # Create a dummy vec env for frame stacking - always use N_STACK from kungfu_env
-    env = DummyVecEnv([lambda: env])
-    env = VecFrameStack(env, n_stack=N_STACK, channels_order="last")
-    # Apply VecTransposeImage for conversion to PyTorch format (channels first)
+    # Create the environment only once through DummyVecEnv
+    env = DummyVecEnv([make_kungfu_env_for_vec])
+    env = VecFrameStack(env, n_stack=N_STACK)
     env = VecTransposeImage(env)
 
     # First reset to get initial observation
     obs = env.reset()
+
+    # Debug observation shape - this is helpful
+    print(f"Observation type: {type(obs)}")
+    if isinstance(obs, dict):
+        for key, value in obs.items():
+            print(f"Observation key: {key}, shape: {value.shape}")
+    else:
+        print(f"Observation shape: {obs.shape}")
+
+    # Get the internal environment from VecEnv
+    # Let's print the wrapper hierarchy to debug
+    current_env = env.envs[0]
+    print(f"Environment type: {type(current_env)}")
+
+    # Navigate through wrappers until we find RetroEnv
+    # this is go down
+    while hasattr(current_env, "env"):
+        current_env = current_env.env
+        print(f"Unwrapped to: {type(current_env)}")
+
+    # The last unwrapped environment should be the RetroEnv
+    base_env = current_env
 
     # Get initial screen shape from raw environment render
     screen = base_env.render()

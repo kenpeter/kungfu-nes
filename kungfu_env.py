@@ -1,5 +1,5 @@
 from collections import deque
-import gymnasium as gym
+import gymnasium as gym  # gymnasium, not open ai gym
 import numpy as np
 from gymnasium import spaces, Wrapper
 import cv2
