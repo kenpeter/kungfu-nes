@@ -1,3 +1,4 @@
+from collections import deque
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces, Wrapper
@@ -53,7 +54,10 @@ KUNGFU_ACTION_NAMES = [
 # Define observation space with consistent dimensions
 KUNGFU_OBSERVATION_SPACE = spaces.Dict(
     {
-        "viewport": spaces.Box(low=0, high=255, shape=(160, 160, 3), dtype=np.uint8),
+        # 160, 160, 3*n_stack
+        "viewport": spaces.Box(
+            low=0, high=255, shape=(160, 160, 3 * N_STACK), dtype=np.uint8
+        ),
         "projectile_vectors": spaces.Box(
             low=-255, high=255, shape=(MAX_PROJECTILES * 4,), dtype=np.float32
         ),
@@ -62,15 +66,20 @@ KUNGFU_OBSERVATION_SPACE = spaces.Dict(
 
 
 class KungFuWrapper(Wrapper):
-    def __init__(self, env):
+    def __init__(self, env, n_stack=4):
+        # super
         super().__init__(env)
+        # reset env
         result = env.reset()
+        # obs there?
         if isinstance(result, tuple):
             obs, _ = result
         else:
             obs = result
 
+        # true height
         self.true_height, self.true_width = obs.shape[:2]
+        # view port size
         self.viewport_size = (160, 160)  # Consistent viewport size
 
         self.actions = KUNGFU_ACTIONS
@@ -103,6 +112,8 @@ class KungFuWrapper(Wrapper):
         self.boss_action = 0
         self.enemy_action_timers = [0] * KUNGFU_MAX_ENEMIES
         self.enemy_actions = [0] * KUNGFU_MAX_ENEMIES
+        self.n_stack = n_stack
+        self.frame_stack = deque(maxlen=n_stack)  # Stores last `n_stack` frames
 
         logger.info(
             f"KungFu wrapper initialized with viewport size {self.viewport_size}"
@@ -156,6 +167,15 @@ class KungFuWrapper(Wrapper):
             int(ram[0x0082]),
             int(ram[0x0083]),
         ]
+
+        # Resize the observation before adding to frame stack
+        resized_obs = cv2.resize(obs, (160, 160), interpolation=cv2.INTER_AREA)
+
+        # Initialize frame stack with resized observation
+        self.frame_stack.clear()
+        for _ in range(self.n_stack):
+            self.frame_stack.append(resized_obs)
+
         return self._get_obs(obs), info
 
     def step(self, action):
@@ -334,10 +354,18 @@ class KungFuWrapper(Wrapper):
         return self._get_obs(obs), normalized_reward, terminated, truncated, info
 
     def _get_obs(self, obs):
-        # Resize observation to consistent viewport size
-        viewport = cv2.resize(obs, self.viewport_size, interpolation=cv2.INTER_AREA)
+        # obs become 160x160
+        frame = cv2.resize(obs, (160, 160), interpolation=cv2.INTER_AREA)
+
+        # push to frame stack
+        self.frame_stack.append(frame)
+
+        # Combine frames along channels: (160, 160, 3*N)
+        stacked_frames = np.concatenate(self.frame_stack, axis=2)
+
         return {
-            "viewport": viewport.astype(np.uint8),
+            # ok, so u mean viewport shoudl use frame stack
+            "viewport": stacked_frames.astype(np.uint8),
             "projectile_vectors": np.array(
                 self._detect_projectiles(obs), dtype=np.float32
             ),
@@ -378,11 +406,8 @@ class KungFuWrapper(Wrapper):
 
 
 class SimpleCNN(BaseFeaturesExtractor):
-    """
-    CNN feature extractor for KungFu environment
-    """
-
     def __init__(self, observation_space, features_dim=256):
+        # super with obs and feature dim
         super().__init__(observation_space, features_dim)
         # Get viewport shape from observation space
         viewport_shape = observation_space["viewport"].shape
@@ -437,21 +462,20 @@ class SimpleCNN(BaseFeaturesExtractor):
         )
 
     def forward(self, observations):
-        viewport = observations["viewport"]
-        viewport_shape = viewport.shape
+        viewport = observations["viewport"]  # Shape: [batch, H, W, 3*N_STACK]
 
-        # Check if we need to transpose
-        if len(viewport_shape) == 4 and viewport_shape[1] > viewport_shape[3]:
-            # Input is (batch, H, W, C) - need to transpose to (batch, C, H, W)
+        # If input is (H,W,C), permute to (C,H,W)
+        if viewport.shape[1] > viewport.shape[3]:
             viewport = viewport.permute(0, 3, 1, 2)
 
-        # Normalize and process viewport
+        # Normalize and process
         viewport = viewport.float() / 255.0
-        proj_vectors = observations["projectile_vectors"].float()
+        cnn_features = self.cnn(viewport)  # Pass through Conv layers
 
-        # Extract features
-        cnn_features = self.cnn(viewport)
+        # Combine with projectile vectors
+        proj_vectors = observations["projectile_vectors"].float()
         combined = torch.cat([cnn_features, proj_vectors], dim=1)
+
         return self.linear(combined)
 
 
