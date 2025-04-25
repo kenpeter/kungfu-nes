@@ -52,27 +52,296 @@ class KungFuMasterEnv(gym.Wrapper):
         # Override the action space to use our discrete actions
         self.action_space = gym.spaces.Discrete(len(KUNGFU_ACTIONS))
 
+        # Track previous game state to calculate differences
+        self.prev_score = 0
+        self.prev_hp = 0
+        self.prev_x_pos = 0
+        self.prev_boss_hp = 0
+        self.prev_stage = 0
+        self.prev_enemy_x = [0, 0, 0, 0]  # Previous X positions for 4 enemies
+        self.prev_enemy_actions = [0, 0, 0, 0]  # Previous actions for 4 enemies
+
+        # Constants for reward shaping
+        self.SCORE_REWARD_SCALE = 0.01  # Per point of score
+        self.HP_LOSS_PENALTY = -1.0  # Per point of HP lost
+        self.STAGE_COMPLETION_REWARD = 50.0
+        self.DEATH_PENALTY = -25.0
+        self.PROGRESS_REWARD_SCALE = 0.05  # Reward for moving in correct direction
+        self.BOSS_DAMAGE_REWARD = 1.0  # Per point of damage to boss
+        self.TIME_PRESSURE_PENALTY = -0.01  # Small penalty per step to encourage speed
+        self.ENEMY_PROXIMITY_AWARENESS = (
+            0.5  # Reward for appropriate action with enemies nearby
+        )
+        self.ENEMY_DEFEAT_BONUS = 2.0  # Bonus for enemy disappearing (defeated)
+
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+
+        # Read initial state
+        ram = self.env.get_ram()
+        self.prev_score = self._get_score(ram)
+        self.prev_hp = ram[0x04A6]
+        self.prev_x_pos = ram[0x0094]
+        self.prev_boss_hp = ram[0x04A5]
+        self.prev_stage = ram[0x0058]
+
+        # Read enemy positions and actions
+        self.prev_enemy_x = [
+            ram[0x008E],  # Enemy 1 X position
+            ram[0x008F],  # Enemy 2 X position
+            ram[0x0090],  # Enemy 3 X position
+            ram[0x0091],  # Enemy 4 X position
+        ]
+
+        self.prev_enemy_actions = [
+            ram[0x0080],  # Enemy 1 action
+            ram[0x0081],  # Enemy 2 action
+            ram[0x0082],  # Enemy 3 action
+            ram[0x0083],  # Enemy 4 action
+        ]
+
+        return obs
+
     def step(self, action):
         # Convert our discrete action to the multi-binary format
         converted_action = KUNGFU_ACTIONS[action]
         obs, reward, terminated, truncated, info = self.env.step(converted_action)
         done = terminated or truncated
 
-        # Simple reward shaping to encourage progress
-        shaped_reward = reward
+        # Get current RAM state
+        ram = self.env.get_ram()
 
-        # Use the info dict to enhance rewards
-        if "score" in info:
-            shaped_reward += info["score"] * 0.01
+        # Extract relevant game state
+        current_stage = ram[0x0058]
+        current_score = self._get_score(ram)
+        current_hp = ram[0x04A6]
+        current_x_pos = ram[0x0094]
+        current_y_pos = ram[0x00B6]  # Hero Y position
+        current_boss_hp = ram[0x04A5]
 
-        # Encourage staying alive
-        shaped_reward += 0.1
+        # Get current enemy positions and actions
+        current_enemy_x = [
+            ram[0x008E],  # Enemy 1 X position
+            ram[0x008F],  # Enemy 2 X position
+            ram[0x0090],  # Enemy 3 X position
+            ram[0x0091],  # Enemy 4 X position
+        ]
 
-        # Discourage death
+        current_enemy_actions = [
+            ram[0x0080],  # Enemy 1 action
+            ram[0x0081],  # Enemy 2 action
+            ram[0x0082],  # Enemy 3 action
+            ram[0x0083],  # Enemy 4 action
+        ]
+
+        # Calculate shaped reward
+        shaped_reward = 0.0
+
+        # Base reward from the game
+        shaped_reward += reward
+
+        # Reward for score increase
+        score_diff = current_score - self.prev_score
+        if score_diff > 0:
+            shaped_reward += score_diff * self.SCORE_REWARD_SCALE
+
+        # Penalty for health loss
+        hp_diff = current_hp - self.prev_hp
+        if hp_diff < 0:
+            shaped_reward += hp_diff * self.HP_LOSS_PENALTY
+
+        # Reward/penalty for movement in correct direction based on stage
+        direction_reward = self._calculate_direction_reward(
+            current_stage, current_x_pos, self.prev_x_pos
+        )
+        shaped_reward += direction_reward
+
+        # Reward for damaging boss
+        boss_hp_diff = current_boss_hp - self.prev_boss_hp
+        if boss_hp_diff < 0:
+            shaped_reward += abs(boss_hp_diff) * self.BOSS_DAMAGE_REWARD
+
+        # Reward for stage completion
+        if current_stage > self.prev_stage:
+            shaped_reward += self.STAGE_COMPLETION_REWARD
+
+        # Enemy handling rewards
+        enemy_reward = self._calculate_enemy_handling_reward(
+            action,
+            current_x_pos,
+            current_y_pos,
+            current_enemy_x,
+            current_enemy_actions,
+            self.prev_enemy_x,
+            self.prev_enemy_actions,
+        )
+        shaped_reward += enemy_reward
+
+        # Penalty for death
         if done and "lives" in info and info["lives"] == 0:
-            shaped_reward -= 10.0
+            shaped_reward += self.DEATH_PENALTY
+
+        # Small time pressure penalty to encourage finishing quickly
+        shaped_reward += self.TIME_PRESSURE_PENALTY
+
+        # Update previous state
+        self.prev_score = current_score
+        self.prev_hp = current_hp
+        self.prev_x_pos = current_x_pos
+        self.prev_boss_hp = current_boss_hp
+        self.prev_stage = current_stage
+        self.prev_enemy_x = current_enemy_x.copy()
+        self.prev_enemy_actions = current_enemy_actions.copy()
+
+        # Add debugging info
+        info["shaped_reward"] = shaped_reward
+        info["current_stage"] = current_stage
+        info["player_hp"] = current_hp
+        info["player_x"] = current_x_pos
+        info["enemy_positions"] = current_enemy_x
+        info["enemy_actions"] = current_enemy_actions
 
         return obs, shaped_reward, terminated, truncated, info
+
+    def _calculate_direction_reward(self, stage, current_x, prev_x):
+        """Calculate reward for moving in the correct direction based on stage"""
+        movement = current_x - prev_x
+
+        # If no movement, no reward
+        if movement == 0:
+            return 0
+
+        # Get the correct direction for this stage
+        stage_direction = self._get_stage_direction(stage)
+
+        # If moving in the correct direction
+        if (stage_direction < 0 and movement < 0) or (
+            stage_direction > 0 and movement > 0
+        ):
+            return abs(movement) * self.PROGRESS_REWARD_SCALE
+        else:
+            # Smaller penalty for moving in wrong direction
+            return -abs(movement) * self.PROGRESS_REWARD_SCALE * 0.5
+
+    def _get_stage_direction(self, stage):
+        """Return the correct movement direction for the current stage"""
+        # Stage 1, 3, 5: Go left (decreasing X)
+        if stage in [1, 3, 5]:
+            return -1  # Left direction
+        # Stage 2, 4: Go right (increasing X)
+        elif stage in [2, 4]:
+            return 1  # Right direction
+        return 0
+
+    def _calculate_enemy_handling_reward(
+        self,
+        action,
+        player_x,
+        player_y,
+        current_enemy_x,
+        current_enemy_actions,
+        prev_enemy_x,
+        prev_enemy_actions,
+    ):
+        """Calculate rewards for handling enemies appropriately based on their direction and actions"""
+        reward = 0.0
+
+        # Determine if player used an attack action
+        is_attack_action = action in [1, 8, 9, 11, 12]  # Punch, Kick, etc.
+
+        # Track if new enemies have appeared (slots that were empty but now have enemies)
+        new_enemies_appeared = 0
+        for i in range(4):
+            if prev_enemy_x[i] == 0 and current_enemy_x[i] != 0:
+                new_enemies_appeared += 1
+
+        # Small penalty for new enemies appearing to encourage proactive enemy handling
+        if new_enemies_appeared > 0:
+            reward -= new_enemies_appeared * 0.2
+
+        for i in range(4):
+            # Skip if both current and previous positions are 0 (no enemy in this slot)
+            if current_enemy_x[i] == 0 and prev_enemy_x[i] == 0:
+                continue
+
+            # Check if enemy was defeated (was present before, now gone)
+            # This could be due to defeat or the enemy moving out of screen
+            if prev_enemy_x[i] != 0 and current_enemy_x[i] == 0:
+                # If score also increased, likely defeated an enemy
+                if self.prev_score < self._get_score(self.env.get_ram()):
+                    reward += self.ENEMY_DEFEAT_BONUS
+                continue
+
+            # Calculate enemy proximity and direction relative to player
+            if current_enemy_x[i] != 0:
+                enemy_distance = abs(player_x - current_enemy_x[i])
+                enemy_direction = (
+                    1 if current_enemy_x[i] > player_x else -1
+                )  # 1: enemy on right, -1: enemy on left
+
+                # Determine if enemy is approaching or retreating
+                is_approaching = False
+                if prev_enemy_x[i] != 0:  # If we have previous position data
+                    if enemy_direction < 0 and prev_enemy_x[i] > current_enemy_x[i]:
+                        is_approaching = True  # Enemy on left is moving toward player
+                    elif enemy_direction > 0 and prev_enemy_x[i] < current_enemy_x[i]:
+                        is_approaching = True  # Enemy on right is moving toward player
+
+                # Reward appropriate actions based on enemy proximity and direction
+                if enemy_distance < 30:  # Enemy is close
+                    # Reward attacking nearby enemies
+                    if is_attack_action:
+                        reward += self.ENEMY_PROXIMITY_AWARENESS
+
+                        # Extra reward for attacking an approaching enemy
+                        if is_approaching:
+                            reward += self.ENEMY_PROXIMITY_AWARENESS * 0.5
+
+                    # Reward facing the enemy (even if not attacking)
+                    elif (enemy_direction < 0 and action == 6) or (
+                        enemy_direction > 0 and action == 7
+                    ):
+                        reward += self.ENEMY_PROXIMITY_AWARENESS * 0.3
+
+                # For enemies at medium distance
+                elif enemy_distance < 60:
+                    # Smaller reward for moving toward enemies (aggressive play)
+                    if (enemy_direction < 0 and action == 6) or (
+                        enemy_direction > 0 and action == 7
+                    ):
+                        reward += 0.1
+
+                # For distant enemies, small reward for strategic positioning
+                else:
+                    # If player is in correct stage direction and moving that way
+                    stage_direction = self._get_stage_direction(self.prev_stage)
+                    if (stage_direction < 0 and action == 6) or (
+                        stage_direction > 0 and action == 7
+                    ):
+                        reward += 0.05
+
+        return reward
+
+    def _get_score(self, ram):
+        """Extract score from RAM values (5 bytes, BCD encoded)"""
+        # Start with a small initial value to avoid the risk of zero score
+        score = 1
+
+        # For games like this, often we just need a relative score change
+        # rather than the exact value, so a simplified approach is better
+
+        # Check if the score memory locations have any non-zero values
+        has_score = False
+        for addr in [0x0531, 0x0532, 0x0533, 0x0534, 0x0535]:
+            if ram[addr] > 0:
+                has_score = True
+                score += ram[addr]  # Just add the raw values
+
+        # If no score detected, return base value
+        if not has_score:
+            return 1
+
+        return score
 
 
 def make_kungfu_env(num_envs=1, is_play_mode=False):
