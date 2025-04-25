@@ -174,6 +174,7 @@ class KungFuMasterEnv(gym.Wrapper):
             current_enemy_actions,
             self.prev_enemy_x,
             self.prev_enemy_actions,
+            current_stage,  # Pass current stage to enemy handling
         )
         shaped_reward += enemy_reward
 
@@ -200,6 +201,7 @@ class KungFuMasterEnv(gym.Wrapper):
         info["player_x"] = current_x_pos
         info["enemy_positions"] = current_enemy_x
         info["enemy_actions"] = current_enemy_actions
+        info["stage_direction"] = self._get_stage_direction(current_stage)
 
         return obs, shaped_reward, terminated, truncated, info
 
@@ -264,12 +266,24 @@ class KungFuMasterEnv(gym.Wrapper):
         current_enemy_actions,
         prev_enemy_x,
         prev_enemy_actions,
+        current_stage,  # Added current stage parameter
     ):
         """Calculate rewards for handling enemies appropriately based on their direction and actions"""
         reward = 0.0
 
+        # Get the correct stage direction
+        stage_direction = self._get_stage_direction(current_stage)
+
         # Determine if player used an attack action
         is_attack_action = action in [1, 8, 9, 11, 12]  # Punch, Kick, etc.
+
+        # For appropriate direction facing, we'll reward facing the correct way
+        # For stages where we go left (1,3,5), reward LEFT action
+        # For stages where we go right (2,4), reward RIGHT action
+        if (stage_direction < 0 and action == 6) or (
+            stage_direction > 0 and action == 7
+        ):
+            reward += 0.2  # Reward for facing the correct direction for the stage
 
         # Track if new enemies have appeared (slots that were empty but now have enemies)
         new_enemies_appeared = 0
@@ -305,11 +319,11 @@ class KungFuMasterEnv(gym.Wrapper):
                 # Determine if enemy is approaching or retreating
                 is_approaching = False
                 if prev_enemy_x[i] != 0:  # If we have previous position data
-                    prev_dist = self._safe_subtract(prev_enemy_x[i], player_x)
-                    curr_dist = self._safe_subtract(current_enemy_x[i], player_x)
+                    prev_dist = abs(self._safe_subtract(prev_enemy_x[i], player_x))
+                    curr_dist = abs(self._safe_subtract(current_enemy_x[i], player_x))
 
                     # Check if distance is decreasing (approaching)
-                    if abs(curr_dist) < abs(prev_dist):
+                    if curr_dist < prev_dist:
                         is_approaching = True
 
                 # Reward appropriate actions based on enemy proximity and direction
@@ -339,7 +353,6 @@ class KungFuMasterEnv(gym.Wrapper):
                 # For distant enemies, small reward for strategic positioning
                 else:
                     # If player is in correct stage direction and moving that way
-                    stage_direction = self._get_stage_direction(self.prev_stage)
                     if (stage_direction < 0 and action == 6) or (
                         stage_direction > 0 and action == 7
                     ):
@@ -456,19 +469,52 @@ def play_game(env, model, episodes=5):
     print(f"Observation shape during play: {obs.shape}")  # Should show stacked frames
 
     for episode in range(episodes):
-        done = False
+        done = [False]  # Initialize as list for vectorized env
         total_reward = 0
         step = 0
 
+        # Track the current stage for directional logic
+        current_stage = 1  # Default to stage 1 at start
+
         while not any(done):
-            # Use deterministic actions for gameplay
+            # Get the model's predicted action
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
+
+            # Apply stage-specific logic to prioritize correct directional movement
+            info = env.get_attr("unwrapped")[0]  # Get wrapped env info
+            if hasattr(info, "get_ram"):
+                try:
+                    # Try to get current stage from RAM
+                    ram = info.get_ram()
+                    current_stage = int(ram[0x0058])
+
+                    # Get stage direction
+                    stage_direction = -1 if current_stage in [1, 3, 5] else 1
+
+                    # Override with directional movement if no enemy is close
+                    # This prioritizes correct stage movement
+                    if stage_direction < 0:  # Should move left
+                        # Check if the model wants to go right, if so, override to left
+                        if action[0] == 7:  # RIGHT action
+                            print("Overriding RIGHT to LEFT for stage", current_stage)
+                            action[0] = 6  # LEFT action
+                    elif stage_direction > 0:  # Should move right
+                        # Check if the model wants to go left, if so, override to right
+                        if action[0] == 6:  # LEFT action
+                            print("Overriding LEFT to RIGHT for stage", current_stage)
+                            action[0] = 7  # RIGHT action
+                except Exception as e:
+                    print(f"Error reading stage info: {e}")
+
+            # Handle API differences between Gymnasium and stable-baselines3 VecEnv
+            # VecEnv still uses the older format: obs, reward, done, info
+            obs, reward, done, info = env.step(action)
 
             # Display action being taken
             action_name = KUNGFU_ACTION_NAMES[action[0]]
-            print(f"Step: {step}, Action: {action_name}, Reward: {reward[0]}")
+            print(
+                f"Step: {step}, Action: {action_name}, Reward: {reward[0]}, Stage: {current_stage}"
+            )
 
             total_reward += reward[0]
             step += 1
