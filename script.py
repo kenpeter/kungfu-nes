@@ -820,10 +820,10 @@ def train_model(model, timesteps):
 
     # Create the improved callback
     improved_callback = ImprovedKungFuModelCallback(
-        check_freq=10000,
+        check_freq=5000,
         model_dir=model_dir,
         verbose=1,
-        moving_avg_window=50,  # Track performance over 50 episodes
+        moving_avg_window=20,  # Track performance over 50 episodes
         checkpoint_freq=100000,  # Save checkpoint every 100k steps
         min_steps_between_saves=50000,  # Prevent saving too frequently
     )
@@ -921,14 +921,13 @@ def play_game(env, model, episodes=5):
                 except Exception as e:
                     print(f"Error reading RAM: {e}")
 
-            # PHASE 1: Handle start screen by pressing START only when needed
+            # PHASE 1: Handle start screen - REMOVED CODE FOR PRESSING START
+            # We're letting the environment handle the start button press
             if in_start_screen:
-                # Only press START periodically, not constantly
+                # Set a NO-OP action when in start screen
+                action[0] = 0  # NO-OP action
                 if start_screen_counter % 30 == 0:
-                    action[0] = 3  # START action
-                    print("Pressing START to begin gameplay")
-                else:
-                    action[0] = 0  # NO-OP most of the time
+                    print("In start screen - waiting for environment to press START")
 
             # PHASE 2: Actual gameplay - fix the agent's behavior
             else:
@@ -988,12 +987,8 @@ def play_game(env, model, episodes=5):
                         action[0] = 6  # Force LEFT
 
                 # If model isn't using combat actions or moving, override occasionally
-                if step % 5 == 0 and action[0] in [
-                    0,
-                    3,
-                    4,
-                    5,
-                ]:  # No-op, START, UP, DOWN
+                # IMPORTANT: Removed START from this check to prevent accidental START presses
+                if step % 5 == 0 and action[0] in [0, 4, 5]:  # No-op, UP, DOWN
                     # Randomly pick an action that would be useful (attack or move in correct direction)
                     useful_actions = [1, 8, 9]  # Basic attacks
                     if stage_direction < 0:
@@ -1011,6 +1006,11 @@ def play_game(env, model, episodes=5):
                 # If we're doing a normal attack reset the steps_since_attack counter
                 if action[0] in [1, 8, 9, 11, 12]:  # Punch, Kick, etc.
                     steps_since_attack = 0
+
+            # Ensure the agent NEVER presses START (action index 3)
+            if action[0] == 3:  # START action
+                action[0] = 0  # Replace with NO-OP
+                print("Prevented agent from pressing START button")
 
             # Track action frequencies (after all modifications)
             action_counts[action[0]] += 1
