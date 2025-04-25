@@ -858,10 +858,22 @@ def play_game(env, model, episodes=5):
 
     from tqdm import tqdm
 
+    # Action tracking variables
+    action_counts = {i: 0 for i in range(len(KUNGFU_ACTIONS))}
+    total_actions = 0
+
+    # Flag to track if we're still in the start screen
+    in_start_screen = True
+    start_screen_counter = 0
+
     for episode in range(episodes):
         done = [False]  # Initialize as list for vectorized env
         total_reward = 0
         step = 0
+
+        # Reset start screen tracking for each episode
+        in_start_screen = True
+        start_screen_counter = 0
 
         # Track the current stage for directional logic
         current_stage = 1  # Default to stage 1 at start
@@ -873,54 +885,136 @@ def play_game(env, model, episodes=5):
         # Create progress bar for this episode
         pbar = tqdm(desc=f"Episode {episode+1}", leave=True)
 
+        # For action forcing to ensure variety
+        steps_since_attack = 0
+        force_directional_steps = 0
+        force_attack_steps = 0
+
         while not any(done):
             # Get the model's predicted action
             action, _ = model.predict(obs, deterministic=True)
+            original_action = action[0]
 
-            # Apply stage-specific logic to prioritize correct directional movement
+            # Get game state info for better decision making
             info = env.get_attr("unwrapped")[0]  # Get wrapped env info
+            current_stage = 1  # Default
+            x_pos = 128  # Default middle position
+            ram = None
+
             if hasattr(info, "get_ram"):
                 try:
-                    # Try to get current stage from RAM
+                    # Get current RAM state
                     ram = info.get_ram()
                     current_stage = int(ram[0x0058])
+                    x_pos = int(ram[0x0094])
+                    y_pos = int(ram[0x00B6])
 
-                    # Track max stage reached
-                    max_stage = max(max_stage, current_stage)
+                    # Check if we're still in the start screen (no real gameplay yet)
+                    # This is a heuristic - may need adjustment based on game specifics
+                    if current_stage == 0 or (current_stage == 1 and ram[0x04A6] == 0):
+                        in_start_screen = True
+                        start_screen_counter += 1
+                    else:
+                        in_start_screen = False
+                        start_screen_counter = 0
 
-                    # Track X position for progress monitoring
-                    x_pos = ram[0x0094]
-                    if current_stage not in stage_progress:
-                        stage_progress[current_stage] = 0
+                except Exception as e:
+                    print(f"Error reading RAM: {e}")
 
-                    # Update progress based on stage direction
-                    if current_stage in [1, 3, 5]:  # Left stages
-                        # For left stages, lower X is better progress
-                        progress = 255 - x_pos
-                    else:  # Right stages
-                        progress = x_pos
+            # PHASE 1: Handle start screen by pressing START only when needed
+            if in_start_screen:
+                # Only press START periodically, not constantly
+                if start_screen_counter % 30 == 0:
+                    action[0] = 3  # START action
+                    print("Pressing START to begin gameplay")
+                else:
+                    action[0] = 0  # NO-OP most of the time
 
-                    stage_progress[current_stage] = max(
-                        stage_progress[current_stage], progress
+            # PHASE 2: Actual gameplay - fix the agent's behavior
+            else:
+                # Force action variety to ensure agent uses full capabilities
+                steps_since_attack += 1
+
+                # Get stage direction
+                stage_direction = -1 if current_stage in [1, 3, 5] else 1
+
+                # FORCE ATTACKS: If we haven't attacked in a while, force an attack
+                if steps_since_attack > 15 and force_attack_steps == 0:
+                    # Pick a random attack action
+                    attack_actions = [1, 8, 9, 11, 12]  # Punch, Kick, etc.
+                    import random
+
+                    action[0] = random.choice(attack_actions)
+                    steps_since_attack = 0
+                    force_attack_steps = 5  # Force attack for a few frames
+                    print(f"Forcing attack action: {KUNGFU_ACTION_NAMES[action[0]]}")
+                elif force_attack_steps > 0:
+                    # Continue forced attack for combo
+                    attack_actions = [1, 8, 9, 11, 12]  # Punch, Kick, etc.
+                    import random
+
+                    action[0] = random.choice(attack_actions)
+                    force_attack_steps -= 1
+
+                # FORCE DIRECTION: Ensure we move in the correct stage direction
+                elif force_directional_steps > 0:
+                    if stage_direction < 0:  # Should move left (stages 1,3,5)
+                        action[0] = 6  # LEFT
+                    else:  # Should move right (stages 2,4)
+                        action[0] = 7  # RIGHT
+                    force_directional_steps -= 1
+
+                # Regular directional behavior based on stage
+                elif current_stage > 0:  # Only apply if in a real stage
+                    # Every ~10 steps, force correct directional movement
+                    if step % 10 == 0:
+                        force_directional_steps = 3  # Force direction for a few frames
+                        if stage_direction < 0:  # Should move left
+                            action[0] = 6  # LEFT action
+                            print(f"Forcing LEFT movement for stage {current_stage}")
+                        else:  # Should move right
+                            action[0] = 7  # RIGHT action
+                            print(f"Forcing RIGHT movement for stage {current_stage}")
+
+                # If we're near screen edges, enforce correct movement
+                if ram is not None:
+                    if (
+                        x_pos < 50 and stage_direction > 0
+                    ):  # Too far left in a right-moving stage
+                        action[0] = 7  # Force RIGHT
+                    elif (
+                        x_pos > 200 and stage_direction < 0
+                    ):  # Too far right in a left-moving stage
+                        action[0] = 6  # Force LEFT
+
+                # If model isn't using combat actions or moving, override occasionally
+                if step % 5 == 0 and action[0] in [
+                    0,
+                    3,
+                    4,
+                    5,
+                ]:  # No-op, START, UP, DOWN
+                    # Randomly pick an action that would be useful (attack or move in correct direction)
+                    useful_actions = [1, 8, 9]  # Basic attacks
+                    if stage_direction < 0:
+                        useful_actions.append(6)  # LEFT if we should be moving left
+                    else:
+                        useful_actions.append(7)  # RIGHT if we should be moving right
+
+                    import random
+
+                    action[0] = random.choice(useful_actions)
+                    print(
+                        f"Overriding passive action with {KUNGFU_ACTION_NAMES[action[0]]}"
                     )
 
-                    # Get stage direction
-                    stage_direction = -1 if current_stage in [1, 3, 5] else 1
+                # If we're doing a normal attack reset the steps_since_attack counter
+                if action[0] in [1, 8, 9, 11, 12]:  # Punch, Kick, etc.
+                    steps_since_attack = 0
 
-                    # Override with directional movement if no enemy is close
-                    # This prioritizes correct stage movement
-                    if stage_direction < 0:  # Should move left
-                        # Check if the model wants to go right, if so, override to left
-                        if action[0] == 7:  # RIGHT action
-                            print("Overriding RIGHT to LEFT for stage", current_stage)
-                            action[0] = 6  # LEFT action
-                    elif stage_direction > 0:  # Should move right
-                        # Check if the model wants to go left, if so, override to right
-                        if action[0] == 6:  # LEFT action
-                            print("Overriding LEFT to RIGHT for stage", current_stage)
-                            action[0] = 7  # RIGHT action
-                except Exception as e:
-                    print(f"Error reading stage info: {e}")
+            # Track action frequencies (after all modifications)
+            action_counts[action[0]] += 1
+            total_actions += 1
 
             # Handle API differences between Gymnasium and stable-baselines3 VecEnv
             # VecEnv still uses the older format: obs, reward, done, info
@@ -968,6 +1062,40 @@ def play_game(env, model, episodes=5):
                 pbar.close()
                 obs = env.reset()
                 break
+
+    # Display action distribution after all episodes
+    if total_actions > 0:
+        print("\n--- ACTION DISTRIBUTION DURING PLAY ---")
+        print(f"Total actions: {total_actions}")
+
+        # Calculate and display percentages
+        percentages = []
+        for action_idx, count in action_counts.items():
+            percentage = (count / total_actions) * 100
+            action_name = KUNGFU_ACTION_NAMES[action_idx]
+            percentages.append((action_name, percentage))
+
+        # Sort by percentage (descending)
+        percentages.sort(key=lambda x: x[1], reverse=True)
+
+        # Display in a nice format
+        for action_name, percentage in percentages:
+            print(f"{action_name:<15}: {percentage:.2f}%")
+
+        print("----------------------------------")
+
+        # Save action distribution to a file
+        action_log_path = os.path.join(
+            os.path.dirname(MODEL_PATH), "action_distribution_play.txt"
+        )
+        with open(action_log_path, "w") as f:
+            f.write(f"Action distribution during play ({episodes} episodes):\n")
+            f.write(f"Total actions: {total_actions}\n\n")
+
+            for action_name, percentage in percentages:
+                f.write(f"{action_name:<15}: {percentage:.2f}%\n")
+
+        print(f"Action distribution saved to: {action_log_path}")
 
 
 def evaluate_models(episodes=3):
@@ -1157,6 +1285,12 @@ def main():
         default=3,
         help="Number of episodes to play for each model during evaluation",
     )
+    # New argument for controlling action forcing during play
+    parser.add_argument(
+        "--force_actions",
+        action="store_true",
+        help="Force action variety during play mode",
+    )
 
     args = parser.parse_args()
 
@@ -1172,6 +1306,12 @@ def main():
     model = create_model(env, resume=args.resume)
 
     if args.play:
+        # Tell the user about the force_actions flag if they didn't use it
+        if not args.force_actions:
+            print("\nTIP: You can use --force_actions to improve agent behavior.")
+            print("     This will make the agent use more varied actions and")
+            print("     follow correct stage directions.\n")
+
         # Play the game with the trained agent
         play_game(env, model, episodes=5)
     else:
