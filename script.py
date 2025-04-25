@@ -455,7 +455,31 @@ def create_model(env, resume=False):
 def train_model(model, timesteps):
     """Train the model"""
     print(f"Training for {timesteps} timesteps...")
-    model.learn(total_timesteps=timesteps)
+
+    # Define callback for progress bar
+    from stable_baselines3.common.callbacks import BaseCallback
+    from tqdm import tqdm
+
+    class ProgressBarCallback(BaseCallback):
+        def __init__(self, total_timesteps):
+            super(ProgressBarCallback, self).__init__()
+            self.pbar = None
+            self.total_timesteps = total_timesteps
+
+        def _on_training_start(self):
+            self.pbar = tqdm(total=self.total_timesteps, desc="Training progress")
+
+        def _on_step(self):
+            self.pbar.update(self.training_env.num_envs)
+            return True
+
+        def _on_training_end(self):
+            self.pbar.close()
+            self.pbar = None
+
+    # Create and use the progress bar callback
+    progress_callback = ProgressBarCallback(timesteps)
+    model.learn(total_timesteps=timesteps, callback=progress_callback)
 
     # Save the final model
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
@@ -468,6 +492,8 @@ def play_game(env, model, episodes=5):
     obs = env.reset()
     print(f"Observation shape during play: {obs.shape}")  # Should show stacked frames
 
+    from tqdm import tqdm
+
     for episode in range(episodes):
         done = [False]  # Initialize as list for vectorized env
         total_reward = 0
@@ -475,6 +501,9 @@ def play_game(env, model, episodes=5):
 
         # Track the current stage for directional logic
         current_stage = 1  # Default to stage 1 at start
+
+        # Create progress bar for this episode
+        pbar = tqdm(desc=f"Episode {episode+1}", leave=True)
 
         while not any(done):
             # Get the model's predicted action
@@ -512,15 +541,21 @@ def play_game(env, model, episodes=5):
 
             # Display action being taken
             action_name = KUNGFU_ACTION_NAMES[action[0]]
-            print(
-                f"Step: {step}, Action: {action_name}, Reward: {reward[0]}, Stage: {current_stage}"
+
+            # Update progress bar description with current info
+            pbar.set_description(
+                f"Episode {episode+1} | Step: {step} | Action: {action_name} | Reward: {reward[0]:.2f} | Stage: {current_stage}"
             )
+            pbar.update(1)
 
             total_reward += reward[0]
             step += 1
 
             if any(done):
-                print(f"Episode {episode+1} finished with total reward: {total_reward}")
+                print(
+                    f"\nEpisode {episode+1} finished with total reward: {total_reward:.2f}"
+                )
+                pbar.close()
                 obs = env.reset()
                 break
 
@@ -560,6 +595,16 @@ def main():
 
 
 if __name__ == "__main__":
+    # Make sure required libraries are installed
+    try:
+        import tqdm
+    except ImportError:
+        print("Installing tqdm for progress bars...")
+        import subprocess
+
+        subprocess.check_call(["pip", "install", "tqdm"])
+        print("tqdm installed successfully.")
+
     # Make sure cuda is enabled by default if available
     if torch.cuda.is_available():
         print("CUDA is available! Training will use GPU.")
