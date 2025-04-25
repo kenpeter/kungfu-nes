@@ -453,12 +453,14 @@ def create_model(env, resume=False):
 
 
 def train_model(model, timesteps):
-    """Train the model"""
+    """Train the model with best model saving based on progress and performance"""
     print(f"Training for {timesteps} timesteps...")
 
-    # Define callback for progress bar
-    from stable_baselines3.common.callbacks import BaseCallback
+    # Define callbacks for progress bar and best model saving
+    from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+    from stable_baselines3.common.vec_env import VecMonitor
     from tqdm import tqdm
+    import numpy as np
 
     class ProgressBarCallback(BaseCallback):
         def __init__(self, total_timesteps):
@@ -477,14 +479,142 @@ def train_model(model, timesteps):
             self.pbar.close()
             self.pbar = None
 
-    # Create and use the progress bar callback
-    progress_callback = ProgressBarCallback(timesteps)
-    model.learn(total_timesteps=timesteps, callback=progress_callback)
+    class KungFuBestModelCallback(BaseCallback):
+        """Custom callback to save best model based on game progress and reward"""
 
-    # Save the final model
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    model.save(MODEL_PATH)
-    print(f"Model saved to {MODEL_PATH}")
+        def __init__(self, check_freq=10000, best_model_save_path=None, verbose=1):
+            super(KungFuBestModelCallback, self).__init__(verbose)
+            self.check_freq = check_freq
+            self.best_model_save_path = best_model_save_path
+
+            # Initialize best metrics tracking
+            self.best_reward = -np.inf
+            self.best_progress = -np.inf
+            self.best_weighted_score = -np.inf
+
+            # Track metrics from environment
+            self.cum_reward = 0
+            self.max_stage = 1
+            self.best_x_progress_by_stage = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+
+        def _on_step(self):
+            # Log rewards and progress
+            if (
+                len(self.model.ep_info_buffer) > 0
+                and len(self.model.ep_info_buffer[-1]) > 0
+            ):
+                # Get info from latest step
+                for env_idx in range(self.training_env.num_envs):
+                    try:
+                        info = self.locals["infos"][env_idx]
+
+                        # Track cumulative reward
+                        if "shaped_reward" in info:
+                            self.cum_reward += info["shaped_reward"]
+
+                        # Track stage progress
+                        if "current_stage" in info:
+                            stage = info["current_stage"]
+                            self.max_stage = max(self.max_stage, stage)
+
+                            # Track X progress based on direction for each stage
+                            if "player_x" in info:
+                                x_pos = info["player_x"]
+                                # For stages 1,3,5 progress is left (decreasing X)
+                                # For stages 2,4 progress is right (increasing X)
+                                if stage in [1, 3, 5]:
+                                    # Convert to a progress value (invert since lower is better)
+                                    progress = 255 - x_pos
+                                else:
+                                    progress = x_pos
+
+                                self.best_x_progress_by_stage[stage] = max(
+                                    self.best_x_progress_by_stage.get(stage, 0),
+                                    progress,
+                                )
+                    except (KeyError, IndexError):
+                        pass
+
+            # Check if it's time to evaluate model and save if better
+            if self.n_calls % self.check_freq == 0:
+                # Calculate current weighted score
+                # Stage progress (60%), X position (30%), reward (10%)
+
+                # Get normalized X progress score (average across stages encountered)
+                x_progress_scores = []
+                for stage in range(1, self.max_stage + 1):
+                    if stage in self.best_x_progress_by_stage:
+                        # Normalize to 0-1 range
+                        if stage in [1, 3, 5]:  # Left stages
+                            norm_progress = self.best_x_progress_by_stage[stage] / 255
+                        else:  # Right stages
+                            norm_progress = self.best_x_progress_by_stage[stage] / 255
+                        x_progress_scores.append(norm_progress)
+
+                avg_x_progress = (
+                    sum(x_progress_scores) / len(x_progress_scores)
+                    if x_progress_scores
+                    else 0
+                )
+
+                # Calculate weighted score
+                weighted_score = (
+                    0.6 * self.max_stage  # Stage progress (max weight)
+                    + 0.3 * avg_x_progress  # X position progress
+                    + 0.1
+                    * min(1.0, self.cum_reward / 1000)  # Normalized reward (cap at 1.0)
+                )
+
+                # Check if this is the best model
+                if weighted_score > self.best_weighted_score:
+                    self.best_weighted_score = weighted_score
+                    self.best_progress = self.max_stage
+                    self.best_reward = self.cum_reward
+
+                    # Save the best model
+                    if self.best_model_save_path is not None:
+                        path = os.path.join(self.best_model_save_path, "best_model")
+                        self.model.save(path)
+                        if self.verbose > 0:
+                            print(f"Saving new best model to {path}.zip")
+                            print(
+                                f"New best metrics: Stage={self.max_stage}, "
+                                f"X-Progress={avg_x_progress:.2f}, "
+                                f"Reward={self.cum_reward:.2f}"
+                            )
+
+                # Reset cumulative metrics for next evaluation window
+                self.cum_reward = 0
+
+            return True
+
+    # Create directory for best model
+    best_model_dir = os.path.dirname(MODEL_PATH)
+    os.makedirs(best_model_dir, exist_ok=True)
+
+    # Create callbacks
+    best_model_callback = KungFuBestModelCallback(
+        check_freq=10000, best_model_save_path=best_model_dir, verbose=1
+    )
+
+    progress_callback = ProgressBarCallback(timesteps)
+
+    # Train the model with callbacks
+    model.learn(
+        total_timesteps=timesteps, callback=[progress_callback, best_model_callback]
+    )
+
+    # Copy best model to final model path or save final model
+    best_model_path = os.path.join(best_model_dir, "best_model.zip")
+    if os.path.exists(best_model_path):
+        import shutil
+
+        shutil.copy(best_model_path, MODEL_PATH)
+        print(f"Best model saved to {MODEL_PATH}")
+    else:
+        # If no best model was saved, save the final model
+        model.save(MODEL_PATH)
+        print(f"Final model saved to {MODEL_PATH}")
 
 
 def play_game(env, model, episodes=5):
