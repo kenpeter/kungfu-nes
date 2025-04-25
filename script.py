@@ -140,8 +140,8 @@ class KungFuMasterEnv(gym.Wrapper):
         # Base reward from the game
         shaped_reward += reward
 
-        # Reward for score increase (safe subtraction)
-        score_diff = max(0, current_score - self.prev_score)  # Ensure non-negative
+        # Reward for score increase (safe subtraction using our helper method)
+        score_diff = self._safe_subtract(current_score, self.prev_score)
         if score_diff > 0:
             shaped_reward += score_diff * self.SCORE_REWARD_SCALE
 
@@ -497,7 +497,27 @@ def train_model(model, timesteps):
             self.max_stage = 1
             self.best_x_progress_by_stage = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
 
+            # Track action distribution
+            self.action_counts = {i: 0 for i in range(len(KUNGFU_ACTIONS))}
+            self.total_actions = 0
+            self.last_log_step = 0
+            self.action_log_freq = 5000  # Log action percentages every 5000 steps
+
         def _on_step(self):
+            # Track actions taken
+            for env_idx in range(self.training_env.num_envs):
+                try:
+                    action = self.locals["actions"][env_idx]
+                    self.action_counts[action] += 1
+                    self.total_actions += 1
+                except (KeyError, IndexError):
+                    pass
+
+            # Log action distribution periodically
+            if self.n_calls - self.last_log_step >= self.action_log_freq:
+                self._log_action_percentages()
+                self.last_log_step = self.n_calls
+
             # Log rewards and progress
             if (
                 len(self.model.ep_info_buffer) > 0
@@ -583,10 +603,37 @@ def train_model(model, timesteps):
                                 f"Reward={self.cum_reward:.2f}"
                             )
 
+                    # Log action percentages when saving best model
+                    self._log_action_percentages()
+
                 # Reset cumulative metrics for next evaluation window
                 self.cum_reward = 0
 
             return True
+
+        def _log_action_percentages(self):
+            """Log the percentage of each action taken during training"""
+            if self.total_actions == 0:
+                return
+
+            print("\n--- ACTION DISTRIBUTION ---")
+            print(f"Total actions: {self.total_actions}")
+
+            # Calculate and display percentages
+            percentages = []
+            for action_idx, count in self.action_counts.items():
+                percentage = (count / self.total_actions) * 100
+                action_name = KUNGFU_ACTION_NAMES[action_idx]
+                percentages.append((action_name, percentage))
+
+            # Sort by percentage (descending)
+            percentages.sort(key=lambda x: x[1], reverse=True)
+
+            # Display in a nice format
+            for action_name, percentage in percentages:
+                print(f"{action_name:<15}: {percentage:.2f}%")
+
+            print("---------------------------\n")
 
     # Create directory for best model
     best_model_dir = os.path.dirname(MODEL_PATH)
