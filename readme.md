@@ -1,9 +1,9 @@
 
 
-python script.py train --timesteps 10000
+python script.py --timesteps 1000 --resume
 
 
-python script.py play
+python script.py --play
 
 ===
 

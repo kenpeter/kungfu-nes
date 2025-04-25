@@ -3,7 +3,7 @@ import os
 import numpy as np
 import torch
 import zipfile
-import retro
+import retro  # stabl retro, not open ai retro
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import (
     SubprocVecEnv,
