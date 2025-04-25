@@ -135,6 +135,7 @@ def create_model(env, resume=False):
             n_epochs=10,
             gamma=0.99,
             device="cuda" if torch.cuda.is_available() else "cpu",
+            tensorboard_log=None,  # Explicitly disable tensorboard
         )
 
     return model
