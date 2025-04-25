@@ -1,121 +1,23 @@
 
 
-python script.py --timesteps 1000 --resume
+python script.py --timesteps 10000 --num_envs 4
 
 
 python script.py --play
 
-===
 
-python train.py --num_envs 4 --cuda --progress_bar --timesteps 10000
 
 
 
+best model
+python script.py --eval --eval_episodes 5
 
 
 
-python train.py --num_envs 4 --cuda --progress_bar --timesteps 10000 --resume
 
 
 
 
-python train.py --num_envs 4 --npz_dir recordings_filtered --cuda --progress_bar --timesteps 10000 --resume
-
-
-
-
-
-nohup python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timesteps 400000 --resume & 
-
-
-tail -f nohup.out  # Check output (if still writing, it's running)
-ps aux | grep "long-task.sh"  # Check if process exists
-
-
-
-
-
-
-
-python train.py  --cuda --progress_bar --timesteps 50 --resume --render
-
-
-
-
-
-
-
-
-
-
-python playback.py recordings/KungFu-Nes_1Player.Level1_k.back.npz
-python playback.py recordings/KungFu-Nes_1Player.Level1_k.punch.npz
-
-
-
-
-
-
-python playback.py recordings/your_recording.npz --speed 0.5  # Half speed
-python playback.py recordings/your_recording.npz --speed 2.0  # Double speed
-
-
-
-
-
-
-
-
-==
-
-
-
-python -c "import gym; print(gym.__version__)"
-
-
-
-
-python capture_state.py --state_file knife_state.state --enable_file_logging
-
-
-
-
-
-
-
-
-
-
-
-python script.py --train --render --num_envs 1 --timesteps 5000 --enable_file_logging
-
-
-
-
-python script.py --train --render --num_envs 1 --timesteps 2000 --state_only --state_file knife_state.state --resume --enable_file_logging
-
-
-python script.py --train --render --num_envs 1 --timesteps 5000 --resume --enable_file_logging
-
-
-python train.py --play --render --enable_file_logging
-
-
-python train.py --play --render --state_only --state_file knife_state.state --enable_file_logging
-
-==
-
-
-
-
-
-===
-
-python train.py --num_envs 4 --npz_dir recordings --cuda --progress_bar --timesteps 10000
-
-
-
-requirements for reward function:
 
 
 

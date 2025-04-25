@@ -1,12 +1,17 @@
 import os
+import sys
 import argparse
 import numpy as np
 import retro
 import torch
+import stable_baselines3
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback
 import gymnasium as gym
+from datetime import datetime
+from tqdm import tqdm
 
 # Define the Kung Fu Master action space
 KUNGFU_ACTIONS = [
@@ -452,214 +457,396 @@ def create_model(env, resume=False):
     return model
 
 
+class ProgressBarCallback(BaseCallback):
+    def __init__(self, total_timesteps):
+        super(ProgressBarCallback, self).__init__()
+        self.pbar = None
+        self.total_timesteps = total_timesteps
+
+    def _on_training_start(self):
+        self.pbar = tqdm(total=self.total_timesteps, desc="Training progress")
+
+    def _on_step(self):
+        self.pbar.update(self.training_env.num_envs)
+        return True
+
+    def _on_training_end(self):
+        self.pbar.close()
+        self.pbar = None
+
+
+class ImprovedKungFuModelCallback(BaseCallback):
+    """
+    Advanced callback for Kung Fu Master RL training that implements a hybrid model saving strategy:
+    1. Moving average performance tracking
+    2. Periodic checkpoints
+    3. Best model tracking based on weighted metrics
+    4. Protection against saving models that overfit to lucky episodes
+    """
+
+    def __init__(
+        self,
+        check_freq=10000,
+        model_dir="model",
+        verbose=1,
+        moving_avg_window=100,
+        checkpoint_freq=100000,  # Save checkpoint every 100k steps
+        min_steps_between_saves=50000,  # Prevent saving too frequently
+    ):
+        super(ImprovedKungFuModelCallback, self).__init__(verbose)
+        self.check_freq = check_freq
+        self.model_dir = model_dir
+        self.moving_avg_window = moving_avg_window
+        self.checkpoint_freq = checkpoint_freq
+        self.min_steps_between_saves = min_steps_between_saves
+
+        # Create directories
+        os.makedirs(os.path.join(self.model_dir, "checkpoints"), exist_ok=True)
+        os.makedirs(os.path.join(self.model_dir, "best_models"), exist_ok=True)
+
+        # Initialize best metrics tracking
+        self.best_reward = -np.inf
+        self.best_progress = -np.inf
+        self.best_weighted_score = -np.inf
+        self.best_moving_avg_reward = -np.inf
+
+        # Track the last step when we saved a model
+        self.last_save_step = 0
+
+        # Moving average tracking
+        self.episode_rewards = []
+        self.episode_stages = []
+        self.episode_metrics = []  # Store complete metrics for each episode
+
+        # Current episode tracking
+        self.current_ep_reward = 0
+        self.current_ep_max_stage = 1
+        self.current_ep_x_progress_by_stage = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        self.ep_start_step = 0
+
+        # Track action distribution
+        self.action_counts = {i: 0 for i in range(len(KUNGFU_ACTIONS))}
+        self.total_actions = 0
+        self.last_log_step = 0
+        self.action_log_freq = 5000
+
+    def _on_training_start(self):
+        # Create timestamp for this training run
+        from datetime import datetime
+
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Log training start
+        print(f"Training started at {self.timestamp}")
+        print(f"Model directory: {self.model_dir}")
+        print(f"Moving average window: {self.moving_avg_window} episodes")
+        print(f"Checkpoint frequency: {self.checkpoint_freq} steps")
+
+        # Initialize episode tracking
+        self.ep_start_step = self.n_calls
+
+    def _on_step(self):
+        # Track actions taken
+        for env_idx in range(self.training_env.num_envs):
+            try:
+                action = self.locals["actions"][env_idx]
+                self.action_counts[action] += 1
+                self.total_actions += 1
+            except (KeyError, IndexError):
+                pass
+
+        # Log action distribution periodically
+        if self.n_calls - self.last_log_step >= self.action_log_freq:
+            self._log_action_percentages()
+            self.last_log_step = self.n_calls
+
+        # Track episode metrics
+        for env_idx in range(self.training_env.num_envs):
+            try:
+                info = self.locals["infos"][env_idx]
+
+                # Track current episode reward
+                if "shaped_reward" in info:
+                    self.current_ep_reward += info["shaped_reward"]
+
+                # Track stage progress
+                if "current_stage" in info:
+                    stage = info["current_stage"]
+                    self.current_ep_max_stage = max(self.current_ep_max_stage, stage)
+
+                    # Track X progress based on direction for each stage
+                    if "player_x" in info:
+                        x_pos = info["player_x"]
+                        # For stages 1,3,5 progress is left (decreasing X)
+                        # For stages 2,4 progress is right (increasing X)
+                        if stage in [1, 3, 5]:
+                            # Convert to a progress value (invert since lower is better)
+                            progress = 255 - x_pos
+                        else:
+                            progress = x_pos
+
+                        self.current_ep_x_progress_by_stage[stage] = max(
+                            self.current_ep_x_progress_by_stage.get(stage, 0),
+                            progress,
+                        )
+
+                # Check if episode ended
+                done = self.locals["dones"][env_idx]
+                if done:
+                    # Calculate episode metrics
+                    ep_metrics = self._calculate_episode_metrics()
+
+                    # Store for moving average
+                    self.episode_rewards.append(self.current_ep_reward)
+                    self.episode_stages.append(self.current_ep_max_stage)
+                    self.episode_metrics.append(ep_metrics)
+
+                    # Keep only the window size
+                    if len(self.episode_rewards) > self.moving_avg_window:
+                        self.episode_rewards.pop(0)
+                        self.episode_stages.pop(0)
+                        self.episode_metrics.pop(0)
+
+                    # Log episode stats
+                    if self.verbose > 0:
+                        steps = self.n_calls - self.ep_start_step
+                        print(f"\nEpisode finished after {steps} steps:")
+                        print(f"  Reward: {self.current_ep_reward:.2f}")
+                        print(f"  Max Stage: {self.current_ep_max_stage}")
+                        print(f"  Weighted Score: {ep_metrics['weighted_score']:.4f}")
+
+                    # Reset episode tracking
+                    self.current_ep_reward = 0
+                    self.current_ep_max_stage = 1
+                    self.current_ep_x_progress_by_stage = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+                    self.ep_start_step = self.n_calls
+
+            except (KeyError, IndexError):
+                pass
+
+        # Save periodic checkpoints
+        if self.n_calls % self.checkpoint_freq == 0 and self.n_calls > 0:
+            checkpoint_path = os.path.join(
+                self.model_dir, "checkpoints", f"checkpoint_{self.n_calls:010d}.zip"
+            )
+            self.model.save(checkpoint_path)
+            if self.verbose > 0:
+                print(f"Saved periodic checkpoint to {checkpoint_path}")
+
+        # Evaluate for best model saving
+        if self.n_calls % self.check_freq == 0 and len(self.episode_metrics) > 0:
+            # Calculate moving averages
+            moving_avg_reward = np.mean([m["reward"] for m in self.episode_metrics])
+            moving_avg_stage = np.mean([m["max_stage"] for m in self.episode_metrics])
+            moving_avg_score = np.mean(
+                [m["weighted_score"] for m in self.episode_metrics]
+            )
+
+            # Log current moving averages
+            if self.verbose > 0:
+                print("\n--- MOVING AVERAGES ---")
+                print(f"Window size: {len(self.episode_metrics)} episodes")
+                print(f"Avg Reward: {moving_avg_reward:.2f}")
+                print(f"Avg Max Stage: {moving_avg_stage:.2f}")
+                print(f"Avg Weighted Score: {moving_avg_score:.4f}")
+                print("----------------------")
+
+            # Determine if we should save based on improvement and minimum time between saves
+            steps_since_last_save = self.n_calls - self.last_save_step
+
+            # Check multiple conditions for saving:
+            should_save = False
+            save_reason = ""
+
+            # 1. Check if moving average weighted score improved
+            if (
+                moving_avg_score > self.best_moving_avg_reward
+                and steps_since_last_save >= self.min_steps_between_saves
+            ):
+                should_save = True
+                save_reason = "improved moving average"
+                self.best_moving_avg_reward = moving_avg_score
+
+            # 2. Check if any episode had exceptional performance (significantly better than average)
+            if len(self.episode_metrics) >= 10:  # Only if we have enough episodes
+                recent_best = max(
+                    [m["weighted_score"] for m in self.episode_metrics[-10:]]
+                )
+                if (
+                    recent_best > self.best_weighted_score * 1.2
+                    and steps_since_last_save >= self.min_steps_between_saves
+                ):
+                    should_save = True
+                    save_reason = "exceptional recent episode"
+                    self.best_weighted_score = recent_best
+
+            # Save if conditions met
+            if should_save:
+                self.last_save_step = self.n_calls
+
+                # Save as named model with timestamp and metrics
+                best_model_path = os.path.join(
+                    self.model_dir,
+                    "best_models",
+                    f"best_model_{self.timestamp}_step{self.n_calls}_score{moving_avg_score:.4f}.zip",
+                )
+
+                # Also save as best_model.zip for convenience
+                standard_best_path = os.path.join(self.model_dir, "best_model.zip")
+
+                self.model.save(best_model_path)
+                self.model.save(standard_best_path)
+
+                if self.verbose > 0:
+                    print(f"\nSaving new best model: {save_reason}")
+                    print(f"Saved to {best_model_path}")
+                    print(f"Also saved to {standard_best_path}")
+
+                # Log action percentages when saving best model
+                self._log_action_percentages()
+
+        return True
+
+    def _calculate_episode_metrics(self):
+        """Calculate comprehensive metrics for the current episode"""
+        # Get normalized X progress score (average across stages encountered)
+        x_progress_scores = []
+        for stage in range(1, self.current_ep_max_stage + 1):
+            if stage in self.current_ep_x_progress_by_stage:
+                # Normalize to 0-1 range
+                if stage in [1, 3, 5]:  # Left stages
+                    norm_progress = self.current_ep_x_progress_by_stage[stage] / 255
+                else:  # Right stages
+                    norm_progress = self.current_ep_x_progress_by_stage[stage] / 255
+                x_progress_scores.append(norm_progress)
+
+        avg_x_progress = (
+            sum(x_progress_scores) / len(x_progress_scores) if x_progress_scores else 0
+        )
+
+        # Calculate weighted score for this episode
+        weighted_score = (
+            0.6 * self.current_ep_max_stage  # Stage progress (max weight)
+            + 0.3 * avg_x_progress  # X position progress
+            + 0.1
+            * min(1.0, self.current_ep_reward / 1000)  # Normalized reward (cap at 1.0)
+        )
+
+        return {
+            "reward": self.current_ep_reward,
+            "max_stage": self.current_ep_max_stage,
+            "avg_x_progress": avg_x_progress,
+            "weighted_score": weighted_score,
+        }
+
+    def _log_action_percentages(self):
+        """Log the percentage of each action taken during training"""
+        if self.total_actions == 0:
+            return
+
+        print("\n--- ACTION DISTRIBUTION ---")
+        print(f"Total actions: {self.total_actions}")
+
+        # Calculate and display percentages
+        percentages = []
+        for action_idx, count in self.action_counts.items():
+            percentage = (count / self.total_actions) * 100
+            action_name = KUNGFU_ACTION_NAMES[action_idx]
+            percentages.append((action_name, percentage))
+
+        # Sort by percentage (descending)
+        percentages.sort(key=lambda x: x[1], reverse=True)
+
+        # Display in a nice format
+        for action_name, percentage in percentages:
+            print(f"{action_name:<15}: {percentage:.2f}%")
+
+        print("---------------------------\n")
+
+    def _on_training_end(self):
+        """Final operations at end of training"""
+        # Save final model
+        final_model_path = os.path.join(self.model_dir, "final_model.zip")
+        self.model.save(final_model_path)
+
+        # Log summary of training
+        print("\n=== TRAINING COMPLETE ===")
+        print(f"Total steps: {self.n_calls}")
+        print(f"Best moving average score: {self.best_moving_avg_reward:.4f}")
+        print(f"Final model saved to: {final_model_path}")
+
+        # Save a performance summary
+        if len(self.episode_metrics) > 0:
+            summary_path = os.path.join(self.model_dir, "training_summary.txt")
+            with open(summary_path, "w") as f:
+                f.write(
+                    f"Training completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                f.write(f"Total steps: {self.n_calls}\n")
+                f.write(
+                    f"Final moving average (over {len(self.episode_metrics)} episodes):\n"
+                )
+                f.write(
+                    f"  Reward: {np.mean([m['reward'] for m in self.episode_metrics]):.2f}\n"
+                )
+                f.write(
+                    f"  Max Stage: {np.mean([m['max_stage'] for m in self.episode_metrics]):.2f}\n"
+                )
+                f.write(
+                    f"  Weighted Score: {np.mean([m['weighted_score'] for m in self.episode_metrics]):.4f}\n"
+                )
+
+                # Add action distribution
+                f.write("\nFinal Action Distribution:\n")
+                percentages = [
+                    (KUNGFU_ACTION_NAMES[i], (count / self.total_actions) * 100)
+                    for i, count in self.action_counts.items()
+                ]
+                percentages.sort(key=lambda x: x[1], reverse=True)
+
+                for action_name, percentage in percentages:
+                    f.write(f"  {action_name:<15}: {percentage:.2f}%\n")
+
+            print(f"Training summary saved to: {summary_path}")
+
+
 def train_model(model, timesteps):
-    """Train the model with best model saving based on progress and performance"""
+    """Train the model with improved model saving strategy"""
     print(f"Training for {timesteps} timesteps...")
 
-    # Define callbacks for progress bar and best model saving
-    from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
-    from stable_baselines3.common.vec_env import VecMonitor
-    from tqdm import tqdm
-    import numpy as np
+    # Define callbacks
+    model_dir = os.path.dirname(MODEL_PATH)
+    os.makedirs(model_dir, exist_ok=True)
 
-    class ProgressBarCallback(BaseCallback):
-        def __init__(self, total_timesteps):
-            super(ProgressBarCallback, self).__init__()
-            self.pbar = None
-            self.total_timesteps = total_timesteps
-
-        def _on_training_start(self):
-            self.pbar = tqdm(total=self.total_timesteps, desc="Training progress")
-
-        def _on_step(self):
-            self.pbar.update(self.training_env.num_envs)
-            return True
-
-        def _on_training_end(self):
-            self.pbar.close()
-            self.pbar = None
-
-    class KungFuBestModelCallback(BaseCallback):
-        """Custom callback to save best model based on game progress and reward"""
-
-        def __init__(self, check_freq=10000, best_model_save_path=None, verbose=1):
-            super(KungFuBestModelCallback, self).__init__(verbose)
-            self.check_freq = check_freq
-            self.best_model_save_path = best_model_save_path
-
-            # Initialize best metrics tracking
-            self.best_reward = -np.inf
-            self.best_progress = -np.inf
-            self.best_weighted_score = -np.inf
-
-            # Track metrics from environment
-            self.cum_reward = 0
-            self.max_stage = 1
-            self.best_x_progress_by_stage = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-
-            # Track action distribution
-            self.action_counts = {i: 0 for i in range(len(KUNGFU_ACTIONS))}
-            self.total_actions = 0
-            self.last_log_step = 0
-            self.action_log_freq = 5000  # Log action percentages every 5000 steps
-
-        def _on_step(self):
-            # Track actions taken
-            for env_idx in range(self.training_env.num_envs):
-                try:
-                    action = self.locals["actions"][env_idx]
-                    self.action_counts[action] += 1
-                    self.total_actions += 1
-                except (KeyError, IndexError):
-                    pass
-
-            # Log action distribution periodically
-            if self.n_calls - self.last_log_step >= self.action_log_freq:
-                self._log_action_percentages()
-                self.last_log_step = self.n_calls
-
-            # Log rewards and progress
-            if (
-                len(self.model.ep_info_buffer) > 0
-                and len(self.model.ep_info_buffer[-1]) > 0
-            ):
-                # Get info from latest step
-                for env_idx in range(self.training_env.num_envs):
-                    try:
-                        info = self.locals["infos"][env_idx]
-
-                        # Track cumulative reward
-                        if "shaped_reward" in info:
-                            self.cum_reward += info["shaped_reward"]
-
-                        # Track stage progress
-                        if "current_stage" in info:
-                            stage = info["current_stage"]
-                            self.max_stage = max(self.max_stage, stage)
-
-                            # Track X progress based on direction for each stage
-                            if "player_x" in info:
-                                x_pos = info["player_x"]
-                                # For stages 1,3,5 progress is left (decreasing X)
-                                # For stages 2,4 progress is right (increasing X)
-                                if stage in [1, 3, 5]:
-                                    # Convert to a progress value (invert since lower is better)
-                                    progress = 255 - x_pos
-                                else:
-                                    progress = x_pos
-
-                                self.best_x_progress_by_stage[stage] = max(
-                                    self.best_x_progress_by_stage.get(stage, 0),
-                                    progress,
-                                )
-                    except (KeyError, IndexError):
-                        pass
-
-            # Check if it's time to evaluate model and save if better
-            if self.n_calls % self.check_freq == 0:
-                # Calculate current weighted score
-                # Stage progress (60%), X position (30%), reward (10%)
-
-                # Get normalized X progress score (average across stages encountered)
-                x_progress_scores = []
-                for stage in range(1, self.max_stage + 1):
-                    if stage in self.best_x_progress_by_stage:
-                        # Normalize to 0-1 range
-                        if stage in [1, 3, 5]:  # Left stages
-                            norm_progress = self.best_x_progress_by_stage[stage] / 255
-                        else:  # Right stages
-                            norm_progress = self.best_x_progress_by_stage[stage] / 255
-                        x_progress_scores.append(norm_progress)
-
-                avg_x_progress = (
-                    sum(x_progress_scores) / len(x_progress_scores)
-                    if x_progress_scores
-                    else 0
-                )
-
-                # Calculate weighted score
-                weighted_score = (
-                    0.6 * self.max_stage  # Stage progress (max weight)
-                    + 0.3 * avg_x_progress  # X position progress
-                    + 0.1
-                    * min(1.0, self.cum_reward / 1000)  # Normalized reward (cap at 1.0)
-                )
-
-                # Check if this is the best model
-                if weighted_score > self.best_weighted_score:
-                    self.best_weighted_score = weighted_score
-                    self.best_progress = self.max_stage
-                    self.best_reward = self.cum_reward
-
-                    # Save the best model
-                    if self.best_model_save_path is not None:
-                        path = os.path.join(self.best_model_save_path, "best_model")
-                        self.model.save(path)
-                        if self.verbose > 0:
-                            print(f"Saving new best model to {path}.zip")
-                            print(
-                                f"New best metrics: Stage={self.max_stage}, "
-                                f"X-Progress={avg_x_progress:.2f}, "
-                                f"Reward={self.cum_reward:.2f}"
-                            )
-
-                    # Log action percentages when saving best model
-                    self._log_action_percentages()
-
-                # Reset cumulative metrics for next evaluation window
-                self.cum_reward = 0
-
-            return True
-
-        def _log_action_percentages(self):
-            """Log the percentage of each action taken during training"""
-            if self.total_actions == 0:
-                return
-
-            print("\n--- ACTION DISTRIBUTION ---")
-            print(f"Total actions: {self.total_actions}")
-
-            # Calculate and display percentages
-            percentages = []
-            for action_idx, count in self.action_counts.items():
-                percentage = (count / self.total_actions) * 100
-                action_name = KUNGFU_ACTION_NAMES[action_idx]
-                percentages.append((action_name, percentage))
-
-            # Sort by percentage (descending)
-            percentages.sort(key=lambda x: x[1], reverse=True)
-
-            # Display in a nice format
-            for action_name, percentage in percentages:
-                print(f"{action_name:<15}: {percentage:.2f}%")
-
-            print("---------------------------\n")
-
-    # Create directory for best model
-    best_model_dir = os.path.dirname(MODEL_PATH)
-    os.makedirs(best_model_dir, exist_ok=True)
-
-    # Create callbacks
-    best_model_callback = KungFuBestModelCallback(
-        check_freq=10000, best_model_save_path=best_model_dir, verbose=1
+    # Create the improved callback
+    improved_callback = ImprovedKungFuModelCallback(
+        check_freq=10000,
+        model_dir=model_dir,
+        verbose=1,
+        moving_avg_window=50,  # Track performance over 50 episodes
+        checkpoint_freq=100000,  # Save checkpoint every 100k steps
+        min_steps_between_saves=50000,  # Prevent saving too frequently
     )
 
+    # Create simple progress callback
     progress_callback = ProgressBarCallback(timesteps)
 
     # Train the model with callbacks
     model.learn(
-        total_timesteps=timesteps, callback=[progress_callback, best_model_callback]
+        total_timesteps=timesteps, callback=[progress_callback, improved_callback]
     )
 
-    # Copy best model to final model path or save final model
-    best_model_path = os.path.join(best_model_dir, "best_model.zip")
+    # Use best model path as final model or just use the final model
+    best_model_path = os.path.join(model_dir, "best_model.zip")
     if os.path.exists(best_model_path):
-        import shutil
+        print(f"Using best model as final model: {best_model_path}")
+        print(f"Final model is at: {MODEL_PATH}")
+        if best_model_path != MODEL_PATH:
+            import shutil
 
-        shutil.copy(best_model_path, MODEL_PATH)
-        print(f"Best model saved to {MODEL_PATH}")
+            shutil.copy(best_model_path, MODEL_PATH)
     else:
-        # If no best model was saved, save the final model
+        # This should not happen with our callback, but just in case
         model.save(MODEL_PATH)
         print(f"Final model saved to {MODEL_PATH}")
 
@@ -679,6 +866,10 @@ def play_game(env, model, episodes=5):
         # Track the current stage for directional logic
         current_stage = 1  # Default to stage 1 at start
 
+        # Track stats for this episode
+        max_stage = 1
+        stage_progress = {}
+
         # Create progress bar for this episode
         pbar = tqdm(desc=f"Episode {episode+1}", leave=True)
 
@@ -693,6 +884,25 @@ def play_game(env, model, episodes=5):
                     # Try to get current stage from RAM
                     ram = info.get_ram()
                     current_stage = int(ram[0x0058])
+
+                    # Track max stage reached
+                    max_stage = max(max_stage, current_stage)
+
+                    # Track X position for progress monitoring
+                    x_pos = ram[0x0094]
+                    if current_stage not in stage_progress:
+                        stage_progress[current_stage] = 0
+
+                    # Update progress based on stage direction
+                    if current_stage in [1, 3, 5]:  # Left stages
+                        # For left stages, lower X is better progress
+                        progress = 255 - x_pos
+                    else:  # Right stages
+                        progress = x_pos
+
+                    stage_progress[current_stage] = max(
+                        stage_progress[current_stage], progress
+                    )
 
                     # Get stage direction
                     stage_direction = -1 if current_stage in [1, 3, 5] else 1
@@ -729,12 +939,199 @@ def play_game(env, model, episodes=5):
             step += 1
 
             if any(done):
-                print(
-                    f"\nEpisode {episode+1} finished with total reward: {total_reward:.2f}"
+                # Calculate normalized progress scores
+                progress_scores = []
+                for stage, prog in stage_progress.items():
+                    normalized = prog / 255.0  # Normalize to 0-1 range
+                    progress_scores.append(normalized)
+
+                # Calculate average progress if we have data
+                avg_progress = (
+                    sum(progress_scores) / len(progress_scores)
+                    if progress_scores
+                    else 0
                 )
+
+                # Print detailed episode stats
+                print(f"\nEpisode {episode+1} finished:")
+                print(f"  Total reward: {total_reward:.2f}")
+                print(f"  Max stage reached: {max_stage}")
+                print(f"  Average stage progress: {avg_progress:.2f}")
+                print(f"  Total steps: {step}")
+
+                # Print progress by stage
+                print("  Progress by stage:")
+                for stage in sorted(stage_progress.keys()):
+                    norm_prog = stage_progress[stage] / 255.0
+                    print(f"    Stage {stage}: {norm_prog:.2f}")
+
                 pbar.close()
                 obs = env.reset()
                 break
+
+
+def evaluate_models(episodes=3):
+    """Evaluate all saved models to compare performance"""
+    import glob
+    import pandas as pd
+
+    print(f"Evaluating all saved models ({episodes} episodes each)...")
+
+    # Find all model files
+    model_dir = os.path.dirname(MODEL_PATH)
+    model_files = []
+
+    # Look in best_models directory
+    best_models = glob.glob(os.path.join(model_dir, "best_models", "*.zip"))
+    model_files.extend(best_models)
+
+    # Look in checkpoints directory
+    checkpoints = glob.glob(os.path.join(model_dir, "checkpoints", "*.zip"))
+    model_files.extend(checkpoints)
+
+    # Add standard models if they exist
+    for std_name in ["best_model.zip", "final_model.zip", "kungfu.zip"]:
+        std_path = os.path.join(model_dir, std_name)
+        if os.path.exists(std_path) and std_path not in model_files:
+            model_files.append(std_path)
+
+    if not model_files:
+        print("No saved models found to evaluate.")
+        return
+
+    print(f"Found {len(model_files)} models to evaluate.")
+
+    # Create environment for evaluation
+    env = make_kungfu_env(num_envs=1, is_play_mode=False)
+
+    # Track results
+    results = []
+
+    for model_path in model_files:
+        model_name = os.path.basename(model_path)
+        print(f"\nEvaluating model: {model_name}")
+
+        try:
+            # Load the model
+            model = PPO.load(model_path)
+
+            # Run episodes and collect stats
+            episode_rewards = []
+            episode_stages = []
+            episode_progress = []
+
+            for episode in range(episodes):
+                obs = env.reset()
+                done = [False]
+                total_reward = 0
+                max_stage = 1
+                stage_progress = {}
+
+                while not any(done):
+                    # Get action from model
+                    action, _ = model.predict(obs, deterministic=True)
+
+                    # Step environment
+                    obs, reward, done, info = env.step(action)
+
+                    # Get info about current state
+                    try:
+                        ram = env.get_attr("unwrapped")[0].get_ram()
+                        current_stage = int(ram[0x0058])
+                        max_stage = max(max_stage, current_stage)
+
+                        # Track X position progress
+                        x_pos = ram[0x0094]
+                        if current_stage not in stage_progress:
+                            stage_progress[current_stage] = 0
+
+                        # Update progress based on stage direction
+                        if current_stage in [1, 3, 5]:  # Left stages
+                            progress = 255 - x_pos
+                        else:  # Right stages
+                            progress = x_pos
+
+                        stage_progress[current_stage] = max(
+                            stage_progress[current_stage], progress
+                        )
+                    except:
+                        pass
+
+                    total_reward += reward[0]
+
+                # Calculate progress score
+                progress_values = list(stage_progress.values())
+                avg_progress = (
+                    sum(progress_values) / len(progress_values)
+                    if progress_values
+                    else 0
+                )
+                norm_progress = avg_progress / 255.0
+
+                # Store episode results
+                episode_rewards.append(total_reward)
+                episode_stages.append(max_stage)
+                episode_progress.append(norm_progress)
+
+                print(
+                    f"  Episode {episode+1}: Reward={total_reward:.2f}, Max Stage={max_stage}, Progress={norm_progress:.2f}"
+                )
+
+            # Calculate average stats
+            avg_reward = sum(episode_rewards) / len(episode_rewards)
+            avg_stage = sum(episode_stages) / len(episode_stages)
+            avg_progress = sum(episode_progress) / len(episode_progress)
+
+            # Calculate weighted score
+            weighted_score = (
+                0.6 * avg_stage + 0.3 * avg_progress + 0.1 * min(1.0, avg_reward / 1000)
+            )
+
+            # Add to results
+            results.append(
+                {
+                    "model": model_name,
+                    "avg_reward": avg_reward,
+                    "avg_stage": avg_stage,
+                    "avg_progress": avg_progress,
+                    "weighted_score": weighted_score,
+                }
+            )
+
+            print(f"  Average over {episodes} episodes:")
+            print(f"    Reward: {avg_reward:.2f}")
+            print(f"    Max Stage: {avg_stage:.2f}")
+            print(f"    Progress: {avg_progress:.2f}")
+            print(f"    Weighted Score: {weighted_score:.4f}")
+
+        except Exception as e:
+            print(f"  Error evaluating model {model_name}: {e}")
+
+    # Close environment
+    env.close()
+
+    # Create summary dataframe
+    if results:
+        df = pd.DataFrame(results)
+        df = df.sort_values("weighted_score", ascending=False)
+
+        print("\n=== MODEL EVALUATION RESULTS ===")
+        print(df.to_string(index=False))
+
+        # Save results to CSV
+        results_path = os.path.join(model_dir, "model_evaluation_results.csv")
+        df.to_csv(results_path, index=False)
+        print(f"\nResults saved to: {results_path}")
+
+        # Identify best model
+        best_model = df.iloc[0]
+        print(f"\nBest model: {best_model['model']}")
+        print(f"  Weighted Score: {best_model['weighted_score']:.4f}")
+        print(f"  Avg Stage: {best_model['avg_stage']:.2f}")
+        print(f"  Avg Progress: {best_model['avg_progress']:.2f}")
+        print(f"  Avg Reward: {best_model['avg_reward']:.2f}")
+    else:
+        print("No successful model evaluations to report.")
 
 
 def main():
@@ -751,8 +1148,22 @@ def main():
     parser.add_argument(
         "--play", action="store_true", help="Play the game with trained agent"
     )
+    parser.add_argument(
+        "--eval", action="store_true", help="Evaluate multiple saved models"
+    )
+    parser.add_argument(
+        "--eval_episodes",
+        type=int,
+        default=3,
+        help="Number of episodes to play for each model during evaluation",
+    )
 
     args = parser.parse_args()
+
+    # Special mode for evaluating all saved models
+    if args.eval:
+        evaluate_models(args.eval_episodes)
+        return
 
     # Create the environment, specifying if we're in play mode
     env = make_kungfu_env(num_envs=args.num_envs, is_play_mode=args.play)
@@ -762,7 +1173,7 @@ def main():
 
     if args.play:
         # Play the game with the trained agent
-        play_game(env, model)
+        play_game(env, model, episodes=5)
     else:
         # Train the model
         train_model(model, args.timesteps)
@@ -773,19 +1184,30 @@ def main():
 
 if __name__ == "__main__":
     # Make sure required libraries are installed
-    try:
-        import tqdm
-    except ImportError:
-        print("Installing tqdm for progress bars...")
-        import subprocess
+    required_packages = ["tqdm", "pandas"]
+    for package in required_packages:
+        try:
+            __import__(package)
+        except ImportError:
+            print(f"Installing {package}...")
+            import subprocess
 
-        subprocess.check_call(["pip", "install", "tqdm"])
-        print("tqdm installed successfully.")
+            subprocess.check_call(["pip", "install", package])
+            print(f"{package} installed successfully.")
 
     # Make sure cuda is enabled by default if available
     if torch.cuda.is_available():
         print("CUDA is available! Training will use GPU.")
     else:
         print("CUDA not available. Training will use CPU.")
+
+    # Add version info in logs
+    import gymnasium as gym
+
+    print(f"Python version: {sys.version}")
+    print(f"NumPy version: {np.__version__}")
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"Gymnasium version: {gym.__version__}")
+    print(f"Stable-Baselines3 version: {stable_baselines3.__version__}")
 
     main()
