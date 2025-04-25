@@ -370,7 +370,7 @@ class KungFuMasterEnv(gym.Wrapper):
 
 
 def make_kungfu_env(num_envs=1, is_play_mode=False):
-    """Create vectorized environments for Kung Fu Master"""
+    """Create vectorized environments for Kung Fu Master with frame stacking"""
 
     def make_env(rank):
         def _init():
@@ -400,14 +400,18 @@ def make_kungfu_env(num_envs=1, is_play_mode=False):
     else:
         env = SubprocVecEnv([make_env(i) for i in range(num_envs)])
 
-    # Stack 4 frames to give the model some temporal context
-    env = VecFrameStack(env, n_stack=4)
+    # Stack 4 frames to give the model temporal context
+    n_stack = 4  # This is explicitly setting the frame stack to 4
+    env = VecFrameStack(env, n_stack=n_stack)
+
+    print(f"Environment created with frame stack of {n_stack}")
+    print(f"Observation space shape: {env.observation_space.shape}")
 
     return env
 
 
 def create_model(env, resume=False):
-    """Create or load a PPO model"""
+    """Create or load a PPO model optimized for frame stacked observations"""
     # Define neural network architecture
     policy_kwargs = dict(
         net_arch=[64, 64]  # Simple network with two hidden layers of 64 units
@@ -419,7 +423,7 @@ def create_model(env, resume=False):
     else:
         print("Creating new model")
         model = PPO(
-            "CnnPolicy",  # CNN policy for image inputs
+            "CnnPolicy",  # CNN policy for frame stacked image inputs
             env,
             policy_kwargs=policy_kwargs,
             verbose=1,
@@ -449,25 +453,27 @@ def train_model(model, timesteps):
 def play_game(env, model, episodes=5):
     """Use the trained model to play the game with rendering"""
     obs = env.reset()
+    print(f"Observation shape during play: {obs.shape}")  # Should show stacked frames
 
     for episode in range(episodes):
         done = False
         total_reward = 0
         step = 0
 
-        while not done:
+        while not any(done):
             # Use deterministic actions for gameplay
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, info = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
 
             # Display action being taken
             action_name = KUNGFU_ACTION_NAMES[action[0]]
-            print(f"Step: {step}, Action: {action_name}, Reward: {reward}")
+            print(f"Step: {step}, Action: {action_name}, Reward: {reward[0]}")
 
-            total_reward += reward
+            total_reward += reward[0]
             step += 1
 
-            if done[0]:
+            if any(done):
                 print(f"Episode {episode+1} finished with total reward: {total_reward}")
                 obs = env.reset()
                 break
