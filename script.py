@@ -111,27 +111,27 @@ class KungFuMasterEnv(gym.Wrapper):
         # Get current RAM state
         ram = self.env.get_ram()
 
-        # Extract relevant game state
-        current_stage = ram[0x0058]
+        # Extract relevant game state (safely convert to int to avoid overflow)
+        current_stage = int(ram[0x0058])
         current_score = self._get_score(ram)
-        current_hp = ram[0x04A6]
-        current_x_pos = ram[0x0094]
-        current_y_pos = ram[0x00B6]  # Hero Y position
-        current_boss_hp = ram[0x04A5]
+        current_hp = int(ram[0x04A6])
+        current_x_pos = int(ram[0x0094])
+        current_y_pos = int(ram[0x00B6])  # Hero Y position
+        current_boss_hp = int(ram[0x04A5])
 
-        # Get current enemy positions and actions
+        # Get current enemy positions and actions (safely convert to int)
         current_enemy_x = [
-            ram[0x008E],  # Enemy 1 X position
-            ram[0x008F],  # Enemy 2 X position
-            ram[0x0090],  # Enemy 3 X position
-            ram[0x0091],  # Enemy 4 X position
+            int(ram[0x008E]),  # Enemy 1 X position
+            int(ram[0x008F]),  # Enemy 2 X position
+            int(ram[0x0090]),  # Enemy 3 X position
+            int(ram[0x0091]),  # Enemy 4 X position
         ]
 
         current_enemy_actions = [
-            ram[0x0080],  # Enemy 1 action
-            ram[0x0081],  # Enemy 2 action
-            ram[0x0082],  # Enemy 3 action
-            ram[0x0083],  # Enemy 4 action
+            int(ram[0x0080]),  # Enemy 1 action
+            int(ram[0x0081]),  # Enemy 2 action
+            int(ram[0x0082]),  # Enemy 3 action
+            int(ram[0x0083]),  # Enemy 4 action
         ]
 
         # Calculate shaped reward
@@ -140,13 +140,13 @@ class KungFuMasterEnv(gym.Wrapper):
         # Base reward from the game
         shaped_reward += reward
 
-        # Reward for score increase
-        score_diff = current_score - self.prev_score
+        # Reward for score increase (safe subtraction)
+        score_diff = max(0, current_score - self.prev_score)  # Ensure non-negative
         if score_diff > 0:
             shaped_reward += score_diff * self.SCORE_REWARD_SCALE
 
-        # Penalty for health loss
-        hp_diff = current_hp - self.prev_hp
+        # Penalty for health loss (safe subtraction)
+        hp_diff = self._safe_subtract(current_hp, self.prev_hp)
         if hp_diff < 0:
             shaped_reward += hp_diff * self.HP_LOSS_PENALTY
 
@@ -156,8 +156,8 @@ class KungFuMasterEnv(gym.Wrapper):
         )
         shaped_reward += direction_reward
 
-        # Reward for damaging boss
-        boss_hp_diff = current_boss_hp - self.prev_boss_hp
+        # Reward for damaging boss (safe subtraction)
+        boss_hp_diff = self._safe_subtract(current_boss_hp, self.prev_boss_hp)
         if boss_hp_diff < 0:
             shaped_reward += abs(boss_hp_diff) * self.BOSS_DAMAGE_REWARD
 
@@ -203,9 +203,40 @@ class KungFuMasterEnv(gym.Wrapper):
 
         return obs, shaped_reward, terminated, truncated, info
 
+    def _get_stage_direction(self, stage):
+        """Return the correct movement direction for the current stage"""
+        # Stage 1, 3, 5: Go left (decreasing X)
+        if stage in [1, 3, 5]:
+            return -1  # Left direction
+        # Stage 2, 4: Go right (increasing X)
+        elif stage in [2, 4]:
+            return 1  # Right direction
+        return 0
+
+    def _safe_subtract(self, a, b):
+        """Perform safe subtraction for uint8 values that might overflow"""
+        # Convert to integers and handle wraparound
+        a_int, b_int = int(a), int(b)
+
+        # If values are within reasonable range, do normal subtraction
+        if abs(a_int - b_int) < 128:
+            return a_int - b_int
+
+        # Special case for HP or similar where 0 might mean "empty" and max might mean "full"
+        if a_int == 0 and b_int > 200:  # Likely went from max to 0
+            return -b_int  # Return negative of previous value
+
+        # Special case for wraparound (e.g., 255 to 0)
+        if a_int < 50 and b_int > 200:  # Likely wrapped around
+            return (a_int + 256) - b_int
+
+        # Default to normal subtraction
+        return a_int - b_int
+
     def _calculate_direction_reward(self, stage, current_x, prev_x):
         """Calculate reward for moving in the correct direction based on stage"""
-        movement = current_x - prev_x
+        # Safe movement calculation
+        movement = self._safe_subtract(current_x, prev_x)
 
         # If no movement, no reward
         if movement == 0:
@@ -221,17 +252,8 @@ class KungFuMasterEnv(gym.Wrapper):
             return abs(movement) * self.PROGRESS_REWARD_SCALE
         else:
             # Smaller penalty for moving in wrong direction
-            return -abs(movement) * self.PROGRESS_REWARD_SCALE * 0.5
-
-    def _get_stage_direction(self, stage):
-        """Return the correct movement direction for the current stage"""
-        # Stage 1, 3, 5: Go left (decreasing X)
-        if stage in [1, 3, 5]:
-            return -1  # Left direction
-        # Stage 2, 4: Go right (increasing X)
-        elif stage in [2, 4]:
-            return 1  # Right direction
-        return 0
+            # Make sure we don't overflow by using float calculation
+            return -float(abs(movement)) * self.PROGRESS_REWARD_SCALE * 0.5
 
     def _calculate_enemy_handling_reward(
         self,
@@ -274,7 +296,8 @@ class KungFuMasterEnv(gym.Wrapper):
 
             # Calculate enemy proximity and direction relative to player
             if current_enemy_x[i] != 0:
-                enemy_distance = abs(player_x - current_enemy_x[i])
+                # Safe distance calculation
+                enemy_distance = abs(self._safe_subtract(player_x, current_enemy_x[i]))
                 enemy_direction = (
                     1 if current_enemy_x[i] > player_x else -1
                 )  # 1: enemy on right, -1: enemy on left
@@ -282,10 +305,12 @@ class KungFuMasterEnv(gym.Wrapper):
                 # Determine if enemy is approaching or retreating
                 is_approaching = False
                 if prev_enemy_x[i] != 0:  # If we have previous position data
-                    if enemy_direction < 0 and prev_enemy_x[i] > current_enemy_x[i]:
-                        is_approaching = True  # Enemy on left is moving toward player
-                    elif enemy_direction > 0 and prev_enemy_x[i] < current_enemy_x[i]:
-                        is_approaching = True  # Enemy on right is moving toward player
+                    prev_dist = self._safe_subtract(prev_enemy_x[i], player_x)
+                    curr_dist = self._safe_subtract(current_enemy_x[i], player_x)
+
+                    # Check if distance is decreasing (approaching)
+                    if abs(curr_dist) < abs(prev_dist):
+                        is_approaching = True
 
                 # Reward appropriate actions based on enemy proximity and direction
                 if enemy_distance < 30:  # Enemy is close
