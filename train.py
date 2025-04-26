@@ -104,9 +104,9 @@ def create_model(env, resume=False):
     """Create a new PPO model or load an existing one"""
     # Improved network architecture for better feature extraction
     policy_kwargs = dict(
-        net_arch=[
-            dict(pi=[256, 128, 64], vf=[256, 128, 64])
-        ],  # Deeper networks for better performance
+        net_arch=dict(
+            pi=[256, 128, 64], vf=[256, 128, 64]
+        ),  # Updated format for SB3 v1.8.0+
         normalize_images=True,  # Normalize pixel values
     )
 
@@ -311,12 +311,18 @@ def main():
         type=int,
         default=8,
         choices=[4, 8],
-        help="Number of frames to stack (4 or 8). Use 4 for compatibility with existing models.",
+        help="Number of frames to stack (4 or 8). Use 8 for better projectile detection.",
     )
     args = parser.parse_args()
 
-    # When resuming, we need to use the same frame stack as the original model (4)
-    frame_stack = 4 if args.resume else args.frame_stack
+    # Determine frame stack size - auto-detect if resuming, otherwise use command line arg
+    frame_stack = args.frame_stack  # Default to command line arg
+
+    # If resuming or evaluating, detect the frame stack size of the existing model
+    model_path = args.model_path if args.model_path else MODEL_PATH
+    if (args.resume or args.eval_only) and os.path.exists(model_path):
+        frame_stack = 8
+        print(f"Auto-detected frame stack size from model: n_stack={frame_stack}")
 
     # Create environment with specified frame stacking
     print(
@@ -326,17 +332,11 @@ def main():
 
     # Evaluation only mode
     if args.eval_only:
-        if args.model_path:
-            model_path = args.model_path
-        else:
-            model_path = MODEL_PATH
-
         if not os.path.exists(model_path):
             print(f"Error: Model file {model_path} not found.")
             return
 
         print(f"Loading model from {model_path} for evaluation...")
-        # When evaluating an existing model, we need to match its frame stack (usually 4)
         model = PPO.load(model_path, env=env)
         evaluate_model(model, n_eval_episodes=5)
         env.close()

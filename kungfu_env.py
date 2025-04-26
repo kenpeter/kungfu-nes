@@ -269,11 +269,6 @@ class KungFuMasterEnv(gym.Wrapper):
                     if abs(x_diff) > 5 and self.n_steps % 50 == 0:
                         print(f"Good left movement in stage {current_stage}")
 
-            # Add death penalty
-            if current_hp == 0 and self.prev_hp > 0:
-                shaped_reward -= 10.0
-                print("Agent died! Applying penalty.")
-
             # Reward for well-timed defensive actions (jump/crouch)
             # If HP was maintained during an action that could be defensive, it's likely a good timing
             if action == 4 or action == 5:  # Jump or Crouch actions
@@ -300,6 +295,11 @@ class KungFuMasterEnv(gym.Wrapper):
                         print(
                             f"Defensive action success rate: {success_rate:.1f}% ({self.successful_defensive_actions}/{self.defensive_actions})"
                         )
+
+            # Add death penalty
+            if current_hp == 0 and self.prev_hp > 0:
+                shaped_reward -= 10.0
+                print("Agent died! Applying penalty.")
 
             # Add urgency based on remaining time - increases penalty as time passes
             time_penalty = -0.001 * (self.episode_steps / MAX_EPISODE_STEPS)
@@ -336,7 +336,7 @@ class KungFuMasterEnv(gym.Wrapper):
         return obs, shaped_reward, terminated, truncated, info
 
 
-def make_kungfu_env(is_play_mode=False, frame_stack=4):
+def make_kungfu_env(is_play_mode=False, frame_stack=8):
     """Create a single Kung Fu Master environment wrapped for RL training
 
     Args:
