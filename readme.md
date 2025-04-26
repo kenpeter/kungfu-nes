@@ -1,20 +1,16 @@
+python train.py --timesteps 1000
 
+To resume training from a saved model:
 
-python script.py --timesteps 10000 --num_envs 4
+bashpython train.py --timesteps 50000 --resume
 
+To play the game with the trained model:
 
-python script.py --play
+bashpython play.py --episodes 5
 
+To control the game speed during play:
 
-
-
-
-best model
-python script.py --eval --eval_episodes 5
-
-
-
-
+bashpython play.py --episodes 3 --speed 0.02
 
 
 
