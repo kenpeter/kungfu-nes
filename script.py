@@ -97,11 +97,35 @@ class KungFuMasterEnv(gym.Wrapper):
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
 
-        # Automatically press START to begin the game
-        for _ in range(3):  # Press START multiple times to ensure it registers
-            start_action = KUNGFU_ACTIONS[3]  # Index 3 is the START action
+        # Press START button to actually start the game
+        start_action = KUNGFU_ACTIONS[3]  # Index 3 is the START button action
+        start_pressed = False
+        max_attempts = 10  # Try pressing start up to 10 times
+
+        for _ in range(max_attempts):
+            # Press START button
             temp_obs, _, _, _, _ = self.env.step(start_action)
-            # Don't overwrite the original obs
+
+            # Check if game has started by checking RAM values
+            ram = self.env.get_ram()
+            current_stage = ram[0x0058]
+            player_hp = ram[0x04A6]
+
+            # If we detect we're in a real stage or player has HP, game has started
+            if current_stage > 0 and player_hp > 0:
+                start_pressed = True
+                # Use the observation after pressing START
+                obs = temp_obs
+                break
+
+            # Give the game some frames to process the START press
+            for _ in range(5):
+                temp_obs, _, _, _, _ = self.env.step(KUNGFU_ACTIONS[0])  # No-op
+
+        if not start_pressed:
+            print(
+                "WARNING: Could not start game after multiple attempts. Game may be in an unusual state."
+            )
 
         # Read initial state
         ram = self.env.get_ram()
@@ -883,26 +907,15 @@ def train_model(model, timesteps):
 def play_game(env, model, episodes=5):
     """Use the trained model to play the game with rendering"""
     obs = env.reset()
-    print(f"Observation shape during play: {obs.shape}")  # Should show stacked frames
-
-    from tqdm import tqdm
 
     # Action tracking variables
     action_counts = {i: 0 for i in range(len(KUNGFU_ACTIONS))}
     total_actions = 0
 
-    # Flag to track if we're still in the start screen
-    in_start_screen = True
-    start_screen_counter = 0
-
     for episode in range(episodes):
         done = [False]  # Initialize as list for vectorized env
         total_reward = 0
         step = 0
-
-        # Reset start screen tracking for each episode
-        in_start_screen = True
-        start_screen_counter = 0
 
         # Track the current stage for directional logic
         current_stage = 1  # Default to stage 1 at start
@@ -919,10 +932,16 @@ def play_game(env, model, episodes=5):
         force_directional_steps = 0
         force_attack_steps = 0
 
+        # into the play loop
         while not any(done):
             # Get the model's predicted action
             action, _ = model.predict(obs, deterministic=True)
             original_action = action[0]
+
+            # Ensure the agent NEVER presses START (action index 3)
+            if action[0] == 3:  # START action
+                action[0] = 0  # Replace with NO-OP
+                print("Prevented agent from pressing START button")
 
             # Get game state info for better decision making
             info = env.get_attr("unwrapped")[0]  # Get wrapped env info
