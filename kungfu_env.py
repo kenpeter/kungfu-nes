@@ -1,19 +1,9 @@
 import os
 import numpy as np
-import retro  # stable retro
-import gymnasium as gym  # not open ai gym
+import retro
+import gymnasium as gym
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from stable_baselines3.common.monitor import Monitor
-from typing import Optional, Dict, Any
-import logging
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("kungfu_env.log"), logging.StreamHandler()],
-)
-logger = logging.getLogger("KungFuEnv")
 
 # Define the Kung Fu Master action space
 KUNGFU_ACTIONS = [
@@ -32,6 +22,24 @@ KUNGFU_ACTIONS = [
     [1, 0, 0, 0, 0, 1, 0, 0, 0],  # DOWN + B (Crouch Punch)
 ]
 
+# Set model path
+MODEL_PATH = "model/kungfu.zip"
+
+# Critical memory addresses based on provided RAM map
+MEMORY = {
+    "current_stage": 0x0058,  # Current Stage
+    "player_hp": 0x04A6,  # Hero HP
+    "player_x": 0x0094,  # Hero Screen Pos X
+    "game_mode": 0x0051,  # Game Mode
+    "game_submode": 0x0008,  # Game Submode
+    "boss_hp": 0x04A5,  # Boss HP
+    "player_y": 0x00B6,  # Hero Pos Y
+    "player_action": 0x0069,  # Hero Action
+    "boss_x": 0x0093,  # Boss Pos X
+    "score": [0x0531, 0x0532, 0x0533, 0x0534, 0x0535],  # Score digits
+}
+
+# Define action names for the environment
 KUNGFU_ACTION_NAMES = [
     "No-op",
     "Punch",
@@ -48,8 +56,8 @@ KUNGFU_ACTION_NAMES = [
     "Crouch Punch",
 ]
 
-# Set model path
-MODEL_PATH = "model/kungfu.zip"
+# Maximum episode duration in frames (30 frames per second * 120 seconds = 3600 frames)
+MAX_EPISODE_STEPS = 3600  # 2 minutes
 
 
 # Custom environment wrapper for Kung Fu Master with basic rewards
@@ -67,11 +75,42 @@ class KungFuMasterEnv(gym.Wrapper):
         self.prev_hp = 0
         self.prev_x_pos = 0
         self.prev_stage = 0
-        logger.info("KungFuMasterEnv initialized")
+        self.n_steps = 0
+        self.episode_steps = 0
+        print(
+            "KungFuMasterEnv initialized - Improved version with timeout and score rewards"
+        )
+
+    def get_stage(self):
+        """Get current stage value directly from RAM"""
+        try:
+            ram = self.env.get_ram()
+            return int(ram[MEMORY["current_stage"]])
+        except:
+            return 0
+
+    def get_hp(self):
+        """Get current HP value directly from RAM"""
+        try:
+            ram = self.env.get_ram()
+            return int(ram[MEMORY["player_hp"]])
+        except:
+            return 0
+
+    def get_score(self):
+        """Get score from RAM"""
+        try:
+            ram = self.env.get_ram()
+            score = 0
+            for i, addr in enumerate(MEMORY["score"]):
+                digit = int(ram[addr])
+                score += digit * (10 ** (4 - i))
+            return score
+        except:
+            return 0
 
     def reset(self, **kwargs):
-        # Make sure we return observation and info as required by Gymnasium API
-        logger.info("Resetting environment")
+        # Reset the environment
         obs_result = self.env.reset(**kwargs)
 
         # Handle different return types
@@ -81,78 +120,40 @@ class KungFuMasterEnv(gym.Wrapper):
             obs = obs_result
             info = {}
 
-        logger.info("Pressing START button to begin game")
-        start_action = KUNGFU_ACTIONS[3]  # START button
+        # Reset step counter for timeout
+        self.episode_steps = 0
 
-        # Log the actual button being pressed
-        logger.info(f"START button action: {start_action}")
+        # Simple game start - just press START a few times
+        for _ in range(5):
+            self.env.step(KUNGFU_ACTIONS[3])  # Press START
 
-        for i in range(15):  # Press START for 15 frames
-            logger.debug(f"Pressing START button (frame {i+1}/15)")
-            step_result = self.env.step(start_action)
-            if len(step_result) == 5:
-                obs, _, term, trunc, _ = step_result
-                if term or trunc:
-                    logger.warning(
-                        "Environment terminated or truncated while pressing START"
-                    )
-            else:
-                obs, _, done, _ = step_result
-                if done:
-                    logger.warning("Environment done while pressing START")
-
-        logger.info("START button pressed successfully, waiting for 30 frames")
-        for i in range(30):  # Wait for 30 frames
-            step_result = self.env.step(KUNGFU_ACTIONS[0])
-            if len(step_result) == 5:
-                obs, _, term, trunc, _ = step_result
-                if term or trunc:
-                    logger.warning(
-                        "Environment terminated or truncated during wait period"
-                    )
-            else:
-                obs, _, done, _ = step_result
-                if done:
-                    logger.warning("Environment done during wait period")
-
+        # Get initial state
         try:
             ram = self.env.get_ram()
-            self.prev_score = self._get_score(ram)
-            self.prev_hp = int(ram[0x04A6])
-            self.prev_x_pos = int(ram[0x0094])
-            self.prev_stage = int(ram[0x0058])
+            self.prev_hp = int(ram[MEMORY["player_hp"]])
+            self.prev_x_pos = int(ram[MEMORY["player_x"]])
+            self.prev_stage = int(ram[MEMORY["current_stage"]])
+            self.prev_boss_hp = int(ram[MEMORY["boss_hp"]])
+            self.prev_score = self.get_score()  # Initialize previous score
 
-            # Log initial game state
-            logger.info(
-                f"Initial game state - Score: {self.prev_score}, HP: {self.prev_hp}, Stage: {self.prev_stage}"
+            print(
+                f"Initial state - Stage: {self.prev_stage}, HP: {self.prev_hp}, "
+                f"X-pos: {self.prev_x_pos}, Score: {self.prev_score}"
             )
 
-            # Check if the game has actually started (based on stage or other indicator)
-            if self.prev_stage > 0:
-                logger.info("Game successfully started - player is on stage")
-            else:
-                # Try to detect if we're in game by checking other RAM values
-                game_active = ram[0x04A6] > 0  # Check if player has HP
-                if game_active:
-                    logger.info("Game appears to be active (player has HP)")
-                else:
-                    logger.warning(
-                        "Game may not have started properly - no indicators found"
-                    )
-
         except Exception as e:
-            logger.error(f"Error accessing RAM: {str(e)}")
+            print(f"Error getting initial state: {str(e)}")
 
-        # Always return obs and info
         return obs, info
 
     def step(self, action):
-        if action == 3:  # Filter out START button during gameplay
-            logger.debug("Filtering out START button during gameplay")
-            action = 0
+        # Convert to actual action
         converted_action = self.KUNGFU_ACTIONS[action]
+
+        # Take step in environment
         step_result = self.env.step(converted_action)
 
+        # Handle different return types
         if len(step_result) == 4:
             obs, reward, done, info = step_result
             terminated = done
@@ -160,111 +161,140 @@ class KungFuMasterEnv(gym.Wrapper):
         elif len(step_result) == 5:
             obs, reward, terminated, truncated, info = step_result
         else:
-            error_msg = f"Unexpected step result length: {len(step_result)}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            raise ValueError(f"Unexpected step result length: {len(step_result)}")
 
         if not isinstance(info, dict):
             info = {}
 
+        # Increment episode step counter
+        self.episode_steps += 1
+
+        # Check for timeout (2 minutes = 3600 frames)
+        if self.episode_steps >= MAX_EPISODE_STEPS:
+            print(f"Episode timeout after {self.episode_steps} steps (2 minutes)")
+            truncated = True
+            # Add timeout penalty
+            reward -= 5.0
+
         # Simple reward shaping
         try:
             ram = self.env.get_ram()
-            current_score = self._get_score(ram)
-            current_hp = int(ram[0x04A6])
-            current_x_pos = int(ram[0x0094])
-            current_stage = int(ram[0x0058])
+            current_hp = int(ram[MEMORY["player_hp"]])
+            current_x_pos = int(ram[MEMORY["player_x"]])
+            current_stage = int(ram[MEMORY["current_stage"]])
+            current_boss_hp = int(ram[MEMORY["boss_hp"]])
+            current_score = self.get_score()
 
-            shaped_reward = 0.0
-            # Base game reward
-            shaped_reward += reward
+            # Log position and status occasionally
+            if self.n_steps % 100 == 0:
+                time_left = (MAX_EPISODE_STEPS - self.episode_steps) / 30  # in seconds
+                print(
+                    f"Stage: {current_stage}, Position: {current_x_pos}, "
+                    f"HP: {current_hp}, Boss HP: {current_boss_hp}, "
+                    f"Score: {current_score}, Time left: {time_left:.1f}s"
+                )
 
-            # Score increase reward
-            score_diff = self._safe_subtract(current_score, self.prev_score)
+            # Increment step counter
+            self.n_steps += 1
+
+            # Shape the reward
+            shaped_reward = reward
+
+            # Add score reward (most important progress indicator)
+            score_diff = current_score - self.prev_score
             if score_diff > 0:
-                shaped_reward += score_diff * 0.01
+                shaped_reward += score_diff * 0.05  # Scale down large score changes
+                if score_diff >= 100:
+                    print(f"Score increased by {score_diff}! Current: {current_score}")
 
-            # HP loss penalty
-            hp_diff = self._safe_subtract(current_hp, self.prev_hp)
-            if hp_diff < 0:
+            # Add HP loss penalty
+            hp_diff = current_hp - self.prev_hp
+            if hp_diff < 0 and current_hp < 200:  # Normal health loss
                 shaped_reward += hp_diff * 0.5
 
-            # Stage completion reward
+            # Add stage completion bonus
             if current_stage > self.prev_stage:
-                logger.info(f"Stage advanced from {self.prev_stage} to {current_stage}")
-                shaped_reward += 10.0
+                print(f"Stage up! {self.prev_stage} -> {current_stage}")
+                shaped_reward += 50.0  # Significant reward for stage progression
+                # Reset timer urgency when reaching new stage
+                self.episode_steps = max(
+                    0, self.episode_steps - 600
+                )  # Give 20 more seconds
+
+            # Add boss damage bonus
+            boss_hp_diff = (
+                self.prev_boss_hp - current_boss_hp
+                if hasattr(self, "prev_boss_hp")
+                else 0
+            )
+            if boss_hp_diff > 0:
+                shaped_reward += boss_hp_diff * 0.3  # Reward for damaging boss
+
+            # Apply directional rewards based on stage
+            x_diff = current_x_pos - self.prev_x_pos
+
+            # Stages 0, 2, 4: reward LEFT movement
+            # Stages 1, 3: reward RIGHT movement
+            if current_stage in [1, 3]:  # Stages 1, 3 (move RIGHT)
+                if x_diff > 0:  # Moving RIGHT
+                    shaped_reward += x_diff * 0.1
+                    if x_diff > 5 and self.n_steps % 50 == 0:
+                        print(f"Good right movement in stage {current_stage}")
+            else:  # Stages 0, 2, 4 (move LEFT)
+                if x_diff < 0:  # Moving LEFT
+                    shaped_reward += abs(x_diff) * 0.1
+                    if abs(x_diff) > 5 and self.n_steps % 50 == 0:
+                        print(f"Good left movement in stage {current_stage}")
+
+            # Add urgency based on remaining time - increases penalty as time passes
+            time_penalty = -0.001 * (self.episode_steps / MAX_EPISODE_STEPS)
+            shaped_reward += time_penalty
+
+            # Add death penalty
+            if current_hp == 0 and self.prev_hp > 0:
+                shaped_reward -= 10.0
+                print("Agent died! Applying penalty.")
 
             # Update previous values
-            self.prev_score = current_score
             self.prev_hp = current_hp
             self.prev_x_pos = current_x_pos
             self.prev_stage = current_stage
+            self.prev_boss_hp = current_boss_hp
+            self.prev_score = current_score
 
             info["current_stage"] = current_stage
+            info["current_score"] = current_score
+            info["time_remaining"] = (
+                MAX_EPISODE_STEPS - self.episode_steps
+            ) / 30  # in seconds
 
         except Exception as e:
-            logger.error(f"Error in reward shaping: {str(e)}")
+            print(f"Error in reward shaping: {str(e)}")
             shaped_reward = reward
 
         return obs, shaped_reward, terminated, truncated, info
-
-    def _get_score(self, ram):
-        score = 1
-        has_score = False
-        for addr in [0x0531, 0x0532, 0x0533, 0x0534, 0x0535]:
-            if ram[addr] > 0:
-                has_score = True
-                score += ram[addr]
-        if not has_score:
-            return 1
-        return score
-
-    def _safe_subtract(self, a, b):
-        a_int, b_int = int(a), int(b)
-        if abs(a_int - b_int) < 128:
-            return a_int - b_int
-        if a_int == 0 and b_int > 200:
-            return -b_int
-        if a_int < 50 and b_int > 200:
-            return (a_int + 256) - b_int
-        return a_int - b_int
 
 
 def make_kungfu_env(is_play_mode=False):
     """Create a single Kung Fu Master environment wrapped for RL training"""
     try:
         render_mode = "human" if is_play_mode else None
-        logger.info(
-            f"Attempting to create Kung Fu environment with render_mode={render_mode}"
-        )
         env = retro.make(game="KungFu-Nes", render_mode=render_mode)
-        logger.info("Successfully created KungFu-Nes environment")
-    except Exception as e:
-        logger.warning(f"Failed to create KungFu-Nes environment: {str(e)}")
+    except Exception:
         try:
             render_mode = "human" if is_play_mode else None
-            logger.info(
-                f"Attempting to create KungFuMaster-Nes environment with render_mode={render_mode}"
-            )
             env = retro.make(game="KungFuMaster-Nes", render_mode=render_mode)
-            logger.info("Successfully created KungFuMaster-Nes environment")
         except Exception as e:
-            logger.error(f"Failed to create KungFuMaster-Nes environment: {str(e)}")
-            raise
+            raise e
 
     env = KungFuMasterEnv(env)
     os.makedirs("logs", exist_ok=True)
-    logger.info("Created logs directory")
     env = Monitor(env, os.path.join("logs", "kungfu"))
-    logger.info("Wrapped environment with Monitor")
 
     # Wrap in DummyVecEnv for compatibility with stable-baselines3
     env = DummyVecEnv([lambda: env])
-    logger.info("Wrapped environment with DummyVecEnv")
 
     # Frame stacking for better learning with visual inputs
-    n_stack = 4
-    env = VecFrameStack(env, n_stack=n_stack)
-    logger.info(f"Wrapped environment with VecFrameStack (n_stack={n_stack})")
+    env = VecFrameStack(env, n_stack=4)
 
     return env

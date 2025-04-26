@@ -13,6 +13,11 @@ To control the game speed during play:
 bashpython play.py --episodes 3 --speed 0.02
 
 
+python train.py --timesteps 1000 --render
+
+
+
+
 
 
 
