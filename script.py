@@ -6,7 +6,7 @@ import retro
 import torch
 import stable_baselines3
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
 import gymnasium as gym
@@ -136,8 +136,8 @@ def _worker(remote, parent_remote, env_fn_wrapper, seed=0):
             break
 
 
-# Fixed SubprocVecEnv with corrected reset
-class FixedSubprocVecEnv:
+# Fixed SubprocVecEnv with step_async and step_wait
+class FixedSubprocVecEnv(SubprocVecEnv):
     def __init__(self, env_fns, start_method=None):
         self.waiting = False
         self.closed = False
@@ -167,6 +167,33 @@ class FixedSubprocVecEnv:
         observation_space, action_space = self.remotes[0].recv()
         self.observation_space = observation_space
         self.action_space = action_space
+
+    def step_async(self, actions):
+        if self.waiting:
+            raise RuntimeError("Already stepping asynchronously")
+        for remote, action in zip(self.remotes, actions):
+            remote.send(("step", action))
+        self.waiting = True
+
+    def step_wait(self):
+        if not self.waiting:
+            raise RuntimeError("Not stepping asynchronously")
+        results = []
+        for idx, remote in enumerate(self.remotes):
+            try:
+                res = remote.recv()
+                if res is None or len(res) != 5:
+                    print(f"Invalid result from env {idx}: {res}")
+                    res = (np.zeros(self.observation_space.shape), 0.0, True, False, {})
+                results.append(res)
+            except Exception as e:
+                print(f"Error receiving step result from env {idx}: {e}")
+                results.append(
+                    (np.zeros(self.observation_space.shape), 0.0, True, False, {})
+                )
+        self.waiting = False
+        obs, rews, terms, truncs, infos = zip(*results)
+        return np.stack(obs), np.array(rews), np.array(terms), np.array(truncs), infos
 
     def reset(
         self,
@@ -205,23 +232,6 @@ class FixedSubprocVecEnv:
                 print(f"Error receiving reset result from env {idx}: {e}")
                 obs.append(np.zeros(self.observation_space.shape))
         return np.stack(obs)
-
-    def step(self, actions):
-        for remote, action in zip(self.remotes, actions):
-            remote.send(("step", action))
-        results = [remote.recv() for remote in self.remotes]
-        for i, res in enumerate(results):
-            if res is None or len(res) != 5:
-                print(f"Invalid result from env {i}: {res}")
-                results[i] = (
-                    np.zeros(self.observation_space.shape),
-                    0.0,
-                    True,
-                    False,
-                    {},
-                )
-        obs, rews, terms, truncs, infos = zip(*results)
-        return np.stack(obs), np.array(rews), np.array(terms), np.array(truncs), infos
 
     def close(self):
         if self.closed:
@@ -283,9 +293,9 @@ class KungFuMasterEnv(gym.Wrapper):
         while attempt < max_attempts and not game_started:
             attempt += 1
             print(f"Start attempt {attempt}/{max_attempts}")
-            for _ in range(10):  # Press START for 10 frames
+            for _ in range(15):  # Press START for 15 frames
                 obs, _, _, _, info = self.env.step(start_action)
-            for _ in range(20):  # Wait for 20 frames
+            for _ in range(30):  # Wait for 30 frames
                 obs, _, _, _, info = self.env.step(KUNGFU_ACTIONS[0])
             ram = self.env.get_ram()
             current_stage = int(ram[0x0058])
@@ -295,7 +305,8 @@ class KungFuMasterEnv(gym.Wrapper):
             print(
                 f"RAM Check: stage={current_stage}, hp={player_hp}, game_state={game_state}, x_pos={player_x}"
             )
-            if player_hp > 0 and (current_stage > 0 or player_x != 128):
+            # Stricter condition: require stage > 0 and valid HP
+            if current_stage > 0 and 40 <= player_hp <= 60:
                 game_started = True
                 print(f"Game started successfully after {attempt} attempts")
                 break
