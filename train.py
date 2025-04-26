@@ -30,7 +30,7 @@ class SaveCallback(BaseCallback):
         # Check if file exists, if not create header
         if not os.path.exists(self.metrics_file):
             with open(self.metrics_file, "w") as f:
-                f.write("timestamp,steps,mean_reward\n")
+                f.write("timestamp,steps,mean_reward,defensive_success_rate\n")
 
     def _on_step(self):
         # Save model periodically
@@ -44,13 +44,49 @@ class SaveCallback(BaseCallback):
             # Get metrics from the training buffer
             mean_reward = self.model.logger.name_to_value.get("rollout/ep_rew_mean", 0)
 
-            # Log to console
-            print(f"Step: {self.n_calls}, Mean reward: {mean_reward:.2f}")
+            # Try to get defensive success rates from episode info buffer
+            defensive_success_rate = 0
+            defensive_actions = 0
+            successful_defensive_actions = 0
+
+            if len(self.model.ep_info_buffer) > 0:
+                # Calculate average defensive success rate across episodes
+                rates = [
+                    ep_info.get("defensive_success_rate", 0)
+                    for ep_info in self.model.ep_info_buffer
+                    if "defensive_success_rate" in ep_info
+                ]
+                actions = [
+                    ep_info.get("defensive_actions", 0)
+                    for ep_info in self.model.ep_info_buffer
+                    if "defensive_actions" in ep_info
+                ]
+                successes = [
+                    ep_info.get("successful_defensive_actions", 0)
+                    for ep_info in self.model.ep_info_buffer
+                    if "successful_defensive_actions" in ep_info
+                ]
+
+                if rates:
+                    defensive_success_rate = np.mean(rates)
+                if actions:
+                    defensive_actions = np.mean(actions)
+                if successes:
+                    successful_defensive_actions = np.mean(successes)
+
+            # Log to console with defensive timing metrics
+            print(
+                f"Step: {self.n_calls}, Mean reward: {mean_reward:.2f}, "
+                f"Defensive success rate: {defensive_success_rate:.1f}%, "
+                f"Avg defensive actions: {defensive_actions:.1f}"
+            )
 
             # Log metrics to CSV file
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.metrics_file, "a") as f:
-                f.write(f"{timestamp},{self.n_calls},{mean_reward:.2f}\n")
+                f.write(
+                    f"{timestamp},{self.n_calls},{mean_reward:.2f},{defensive_success_rate:.1f}\n"
+                )
 
             # Save best model if current reward is better
             if mean_reward > self.best_mean_reward:
@@ -122,11 +158,19 @@ def train_model(model, timesteps):
 
 
 def evaluate_model(model, n_eval_episodes=5):
-    """Evaluate model performance"""
+    """Evaluate model performance with focus on timing abilities"""
     print(f"Evaluating model over {n_eval_episodes} episodes...")
     eval_env = make_kungfu_env(is_play_mode=True)
     mean_reward = 0
     mean_stages_cleared = 0
+    total_defensive_actions = 0
+    total_successful_defensive_actions = 0
+
+    # Track jump/crouch timing by action
+    jump_actions = 0
+    crouch_actions = 0
+    successful_jumps = 0
+    successful_crouches = 0
 
     for i in range(n_eval_episodes):
         obs = eval_env.reset()[0]
@@ -134,10 +178,16 @@ def evaluate_model(model, n_eval_episodes=5):
         total_reward = 0
         steps = 0
         max_stage = 0
+        episode_defensive_actions = 0
+        episode_successful_defensive_actions = 0
 
         # Run until episode ends
         while not done:
             action, _ = model.predict(obs, deterministic=True)
+            prev_hp = (
+                eval_env.get_attr("prev_hp")[0] if hasattr(eval_env, "get_attr") else 0
+            )
+
             obs, reward, terminated, truncated, info = eval_env.step(action)
             total_reward += reward
             steps += 1
@@ -147,28 +197,96 @@ def evaluate_model(model, n_eval_episodes=5):
             if "current_stage" in info and info["current_stage"] > max_stage:
                 max_stage = info["current_stage"]
 
+            # Track defensive actions (jumps and crouches)
+            if action == 4:  # Jump
+                jump_actions += 1
+                # Check if HP stayed the same or increased (successful defense)
+                current_hp = (
+                    eval_env.get_attr("prev_hp")[0]
+                    if hasattr(eval_env, "get_attr")
+                    else 0
+                )
+                if current_hp >= prev_hp:
+                    successful_jumps += 1
+
+            elif action == 5:  # Crouch
+                crouch_actions += 1
+                # Check if HP stayed the same or increased (successful defense)
+                current_hp = (
+                    eval_env.get_attr("prev_hp")[0]
+                    if hasattr(eval_env, "get_attr")
+                    else 0
+                )
+                if current_hp >= prev_hp:
+                    successful_crouches += 1
+
+        # Get defensive stats from the environment
+        if hasattr(eval_env, "get_attr"):
+            try:
+                episode_defensive_actions = eval_env.get_attr("defensive_actions")[0]
+                episode_successful_defensive_actions = eval_env.get_attr(
+                    "successful_defensive_actions"
+                )[0]
+                total_defensive_actions += episode_defensive_actions
+                total_successful_defensive_actions += (
+                    episode_successful_defensive_actions
+                )
+            except:
+                pass
+
         mean_reward += total_reward
         mean_stages_cleared += max_stage
 
+        # Calculate defensive success rate for the episode
+        defensive_success_rate = 0
+        if episode_defensive_actions > 0:
+            defensive_success_rate = (
+                episode_successful_defensive_actions / episode_defensive_actions
+            ) * 100
+
         print(
-            f"Episode {i+1}: Reward: {total_reward:.1f}, Steps: {steps}, Stage: {max_stage}"
+            f"Episode {i+1}: Reward: {total_reward:.1f}, Steps: {steps}, Stage: {max_stage}, "
+            f"Defensive success: {defensive_success_rate:.1f}%"
         )
 
     # Calculate averages
     mean_reward /= n_eval_episodes
     mean_stages_cleared /= n_eval_episodes
 
-    print(f"Evaluation results over {n_eval_episodes} episodes:")
+    # Calculate overall defensive success rate
+    overall_defensive_success_rate = 0
+    if total_defensive_actions > 0:
+        overall_defensive_success_rate = (
+            total_successful_defensive_actions / total_defensive_actions
+        ) * 100
+
+    # Calculate success rates for jumps and crouches
+    jump_success_rate = 0
+    if jump_actions > 0:
+        jump_success_rate = (successful_jumps / jump_actions) * 100
+
+    crouch_success_rate = 0
+    if crouch_actions > 0:
+        crouch_success_rate = (successful_crouches / crouch_actions) * 100
+
+    print(f"\nEvaluation results over {n_eval_episodes} episodes:")
     print(f"- Mean reward: {mean_reward:.2f}")
     print(f"- Mean max stage: {mean_stages_cleared:.1f}")
+    print(f"- Overall defensive success rate: {overall_defensive_success_rate:.1f}%")
+    print(
+        f"- Jump success rate: {jump_success_rate:.1f}% ({successful_jumps}/{jump_actions})"
+    )
+    print(
+        f"- Crouch success rate: {crouch_success_rate:.1f}% ({successful_crouches}/{crouch_actions})"
+    )
 
-    return mean_reward, mean_stages_cleared
+    return mean_reward, mean_stages_cleared, overall_defensive_success_rate
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train an AI to play Kung Fu Master")
     parser.add_argument(
-        "--timesteps", type=int, default=100000, help="Number of timesteps to train"
+        "--timesteps", type=int, default=500000, help="Number of timesteps to train"
     )
     parser.add_argument(
         "--resume", action="store_true", help="Resume training from saved model"
@@ -188,13 +306,23 @@ def main():
         default=None,
         help="Path to a specific model to evaluate",
     )
+    parser.add_argument(
+        "--frame-stack",
+        type=int,
+        default=8,
+        choices=[4, 8],
+        help="Number of frames to stack (4 or 8). Use 4 for compatibility with existing models.",
+    )
     args = parser.parse_args()
 
-    # Create environment
+    # When resuming, we need to use the same frame stack as the original model (4)
+    frame_stack = 4 if args.resume else args.frame_stack
+
+    # Create environment with specified frame stacking
     print(
-        "Creating Kung Fu environment with frame stacking for projectile detection..."
+        f"Creating Kung Fu environment with frame stacking (n_stack={frame_stack}) for projectile detection..."
     )
-    env = make_kungfu_env(is_play_mode=args.render)
+    env = make_kungfu_env(is_play_mode=args.render, frame_stack=frame_stack)
 
     # Evaluation only mode
     if args.eval_only:
@@ -208,6 +336,7 @@ def main():
             return
 
         print(f"Loading model from {model_path} for evaluation...")
+        # When evaluating an existing model, we need to match its frame stack (usually 4)
         model = PPO.load(model_path, env=env)
         evaluate_model(model, n_eval_episodes=5)
         env.close()

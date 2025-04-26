@@ -76,8 +76,12 @@ class KungFuMasterEnv(gym.Wrapper):
         self.episode_steps = 0
         self.defeated_enemies = 0
 
+        # Timing learning metrics
+        self.defensive_actions = 0
+        self.successful_defensive_actions = 0
+
         print(
-            "KungFuMasterEnv initialized - Using frame stacking for projectile detection"
+            "KungFuMasterEnv initialized - Using enhanced frame stacking for projectile detection"
         )
 
     def get_stage(self):
@@ -122,6 +126,25 @@ class KungFuMasterEnv(gym.Wrapper):
         # Reset step counter for timeout
         self.episode_steps = 0
         self.defeated_enemies = 0
+
+        # Reset timing metrics for new episode
+        defensive_success_rate = 0
+        if self.defensive_actions > 0:
+            defensive_success_rate = (
+                self.successful_defensive_actions / self.defensive_actions
+            ) * 100
+
+        # Log defensive timing stats at end of episode if we had any defensive actions
+        if hasattr(self, "defensive_actions") and self.defensive_actions > 0:
+            print(
+                f"Episode defensive stats - Actions: {self.defensive_actions}, "
+                f"Successful: {self.successful_defensive_actions}, "
+                f"Success rate: {defensive_success_rate:.1f}%"
+            )
+
+        # Reset defensive action counters
+        self.defensive_actions = 0
+        self.successful_defensive_actions = 0
 
         # Simple game start - just press START a few times
         for _ in range(5):
@@ -251,6 +274,33 @@ class KungFuMasterEnv(gym.Wrapper):
                 shaped_reward -= 10.0
                 print("Agent died! Applying penalty.")
 
+            # Reward for well-timed defensive actions (jump/crouch)
+            # If HP was maintained during an action that could be defensive, it's likely a good timing
+            if action == 4 or action == 5:  # Jump or Crouch actions
+                self.defensive_actions += 1
+
+                # If we didn't lose health during a defensive action, consider it successful
+                if hp_diff >= 0:
+                    self.successful_defensive_actions += 1
+
+                    # Small positive reward for potentially avoiding danger
+                    shaped_reward += 0.2
+
+                    # Extra reward if the agent maintained health and performed well
+                    # This especially helps with projectile timing
+                    if self.n_steps % 30 == 0:  # Don't reward too frequently
+                        shaped_reward += 0.3
+
+                    # Log successful defensive action occasionally
+                    if self.n_steps % 200 == 0:
+                        success_rate = (
+                            self.successful_defensive_actions
+                            / max(1, self.defensive_actions)
+                        ) * 100
+                        print(
+                            f"Defensive action success rate: {success_rate:.1f}% ({self.successful_defensive_actions}/{self.defensive_actions})"
+                        )
+
             # Add urgency based on remaining time - increases penalty as time passes
             time_penalty = -0.001 * (self.episode_steps / MAX_EPISODE_STEPS)
             shaped_reward += time_penalty
@@ -269,6 +319,16 @@ class KungFuMasterEnv(gym.Wrapper):
                 MAX_EPISODE_STEPS - self.episode_steps
             ) / 30  # in seconds
 
+            # Add timing metrics to info
+            if self.defensive_actions > 0:
+                info["defensive_success_rate"] = (
+                    self.successful_defensive_actions / self.defensive_actions
+                ) * 100
+            else:
+                info["defensive_success_rate"] = 0
+            info["defensive_actions"] = self.defensive_actions
+            info["successful_defensive_actions"] = self.successful_defensive_actions
+
         except Exception as e:
             print(f"Error in reward shaping: {str(e)}")
             shaped_reward = reward
@@ -276,8 +336,13 @@ class KungFuMasterEnv(gym.Wrapper):
         return obs, shaped_reward, terminated, truncated, info
 
 
-def make_kungfu_env(is_play_mode=False):
-    """Create a single Kung Fu Master environment wrapped for RL training"""
+def make_kungfu_env(is_play_mode=False, frame_stack=4):
+    """Create a single Kung Fu Master environment wrapped for RL training
+
+    Args:
+        is_play_mode: Whether to render the environment
+        frame_stack: Number of frames to stack (4 or 8)
+    """
     try:
         render_mode = "human" if is_play_mode else None
         env = retro.make(game="KungFu-Nes", render_mode=render_mode)
@@ -295,7 +360,8 @@ def make_kungfu_env(is_play_mode=False):
     # Wrap in DummyVecEnv for compatibility with stable-baselines3
     env = DummyVecEnv([lambda: env])
 
-    # Frame stacking for better learning with visual inputs - critical for projectile detection
-    env = VecFrameStack(env, n_stack=4)
+    # Configure frame stacking based on parameter
+    print(f"Using frame stacking with n_stack={frame_stack}")
+    env = VecFrameStack(env, n_stack=frame_stack)
 
     return env
