@@ -37,6 +37,19 @@ MEMORY = {
     "player_action": 0x0069,  # Hero Action
     "boss_x": 0x0093,  # Boss Pos X
     "score": [0x0531, 0x0532, 0x0533, 0x0534, 0x0535],  # Score digits
+    # New enemy-related addresses
+    "enemy1_action_timer": 0x002B,  # Enemy 1 Action Timer
+    "enemy2_action_timer": 0x002C,  # Enemy 2 Action Timer
+    "enemy3_action_timer": 0x002D,  # Enemy 3 Action Timer
+    "enemy4_action_timer": 0x002E,  # Enemy 4 Action Timer
+    "enemy1_x": 0x008E,  # Enemy 1 Pos X
+    "enemy2_x": 0x008F,  # Enemy 2 Pos X
+    "enemy3_x": 0x0090,  # Enemy 3 Pos X
+    "enemy4_x": 0x0091,  # Enemy 4 Pos X
+    "enemy1_action": 0x0080,  # Enemy 1 Action
+    "enemy2_action": 0x0081,  # Enemy 2 Action
+    "enemy3_action": 0x0082,  # Enemy 3 Action
+    "enemy4_action": 0x0083,  # Enemy 4 Action
 }
 
 # Define action names for the environment
@@ -77,9 +90,12 @@ class KungFuMasterEnv(gym.Wrapper):
         self.prev_stage = 0
         self.n_steps = 0
         self.episode_steps = 0
-        print(
-            "KungFuMasterEnv initialized - Improved version with timeout and score rewards"
-        )
+
+        # New tracking variables for enemies
+        self.prev_enemy_positions = [0, 0, 0, 0]  # Track previous enemy X positions
+        self.defeated_enemies = 0  # Count defeated enemies
+
+        print("KungFuMasterEnv initialized - Enhanced version with enemy tracking")
 
     def get_stage(self):
         """Get current stage value directly from RAM"""
@@ -109,6 +125,90 @@ class KungFuMasterEnv(gym.Wrapper):
         except:
             return 0
 
+    def get_enemy_data(self):
+        """Get enemy positions, actions, and timers"""
+        try:
+            ram = self.env.get_ram()
+            enemy_data = {}
+
+            # Get positions
+            enemy_data["positions"] = [
+                int(ram[MEMORY["enemy1_x"]]),
+                int(ram[MEMORY["enemy2_x"]]),
+                int(ram[MEMORY["enemy3_x"]]),
+                int(ram[MEMORY["enemy4_x"]]),
+            ]
+
+            # Get actions
+            enemy_data["actions"] = [
+                int(ram[MEMORY["enemy1_action"]]),
+                int(ram[MEMORY["enemy2_action"]]),
+                int(ram[MEMORY["enemy3_action"]]),
+                int(ram[MEMORY["enemy4_action"]]),
+            ]
+
+            # Get timers
+            enemy_data["timers"] = [
+                int(ram[MEMORY["enemy1_action_timer"]]),
+                int(ram[MEMORY["enemy2_action_timer"]]),
+                int(ram[MEMORY["enemy3_action_timer"]]),
+                int(ram[MEMORY["enemy4_action_timer"]]),
+            ]
+
+            return enemy_data
+        except Exception as e:
+            print(f"Error getting enemy data: {str(e)}")
+            return {
+                "positions": [0, 0, 0, 0],
+                "actions": [0, 0, 0, 0],
+                "timers": [0, 0, 0, 0],
+            }
+
+    def calculate_enemy_threat(self, player_x, enemy_data):
+        """Calculate threat level from enemies based on positions and actions"""
+        threat_level = 0
+        active_enemies = 0
+        attacking_enemies = 0
+
+        for i in range(4):
+            enemy_x = enemy_data["positions"][i]
+            enemy_action = enemy_data["actions"][i]
+
+            # Skip enemies that aren't on screen or active
+            if enemy_x == 0:
+                continue
+
+            active_enemies += 1
+
+            # Calculate distance to player
+            distance = abs(player_x - enemy_x)
+
+            # Check if enemy is in attacking action state (you may need to adjust these values)
+            # Common attack actions in Kung Fu Master are often specific values
+            is_attacking = enemy_action in [
+                1,
+                3,
+                5,
+                7,
+            ]  # Example values, adjust based on game
+
+            if is_attacking:
+                attacking_enemies += 1
+
+            # Closer enemies are more threatening
+            if distance < 20:
+                threat_level += 3 if is_attacking else 1
+            elif distance < 40:
+                threat_level += 2 if is_attacking else 0.5
+            else:
+                threat_level += 1 if is_attacking else 0
+
+        return {
+            "threat_level": threat_level,
+            "active_enemies": active_enemies,
+            "attacking_enemies": attacking_enemies,
+        }
+
     def reset(self, **kwargs):
         # Reset the environment
         obs_result = self.env.reset(**kwargs)
@@ -122,6 +222,7 @@ class KungFuMasterEnv(gym.Wrapper):
 
         # Reset step counter for timeout
         self.episode_steps = 0
+        self.defeated_enemies = 0
 
         # Simple game start - just press START a few times
         for _ in range(5):
@@ -136,9 +237,14 @@ class KungFuMasterEnv(gym.Wrapper):
             self.prev_boss_hp = int(ram[MEMORY["boss_hp"]])
             self.prev_score = self.get_score()  # Initialize previous score
 
+            # Initialize enemy tracking
+            enemy_data = self.get_enemy_data()
+            self.prev_enemy_positions = enemy_data["positions"]
+
             print(
                 f"Initial state - Stage: {self.prev_stage}, HP: {self.prev_hp}, "
-                f"X-pos: {self.prev_x_pos}, Score: {self.prev_score}"
+                f"X-pos: {self.prev_x_pos}, Score: {self.prev_score}, "
+                f"Active enemies: {sum(1 for x in enemy_data['positions'] if x > 0)}"
             )
 
         except Exception as e:
@@ -176,7 +282,7 @@ class KungFuMasterEnv(gym.Wrapper):
             # Add timeout penalty
             reward -= 5.0
 
-        # Simple reward shaping
+        # Enhanced reward shaping with enemy data
         try:
             ram = self.env.get_ram()
             current_hp = int(ram[MEMORY["player_hp"]])
@@ -185,13 +291,21 @@ class KungFuMasterEnv(gym.Wrapper):
             current_boss_hp = int(ram[MEMORY["boss_hp"]])
             current_score = self.get_score()
 
+            # Get enemy data
+            enemy_data = self.get_enemy_data()
+            current_enemy_positions = enemy_data["positions"]
+
+            # Calculate threat level
+            threat_info = self.calculate_enemy_threat(current_x_pos, enemy_data)
+
             # Log position and status occasionally
             if self.n_steps % 100 == 0:
                 time_left = (MAX_EPISODE_STEPS - self.episode_steps) / 30  # in seconds
                 print(
                     f"Stage: {current_stage}, Position: {current_x_pos}, "
                     f"HP: {current_hp}, Boss HP: {current_boss_hp}, "
-                    f"Score: {current_score}, Time left: {time_left:.1f}s"
+                    f"Score: {current_score}, Time left: {time_left:.1f}s, "
+                    f"Enemies: {threat_info['active_enemies']}, Threat: {threat_info['threat_level']:.1f}"
                 )
 
             # Increment step counter
@@ -246,14 +360,42 @@ class KungFuMasterEnv(gym.Wrapper):
                     if abs(x_diff) > 5 and self.n_steps % 50 == 0:
                         print(f"Good left movement in stage {current_stage}")
 
-            # Add urgency based on remaining time - increases penalty as time passes
-            time_penalty = -0.001 * (self.episode_steps / MAX_EPISODE_STEPS)
-            shaped_reward += time_penalty
+            # NEW: Enemy interaction rewards
+            defeated_enemies = 0
+            for i in range(4):
+                # If an enemy was active but now isn't, count it as defeated
+                if self.prev_enemy_positions[i] > 0 and current_enemy_positions[i] == 0:
+                    defeated_enemies += 1
+                    shaped_reward += 2.0  # Reward for defeating enemies
+
+            if defeated_enemies > 0:
+                print(f"Defeated {defeated_enemies} enemies!")
+                self.defeated_enemies += defeated_enemies
+
+            # NEW: Threat avoidance and combat intelligence
+            # Reward for being near enemies when performing attack actions
+            if action in [
+                1,
+                8,
+                9,
+                11,
+                12,
+            ]:  # Punch, Kick, Punch+Kick, Crouch Kick, Crouch Punch
+                # If there are close enemies, reward for attacking
+                if threat_info["threat_level"] > 2:
+                    shaped_reward += 0.2  # Small reward for appropriate attack timing
+
+            # Small penalty for high threat situations
+            shaped_reward -= threat_info["threat_level"] * 0.05
 
             # Add death penalty
             if current_hp == 0 and self.prev_hp > 0:
                 shaped_reward -= 10.0
                 print("Agent died! Applying penalty.")
+
+            # Add urgency based on remaining time - increases penalty as time passes
+            time_penalty = -0.001 * (self.episode_steps / MAX_EPISODE_STEPS)
+            shaped_reward += time_penalty
 
             # Update previous values
             self.prev_hp = current_hp
@@ -261,12 +403,17 @@ class KungFuMasterEnv(gym.Wrapper):
             self.prev_stage = current_stage
             self.prev_boss_hp = current_boss_hp
             self.prev_score = current_score
+            self.prev_enemy_positions = current_enemy_positions.copy()
 
+            # Update info dictionary
             info["current_stage"] = current_stage
             info["current_score"] = current_score
             info["time_remaining"] = (
                 MAX_EPISODE_STEPS - self.episode_steps
             ) / 30  # in seconds
+            info["active_enemies"] = threat_info["active_enemies"]
+            info["threat_level"] = threat_info["threat_level"]
+            info["defeated_enemies"] = self.defeated_enemies
 
         except Exception as e:
             print(f"Error in reward shaping: {str(e)}")
