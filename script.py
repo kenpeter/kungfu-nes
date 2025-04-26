@@ -54,6 +54,21 @@ MODEL_PATH = "model/kungfu.zip"
 class KungFuMasterEnv(gym.Wrapper):
     def __init__(self, env):
         super(KungFuMasterEnv, self).__init__(env)
+
+        # empty arr to hold actions except start
+        filtered_actions = []
+        filtered_action_names = []
+
+        for i, action in enumerate(KUNGFU_ACTIONS):
+            # Skip the START action (index 3)
+            if i != 3:
+                filtered_actions.append(action)
+                filtered_action_names.append(KUNGFU_ACTION_NAMES[i])
+
+        # Override the global action lists with filtered versions
+        self.KUNGFU_ACTIONS = filtered_actions
+        self.KUNGFU_ACTION_NAMES = filtered_action_names
+
         # Override the action space to use our discrete actions
         self.action_space = gym.spaces.Discrete(len(KUNGFU_ACTIONS))
 
@@ -82,6 +97,12 @@ class KungFuMasterEnv(gym.Wrapper):
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
 
+        # Automatically press START to begin the game
+        for _ in range(3):  # Press START multiple times to ensure it registers
+            start_action = KUNGFU_ACTIONS[3]  # Index 3 is the START action
+            temp_obs, _, _, _, _ = self.env.step(start_action)
+            # Don't overwrite the original obs
+
         # Read initial state
         ram = self.env.get_ram()
         self.prev_score = self._get_score(ram)
@@ -108,6 +129,11 @@ class KungFuMasterEnv(gym.Wrapper):
         return obs
 
     def step(self, action):
+        # Convert our discrete action to the multi-binary format
+        # If action is START (index 3), replace with NO-OP (index 0)
+        if action == 3:  # START action
+            action = 0  # Replace with NO-OP
+
         # Convert our discrete action to the multi-binary format
         converted_action = KUNGFU_ACTIONS[action]
         obs, reward, terminated, truncated, info = self.env.step(converted_action)
@@ -484,6 +510,7 @@ class ImprovedKungFuModelCallback(BaseCallback):
     4. Protection against saving models that overfit to lucky episodes
     """
 
+    # init with moving avg win (100 default)
     def __init__(
         self,
         check_freq=10000,
@@ -493,6 +520,7 @@ class ImprovedKungFuModelCallback(BaseCallback):
         checkpoint_freq=100000,  # Save checkpoint every 100k steps
         min_steps_between_saves=50000,  # Prevent saving too frequently
     ):
+        # super, check freq, model dir, moving agv, check point freq, min step between saves
         super(ImprovedKungFuModelCallback, self).__init__(verbose)
         self.check_freq = check_freq
         self.model_dir = model_dir
@@ -514,6 +542,7 @@ class ImprovedKungFuModelCallback(BaseCallback):
         self.last_save_step = 0
 
         # Moving average tracking
+
         self.episode_rewards = []
         self.episode_stages = []
         self.episode_metrics = []  # Store complete metrics for each episode
