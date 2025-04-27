@@ -2,8 +2,8 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import gymnasium as gym
-import retro
+import gymnasium as gym  # Use gymnasium instead of gym
+import retro  # Use stable_retro explicitly
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.policies import ActorCriticPolicy
@@ -183,12 +183,43 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         # Add new observation
         self.raw_observation_buffer.append(obs)
 
+    def get_ram(self):
+        """Safely get RAM from the environment, compatible with Stable Retro"""
+        try:
+            # For Stable Retro, try these common access methods
+            if hasattr(self.env, "get_ram"):
+                return self.env.get_ram()
+            elif hasattr(self.env.unwrapped, "get_ram"):
+                return self.env.unwrapped.get_ram()
+
+            # Direct data access methods
+            elif hasattr(self.env, "data") and hasattr(self.env.data, "memory"):
+                return self.env.data.memory
+            elif hasattr(self.env.unwrapped, "data") and hasattr(
+                self.env.unwrapped.data, "memory"
+            ):
+                return self.env.unwrapped.data.memory
+
+            # Last resort - try internal attribute if it exists
+            elif hasattr(self.env, "_memory") and self.env._memory is not None:
+                return self.env._memory
+
+            # If all else fails, return dummy RAM
+            print("Warning: Unable to access RAM through known methods")
+            return np.zeros(0x10000, dtype=np.uint8)
+        except Exception as e:
+            print(f"Error accessing RAM: {e}")
+            return np.zeros(0x10000, dtype=np.uint8)
+
     def get_ram_value(self, address):
         """Get a value from RAM at the specified address"""
         try:
-            ram = self.env.get_ram()
-            return int(ram[address])
-        except:
+            ram = self.get_ram()
+            if ram is not None and len(ram) > address:
+                return int(ram[address])
+            return 0
+        except Exception as e:
+            print(f"Error accessing RAM at address 0x{address:04x}: {e}")
             return 0
 
     def get_stage(self):
@@ -208,22 +239,31 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
     def get_score(self):
         """Get score from RAM"""
         try:
-            ram = self.env.get_ram()
             score = 0
             for i, addr in enumerate(MEMORY["score"]):
-                digit = int(ram[addr])
+                digit = self.get_ram_value(addr)
                 score += digit * (10 ** (4 - i))
             return score
-        except:
+        except Exception as e:
+            print(f"Error getting score: {e}")
             return 0
 
     def reset(self, **kwargs):
+        """Reset the environment with Stable Retro compatibility"""
         # Set flag that reset has been called
         self.reset_called = True
 
-        # Reset the environment - specifically for Stable Retro
+        # Reset the environment
         try:
-            obs, info = self.env.reset(**kwargs)
+            # For gymnasium/Stable Retro
+            obs_result = self.env.reset(**kwargs)
+
+            # Handle different return types
+            if isinstance(obs_result, tuple) and len(obs_result) == 2:
+                obs, info = obs_result
+            else:
+                obs = obs_result
+                info = {}
         except Exception as e:
             print(f"Error in reset: {e}")
             # Create a dummy observation and info
@@ -254,53 +294,29 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         # Clear observation buffer
         self.raw_observation_buffer = []
 
-        # Simple game start - press START a few times
-        try:
-            # Only press START if reset() worked correctly
-            # (this prevents the error we were seeing)
-            for _ in range(5):
-                # Only try to press START if the environment seems ready
-                if hasattr(self.env, "step"):
-                    try:
-                        self.env.step(KUNGFU_ACTIONS[3])  # Press START
-                    except Exception as step_err:
-                        print(
-                            f"Warning: Could not press START button during reset: {step_err}"
-                        )
-                        break
-        except Exception as e:
-            print(f"Warning: Could not press START button during reset: {str(e)}")
-
         # Get initial state
-        try:
-            ram = self.env.get_ram()
-            self.prev_hp = int(ram[MEMORY["player_hp"]])
-            self.prev_x_pos = int(ram[MEMORY["player_x"]])
-            self.prev_y_pos = int(ram[MEMORY["player_y"]])
-            self.prev_stage = int(ram[MEMORY["current_stage"]])
-            self.prev_boss_hp = int(ram[MEMORY["boss_hp"]])
-            self.prev_score = self.get_score()
+        self.prev_hp = self.get_hp()
+        self.prev_x_pos, self.prev_y_pos = self.get_player_position()
+        self.prev_stage = self.get_stage()
+        self.prev_boss_hp = self.get_ram_value(MEMORY["boss_hp"])
+        self.prev_score = self.get_score()
 
-            print(
-                f"Initial state - Stage: {self.prev_stage}, HP: {self.prev_hp}, "
-                f"Pos: ({self.prev_x_pos}, {self.prev_y_pos}), Score: {self.prev_score}"
-            )
-        except Exception as e:
-            print(f"Error getting initial state: {str(e)}")
-            # Initialize with default values if we can't read RAM
-            self.prev_hp = 0
-            self.prev_x_pos = 0
-            self.prev_y_pos = 0
-            self.prev_stage = 0
-            self.prev_boss_hp = 0
-            self.prev_score = 0
+        print(
+            f"Initial state - Stage: {self.prev_stage}, HP: {self.prev_hp}, "
+            f"Pos: ({self.prev_x_pos}, {self.prev_y_pos}), Score: {self.prev_score}"
+        )
 
         # Buffer the initial observation
         self._buffer_raw_observation(obs)
 
-        return obs, info
+        # Return based on gym version
+        if isinstance(obs_result, tuple) and len(obs_result) == 2:
+            return obs, info
+        else:
+            return obs
 
     def step(self, action):
+        """Take a step in the environment with Stable Retro compatibility"""
         # Check if reset has been called
         if not self.reset_called:
             print(
@@ -308,32 +324,38 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             )
             self.reset()
 
-        # convet to actual action
-        converted_action = self.KUNGFU_ACTIONS[action]
+        # Convert to actual action
+        try:
+            converted_action = self.KUNGFU_ACTIONS[action]
+        except Exception as e:
+            print(f"Error converting action {action}: {e}")
+            converted_action = self.KUNGFU_ACTIONS[0]  # Default to no-op
 
-        # get current hp and current position
+        # Get current hp and current position before step
         current_hp = self.get_hp()
         player_position = self.get_player_position()
 
-        # many frames inside image projectile
+        # Initialize projectile variables
         image_projectiles = []
-        # projectile info
         projectile_info = None
-        # recomend action
         recommended_action = 0
 
-        # obs >= 2
+        # Detect projectiles if we have enough frames
         if len(self.raw_observation_buffer) >= 2:
-            # Convert buffer to numpy array for projectile detection
-            frame_stack = np.array(self.raw_observation_buffer)
-            # Detect projectiles from frame differences
-            projectile_info = enhance_observation_with_projectiles(
-                frame_stack, self.projectile_detector, player_position
-            )
-            image_projectiles = projectile_info["projectiles"]
-            recommended_action = projectile_info["recommended_action"]
+            try:
+                # Convert buffer to numpy array for projectile detection
+                frame_stack = np.array(self.raw_observation_buffer)
 
-        # Determine if there's an active projectile threat - now based only on image detection
+                # Detect projectiles from frame differences
+                projectile_info = enhance_observation_with_projectiles(
+                    frame_stack, self.projectile_detector, player_position
+                )
+                image_projectiles = projectile_info["projectiles"]
+                recommended_action = projectile_info["recommended_action"]
+            except Exception as e:
+                print(f"Error in projectile detection: {e}")
+
+        # Determine if there's an active projectile threat
         projectile_threat = len(image_projectiles) > 0
 
         if projectile_threat:
@@ -347,31 +369,50 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             if projectile_threat:
                 self.projectile_defensive_actions += 1
 
-                # Check if the action matches the recommended action
-                if recommended_action > 0 and action == recommended_action:
-                    # Bonus for taking the specifically recommended defensive action
-                    action_bonus = 0.5
-                else:
-                    action_bonus = 0.1
-
-        # Take step in environment
+        # Take step in environment with error handling for different gym versions
         try:
-            obs, reward, terminated, truncated, info = self.env.step(converted_action)
-        except Exception as e:
-            print(f"Error during environment step: {str(e)}")
-            # Return default values as fallback
-            return (
-                (
+            # Try step with action
+            step_result = self.env.step(converted_action)
+
+            # Handle different return formats (gym vs gymnasium)
+            if len(step_result) == 5:
+                # Gymnasium format
+                obs, reward, terminated, truncated, info = step_result
+                done = terminated or truncated
+            elif len(step_result) == 4:
+                # Old gym format
+                obs, reward, done, info = step_result
+                terminated = done
+                truncated = False
+            else:
+                # Unexpected format
+                print(
+                    f"Warning: Unexpected step result format with {len(step_result)} values"
+                )
+                obs = (
                     np.zeros_like(self.raw_observation_buffer[-1])
                     if self.raw_observation_buffer
                     else np.zeros((224, 240, 3), dtype=np.uint8)
-                ),
-                -1.0,  # Negative reward for error
-                True,  # Terminate episode
-                True,  # Truncate episode
-                {"error": str(e)},
-            )
+                )
+                reward = 0
+                terminated = True
+                truncated = True
+                info = {}
 
+        except Exception as e:
+            print(f"Error during environment step: {e}")
+            # Fall back to a safe return value format
+            obs = (
+                np.zeros_like(self.raw_observation_buffer[-1])
+                if self.raw_observation_buffer
+                else np.zeros((224, 240, 3), dtype=np.uint8)
+            )
+            reward = -1.0  # Penalty for error
+            terminated = True
+            truncated = True
+            info = {"error": str(e)}
+
+        # Ensure info is a dictionary
         if not isinstance(info, dict):
             info = {}
 
@@ -389,12 +430,10 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         # Enhanced reward shaping
         try:
             # Get new state
-            ram = self.env.get_ram()
-            current_hp = int(ram[MEMORY["player_hp"]])
-            current_x_pos = int(ram[MEMORY["player_x"]])
-            current_y_pos = int(ram[MEMORY["player_y"]])
-            current_stage = int(ram[MEMORY["current_stage"]])
-            current_boss_hp = int(ram[MEMORY["boss_hp"]])
+            current_hp = self.get_hp()
+            current_x_pos, current_y_pos = self.get_player_position()
+            current_stage = self.get_stage()
+            current_boss_hp = self.get_ram_value(MEMORY["boss_hp"])
             current_score = self.get_score()
 
             # Log status occasionally
@@ -524,17 +563,16 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 info["projectile_avoidance_rate"] = 0
 
         except Exception as e:
-            print(f"Error in reward shaping: {str(e)}")
+            print(f"Error in reward shaping: {e}")
             shaped_reward = reward
 
+        # Return with gymnasium API by default
         return obs, shaped_reward, terminated, truncated, info
 
 
-# Projectile Aware Wrapper
 class ProjectileAwareWrapper(gym.Wrapper):
     """A wrapper that adds projectile information to the observation space"""
 
-    # init
     def __init__(self, env, max_projectiles=5):
         super().__init__(env)
 
@@ -570,14 +608,23 @@ class ProjectileAwareWrapper(gym.Wrapper):
             }
         )
 
-    # reset
     def reset(self, **kwargs):
-        obs_result = self.env.reset(**kwargs)
+        """Reset the environment and return enhanced observation with projectile data"""
+        # Reset the underlying environment
+        try:
+            # For gymnasium/Stable Retro
+            obs_result = self.env.reset(**kwargs)
 
-        if isinstance(obs_result, tuple) and len(obs_result) == 2:
-            obs, info = obs_result
-        else:
-            obs = obs_result
+            # Handle different return types
+            if isinstance(obs_result, tuple) and len(obs_result) == 2:
+                obs, info = obs_result
+            else:
+                obs = obs_result
+                info = {}
+        except Exception as e:
+            print(f"Error in reset: {e}")
+            # Create a dummy observation and info
+            obs = np.zeros((224, 240, 3), dtype=np.uint8)
             info = {}
 
         # Create empty projectile vector data
@@ -595,22 +642,52 @@ class ProjectileAwareWrapper(gym.Wrapper):
             "recommended_action": recommended_action,
         }
 
-        return enhanced_obs, info
-
-    # step
-    def step(self, action):
-        # Take step in environment
-        step_result = self.env.step(action)
-
-        # Handle different return types
-        if len(step_result) == 4:
-            obs, reward, done, info = step_result
-            terminated = done
-            truncated = False
-        elif len(step_result) == 5:
-            obs, reward, terminated, truncated, info = step_result
+        # Return based on what we received
+        if isinstance(obs_result, tuple) and len(obs_result) == 2:
+            return enhanced_obs, info
         else:
-            raise ValueError(f"Unexpected step result length: {len(step_result)}")
+            return enhanced_obs
+
+    def step(self, action):
+        """Step the environment and return enhanced observation with projectile data"""
+        # Take step in environment with error handling for different gym versions
+        try:
+            # Try with gymnasium API (5 return values)
+            try:
+                step_result = self.env.step(action)
+                if len(step_result) == 5:
+                    obs, reward, terminated, truncated, info = step_result
+                    done = terminated or truncated
+                elif len(step_result) == 4:
+                    # Old gym API
+                    obs, reward, done, info = step_result
+                    terminated = done
+                    truncated = False
+                else:
+                    # Unexpected format
+                    raise ValueError(
+                        f"Unexpected step result format with {len(step_result)} values"
+                    )
+            except ValueError as e:
+                print(f"Step format error: {e}")
+                obs = np.zeros((224, 240, 3), dtype=np.uint8)
+                reward = -1.0
+                terminated = True
+                truncated = True
+                info = {"error": str(e)}
+
+        except Exception as e:
+            print(f"Error during environment step: {e}")
+            # Return default values as fallback
+            obs = np.zeros((224, 240, 3), dtype=np.uint8)
+            reward = -1.0
+            terminated = True
+            truncated = True
+            info = {"error": str(e)}
+
+        # Ensure info is a dictionary
+        if not isinstance(info, dict):
+            info = {}
 
         # Get current player position
         player_position = (
@@ -631,45 +708,48 @@ class ProjectileAwareWrapper(gym.Wrapper):
             hasattr(self.env, "raw_observation_buffer")
             and len(self.env.raw_observation_buffer) >= 2
         ):
-            # Convert buffer to numpy array for projectile detection
-            frame_stack = np.array(self.env.raw_observation_buffer)
+            try:
+                # Convert buffer to numpy array for projectile detection
+                frame_stack = np.array(self.env.raw_observation_buffer)
 
-            # Detect projectiles from frame differences
-            projectile_info = enhance_observation_with_projectiles(
-                frame_stack, self.env.projectile_detector, player_position
-            )
-            projectiles = projectile_info["projectiles"]
-            recommended_action[0] = projectile_info["recommended_action"]
+                # Detect projectiles from frame differences
+                projectile_info = enhance_observation_with_projectiles(
+                    frame_stack, self.env.projectile_detector, player_position
+                )
+                projectiles = projectile_info["projectiles"]
+                recommended_action[0] = projectile_info["recommended_action"]
 
-            # Convert projectile info to feature vectors
-            # Each projectile: [relative_x, relative_y, velocity_x, velocity_y, size, distance, time_to_impact]
-            for i, proj in enumerate(projectiles[: self.max_projectiles]):
-                # Extract projectile position and info
-                x, y = proj["position"]
-                vel_x, vel_y = proj.get("velocity", (0, 0))
-                width, height = proj.get("size", (0, 0))
-                size = max(width, height)
+                # Convert projectile info to feature vectors
+                # Each projectile: [relative_x, relative_y, velocity_x, velocity_y, size, distance, time_to_impact]
+                for i, proj in enumerate(projectiles[: self.max_projectiles]):
+                    # Extract projectile position and info
+                    x, y = proj["position"]
+                    vel_x, vel_y = proj.get("velocity", (0, 0))
+                    width, height = proj.get("size", (0, 0))
+                    size = max(width, height)
 
-                # Calculate relative position to player
-                player_x, player_y = player_position
-                rel_x = x - player_x
-                rel_y = y - player_y
+                    # Calculate relative position to player
+                    player_x, player_y = player_position
+                    rel_x = x - player_x
+                    rel_y = y - player_y
 
-                # Calculate distance and estimated time to impact
-                distance = np.sqrt(rel_x**2 + rel_y**2)
-                time_to_impact = distance / max(np.sqrt(vel_x**2 + vel_y**2), 1e-6)
+                    # Calculate distance and estimated time to impact
+                    distance = np.sqrt(rel_x**2 + rel_y**2)
+                    time_to_impact = distance / max(np.sqrt(vel_x**2 + vel_y**2), 1e-6)
 
-                # Store features
-                projectile_data[i] = [
-                    rel_x,
-                    rel_y,
-                    vel_x,
-                    vel_y,
-                    size,
-                    distance,
-                    time_to_impact,
-                ]
-                projectile_mask[i] = 1  # Mark this projectile as valid
+                    # Store features
+                    projectile_data[i] = [
+                        rel_x,
+                        rel_y,
+                        vel_x,
+                        vel_y,
+                        size,
+                        distance,
+                        time_to_impact,
+                    ]
+                    projectile_mask[i] = 1  # Mark this projectile as valid
+            except Exception as e:
+                print(f"Error in projectile detection: {e}")
 
         # Create enhanced observation
         enhanced_obs = {
@@ -1038,39 +1118,45 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
 def make_enhanced_kungfu_env(
     is_play_mode=False, frame_stack=8, use_projectile_features=False
 ):
-    """Create a Kung Fu Master environment with enhanced projectile detection"""
+    """Create a Kung Fu Master environment with enhanced projectile detection for Stable Retro"""
 
-    # First, ensure we have the right ROM
+    # Create base environment
+    env = None
     try:
-        # Print available games to debug
         import retro
-    except Exception as e:
-        print(f"Could not list games: {e}")
 
-    # Try with explicit initialization sequence
-    try:
-        env = None
-        import retro
+        print("Using Stable Retro library")
 
         # First ensure we have the render mode set correctly
         render_mode = "human" if is_play_mode else None
-        print(f"Attempting to create environment with render_mode={render_mode}")
+        print(
+            f"Attempting to create Stable Retro environment with render_mode={render_mode}"
+        )
 
         # Try with full error handling
         try:
-            env = retro.make(game="KungFu-Nes", render_mode=render_mode)
+            # Try with explicit render mode first
+            if render_mode:
+                env = retro.make(game="KungFu-Nes", render_mode=render_mode)
+            else:
+                # Try without render mode if not in play mode
+                env = retro.make(game="KungFu-Nes")
             print("Successfully created KungFu-Nes environment")
         except Exception as e1:
             print(f"Failed to create KungFu-Nes environment: {e1}")
             try:
-                env = retro.make(game="KungFuMaster-Nes", render_mode=render_mode)
+                # Try alternate game name
+                if render_mode:
+                    env = retro.make(game="KungFuMaster-Nes", render_mode=render_mode)
+                else:
+                    env = retro.make(game="KungFuMaster-Nes")
                 print("Successfully created KungFuMaster-Nes environment")
             except Exception as e2:
                 print(f"Failed to create KungFuMaster-Nes environment: {e2}")
 
-                # Last resort - try the most basic approach
+                # Last resort - try with minimal parameters
                 try:
-                    # Try with default parameters
+                    # No render mode specified
                     env = retro.make("KungFu-Nes")
                     if is_play_mode and hasattr(env, "render"):
                         print("Using manual rendering mode")
@@ -1078,39 +1164,125 @@ def make_enhanced_kungfu_env(
                     print("Created environment with basic parameters")
                 except Exception as e3:
                     print(f"All environment creation attempts failed: {e1}, {e2}, {e3}")
-                    raise RuntimeError("Could not initialize Retro environment")
+                    raise RuntimeError("Could not initialize Stable Retro environment")
 
-        # Explicitly reset the environment once before wrapping
+        # Explicitly reset the environment once before wrapping to test it
         if env is not None:
             print("Performing initial reset of base environment")
-            env.reset()
-
-        return env
+            try:
+                env.reset()
+                print("Initial reset successful")
+            except Exception as e:
+                print(f"Warning: Initial reset failed but continuing: {e}")
 
     except Exception as e:
         print(f"Fatal error creating environment: {e}")
         raise
 
-    # Apply our enhanced wrapper
-    env = EnhancedKungFuMasterEnv(env)
+    # Check if we have a valid environment
+    if env is None:
+        raise RuntimeError("Failed to create base environment")
+
+    # Print environment info for debugging
+    try:
+        print(f"Environment type: {type(env)}")
+        print(f"Observation space: {env.observation_space}")
+        print(f"Action space: {env.action_space}")
+    except Exception as e:
+        print(f"Warning: Could not print environment info: {e}")
+
+    # Apply our enhanced wrapper with extra error handling
+    print("Applying EnhancedKungFuMasterEnv wrapper")
+    try:
+        env = EnhancedKungFuMasterEnv(env)
+    except Exception as e:
+        print(f"Error applying EnhancedKungFuMasterEnv: {e}")
+        raise
 
     # Set up monitoring with our resilient monitor
-    os.makedirs("logs", exist_ok=True)
-    monitor_path = os.path.join("logs", "kungfu")
-    env = ResilientMonitor(env, monitor_path)
+    try:
+        os.makedirs("logs", exist_ok=True)
+        monitor_path = os.path.join("logs", "kungfu")
+        print(f"Setting up monitoring at {monitor_path}")
+        env = ResilientMonitor(env, monitor_path)
+    except Exception as e:
+        print(f"Warning: Could not set up monitoring: {e}")
 
     # Wrap in DummyVecEnv for compatibility with stable-baselines3
-    env = DummyVecEnv([lambda: env])
+    try:
+        print("Wrapping with DummyVecEnv")
+        env = DummyVecEnv([lambda: env])
+        # Test the wrapped environment
+        print("Testing DummyVecEnv wrapper")
+        test_obs = env.reset()
+        print(
+            f"DummyVecEnv reset successful, observation shape: {test_obs.shape if hasattr(test_obs, 'shape') else 'N/A'}"
+        )
+    except Exception as e:
+        print(f"Error wrapping with DummyVecEnv: {e}")
+        raise
 
     # Apply frame stacking - we need more frames for better projectile detection
-    print(
-        f"Using enhanced frame stacking with n_stack={frame_stack} for improved projectile detection"
-    )
-    env = VecFrameStack(env, n_stack=frame_stack)
+    try:
+        print(
+            f"Using enhanced frame stacking with n_stack={frame_stack} for improved projectile detection"
+        )
+        env = VecFrameStack(env, n_stack=frame_stack)
+
+        # Test the frame-stacked environment
+        print("Testing VecFrameStack wrapper")
+        test_obs = env.reset()
+        print(
+            f"VecFrameStack reset successful, observation shape: {test_obs.shape if hasattr(test_obs, 'shape') else 'N/A'}"
+        )
+    except Exception as e:
+        print(f"Error applying frame stacking: {e}")
+        raise
 
     # Optionally add projectile features wrapper
     if use_projectile_features:
-        print("Adding projectile feature wrapper for explicit projectile information")
-        env = wrap_projectile_aware(env, max_projectiles=5)
+        try:
+            print(
+                "Adding projectile feature wrapper for explicit projectile information"
+            )
+            env = wrap_projectile_aware(env, max_projectiles=5)
+
+            # Test the projectile-aware environment
+            print("Testing ProjectileAwareWrapper")
+            test_obs = env.reset()
+            if isinstance(test_obs, dict):
+                print(
+                    f"ProjectileAwareWrapper reset successful, observation keys: {test_obs.keys()}"
+                )
+            else:
+                print(
+                    f"ProjectileAwareWrapper reset returned unexpected type: {type(test_obs)}"
+                )
+        except Exception as e:
+            print(f"Warning: Could not add projectile features wrapper: {e}")
+            print("Continuing without projectile features")
 
     return env
+
+
+# Helper function to wrap environment with projectile awareness
+def wrap_projectile_aware(env, max_projectiles=5):
+    """Wrap an environment to add projectile awareness"""
+    # Handle VecEnv case - unwrap to get the base env
+    if isinstance(env, VecEnv):
+        # Get the base environment without closing the VecEnv
+        base_env = env.envs[0]
+
+        # Apply our wrapper to the unwrapped base environment
+        print(f"Wrapping base environment of type {type(base_env)}")
+        wrapped_env = ProjectileAwareWrapper(base_env, max_projectiles=max_projectiles)
+
+        # Create a new VecEnv with our wrapped environment
+        print("Creating new DummyVecEnv with the ProjectileAwareWrapper")
+        new_env = DummyVecEnv([lambda: wrapped_env])
+
+        return new_env
+    else:
+        # Apply wrapper directly
+        print(f"Directly wrapping environment of type {type(env)}")
+        return ProjectileAwareWrapper(env, max_projectiles=max_projectiles)
