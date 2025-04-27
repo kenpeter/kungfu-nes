@@ -7,13 +7,13 @@ import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 import matplotlib.pyplot as plt
-import os.path
 
-# Import our enhanced environment
-from enhanced_kungfu_env import make_enhanced_kungfu_env, MODEL_PATH as ENV_MODEL_PATH
-
-# Import the custom model creation function
-from custom_policy import ProjectileAwarePolicy, create_enhanced_kungfu_model
+# Import our custom environment and policy
+from kung_fu_env import (
+    make_enhanced_kungfu_env,
+    create_enhanced_kungfu_model,
+    MODEL_PATH,
+)
 
 
 # Enhanced SaveCallback with projectile metrics tracking
@@ -29,7 +29,7 @@ class EnhancedSaveCallback(BaseCallback):
         self.best_mean_reward = -float("inf")
         self.best_projectile_avoidance = -float("inf")
         self.log_dir = log_dir
-        self.model_path = model_path or ENV_MODEL_PATH
+        self.model_path = model_path or MODEL_PATH
 
         # Create necessary directories
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
@@ -141,7 +141,7 @@ class EnhancedSaveCallback(BaseCallback):
 def create_enhanced_model(env, resume=False, model_path=None):
     """Create a new PPO model with enhanced architecture for projectile detection"""
     # Set model path
-    model_path = model_path or ENV_MODEL_PATH
+    model_path = model_path or MODEL_PATH
 
     # Improved network architecture - deeper for better feature extraction
     policy_kwargs = dict(
@@ -172,7 +172,7 @@ def create_enhanced_model(env, resume=False, model_path=None):
             clip_range=0.2,  # PPO clipping parameter
             ent_coef=0.01,  # Higher entropy for more exploration
             device=device,
-            tensorboard_log=None,
+            tensorboard_log="./logs/tensorboard/",
         )
 
     return model
@@ -181,7 +181,7 @@ def create_enhanced_model(env, resume=False, model_path=None):
 def train_enhanced_model(model, timesteps, model_path=None):
     """Train the model with focus on projectile avoidance"""
     # Set model path
-    model_path = model_path or ENV_MODEL_PATH
+    model_path = model_path or MODEL_PATH
 
     # Create enhanced callback
     save_callback = EnhancedSaveCallback(
@@ -447,7 +447,7 @@ def main():
     model_path = (
         args.model_path
         if args.model_path
-        else f"{ENV_MODEL_PATH.split('.')[0]}{model_suffix}.zip"
+        else f"{MODEL_PATH.split('.')[0]}{model_suffix}.zip"
     )
 
     # Evaluation only mode
@@ -458,10 +458,12 @@ def main():
 
         print(f"Loading model from {model_path} for evaluation...")
         if args.use_projectile_features:
-            # Use custom policy for projectile-aware models
-            model = PPO.load(model_path, env=env, policy=ProjectileAwarePolicy)
+            # Use appropriate model loading based on features
+            model = create_enhanced_kungfu_model(
+                env, resume=True, model_path=model_path
+            )
         else:
-            # Use standard policy for regular models
+            # Use standard model
             model = PPO.load(model_path, env=env)
 
         evaluate_enhanced_model(model, n_eval_episodes=5)
@@ -472,12 +474,9 @@ def main():
     if args.use_projectile_features:
         # Use custom model with projectile awareness
         print("Creating model with projectile feature support...")
-        model = create_enhanced_kungfu_model(env)
-
-        # If resuming, load weights
-        if args.resume and os.path.exists(model_path):
-            print(f"Loading weights from {model_path}")
-            model = PPO.load(model_path, env=env, policy=ProjectileAwarePolicy)
+        model = create_enhanced_kungfu_model(
+            env, resume=args.resume, model_path=model_path
+        )
     else:
         # Use standard model
         model = create_enhanced_model(env, resume=args.resume, model_path=model_path)

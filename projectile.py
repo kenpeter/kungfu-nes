@@ -1,7 +1,6 @@
 import numpy as np
 
 
-# how we detect projectile
 class ProjectileDetector:
     """
     A class to detect projectiles in frame stacks by analyzing pixel changes
@@ -233,6 +232,8 @@ class ProjectileDetector:
                             "vy": vy,
                             "size": matched_proj["size"],
                             "confidence": confidence,
+                            "position": (new_x, new_y),  # For compatibility
+                            "velocity": (vx, vy),  # For compatibility
                         }
                     )
 
@@ -269,6 +270,11 @@ class ProjectileDetector:
                                 "vy": vy,
                                 "size": updated_traj["sizes"][-1],
                                 "confidence": confidence,
+                                "position": (
+                                    predicted_pos[0],
+                                    predicted_pos[1],
+                                ),  # For compatibility
+                                "velocity": (vx, vy),  # For compatibility
                             }
                         )
 
@@ -443,11 +449,6 @@ class ProjectileDetector:
         return collision_time, projectile_height, collision_confidence
 
 
-# Update your enhance_observation_with_projectiles function
-# (Only the relevant parts to modify are shown)
-
-
-# enhance obs with projectile
 def enhance_observation_with_projectiles(frame_stack, detector, player_position):
     """
     Detect projectiles and enhance observation with projectile information
@@ -467,8 +468,20 @@ def enhance_observation_with_projectiles(frame_stack, detector, player_position)
     player_x, player_y = player_position
 
     for i, projectile in enumerate(projectiles):
-        x, y = projectile["position"]
+        x, y = (
+            projectile["position"]
+            if "position" in projectile
+            else (projectile["x"], projectile["y"])
+        )
         width, height = projectile.get("size", (0, 0))
+        if not isinstance(width, tuple):
+            width, height = (
+                width,
+                width,
+            )  # Use size as both width and height if not a tuple
+
+        # Make sure position is set
+        projectile["position"] = (x, y)
 
         # If we have a previous position, calculate velocity
         if "prev_position" in projectile:
