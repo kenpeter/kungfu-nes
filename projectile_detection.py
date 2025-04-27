@@ -1,7 +1,7 @@
 import numpy as np
 
 
-# projectile detector
+# how we detect projectile
 class ProjectileDetector:
     """
     A class to detect projectiles in frame stacks by analyzing pixel changes

@@ -11,7 +11,7 @@ from stable_baselines3 import PPO
 from gymnasium import spaces
 
 
-# Feature extractor for projectile awareness
+# projectile detection -> wraper -> policy -> kungfu env
 class ProjectileAwareCNN(BaseFeaturesExtractor):
     """
     CNN for processing both game frames and projectile features.

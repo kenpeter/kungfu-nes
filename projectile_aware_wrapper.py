@@ -7,6 +7,7 @@ from stable_baselines3.common.vec_env import VecEnv, DummyVecEnv
 from projectile_detection import enhance_observation_with_projectiles
 
 
+# projectile detection -> this wrapper -> RL
 class ProjectileAwareWrapper(gym.Wrapper):
     """A wrapper that adds projectile information to the observation space"""
 
