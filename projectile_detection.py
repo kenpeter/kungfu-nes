@@ -1,6 +1,7 @@
 import numpy as np
 
 
+# projectile detector
 class ProjectileDetector:
     """
     A class to detect projectiles in frame stacks by analyzing pixel changes
@@ -8,6 +9,7 @@ class ProjectileDetector:
     Utilizes full n-frame stack for more robust detection and tracking.
     """
 
+    # init self, projectile color, movement threshold, min project, max project
     def __init__(
         self,
         projectile_color_ranges=None,
@@ -24,26 +26,24 @@ class ProjectileDetector:
             min_projectile_size: Minimum size of a projectile in pixels
             max_projectile_size: Maximum size of a projectile in pixels
         """
-        # Default color ranges for common projectiles in Kung Fu Master
-        # (knives, bottles, etc. - mostly white/light colored)
         self.projectile_color_ranges = projectile_color_ranges or [
-            # Light colors (knives, etc.) - RGB ranges
+            # light color for kinves, etc
             {"r": (180, 255), "g": (180, 255), "b": (180, 255)},
-            # Yellow/orange fireballs
+            # yellow orange fireball
             {"r": (200, 255), "g": (140, 220), "b": (20, 100)},
         ]
 
-        # movement threshold
+        # how fast threshold
         self.movement_threshold = movement_threshold
         # projectile min
         self.min_projectile_size = min_projectile_size
         # projectile max
         self.max_projectile_size = max_projectile_size
 
-        # Track frame history for smoother detection
+        # prev projectile arr
         self.previous_projectiles = []
 
-        # Store trajectory history for each tracked projectile
+        # detect motion pattern
         self.projectile_trajectories = []
 
         # Projectile ID counter to maintain identity across frames
@@ -71,20 +71,23 @@ class ProjectileDetector:
 
         # up to 5 recent frames, more recent and more higher weight
         for i in range(1, min(stack_size, 5)):
-            weight = 1.0 / (i)  # Higher weight for more recent differences
+            # recent frame has more weight
+            weight = 1.0 / (i)
+            # prev index, and current index, but backward
             prev_idx = -i - 1
             curr_idx = -i
 
-            # Check if indices are valid
+            # need to bound check
             if abs(prev_idx) >= stack_size or abs(curr_idx) >= stack_size:
                 continue
 
+            # frame diff
             frame_diff = np.abs(
                 frame_stack[curr_idx].astype(np.float32)
                 - frame_stack[prev_idx].astype(np.float32)
             )
 
-            # Convert to grayscale if RGB
+            # if rgb, convert to grey scale
             if frame_diff.ndim == 3:
                 frame_diff = np.mean(frame_diff, axis=2)
 
@@ -151,8 +154,9 @@ class ProjectileDetector:
         # Copy trajectories for modification
         updated_trajectories = []
 
+        # need to predict where is next projectile will be
         for traj in self.projectile_trajectories:
-            # Predict where this projectile should be in current frame
+            # last x, y position
             last_pos = traj["positions"][-1]  # [x, y]
             last_vel = (
                 traj["velocities"][-1] if traj["velocities"] else [0, 0]
@@ -439,51 +443,107 @@ class ProjectileDetector:
         return collision_time, projectile_height, collision_confidence
 
 
-def enhance_observation_with_projectiles(obs, projectile_detector, player_pos):
+# Update your enhance_observation_with_projectiles function
+# (Only the relevant parts to modify are shown)
+
+
+# enhance obs with projectile
+def enhance_observation_with_projectiles(frame_stack, detector, player_position):
     """
-    Enhance the observation with projectile detection information
+    Detect projectiles and enhance observation with projectile information
 
     Args:
-        obs: Original observation (frame stack)
-        projectile_detector: ProjectileDetector instance
-        player_pos: (x, y) position of the player
+        frame_stack: Stack of recent frames
+        detector: ProjectileDetector instance
+        player_position: (x, y) position of the player
 
     Returns:
-        Dictionary with projectile information:
-        {
-            'projectiles': List of detected projectiles,
-            'collision_time': Estimated frames until collision,
-            'projectile_height': Height of incoming projectile,
-            'recommended_action': Recommended defensive action (4=jump, 5=crouch, 0=none),
-            'confidence': Confidence in the collision prediction
-        }
+        Dictionary with projectile information and recommended action
     """
-    # Detect projectiles using the full frame stack
-    projectiles = projectile_detector.detect_projectiles(obs)
+    # Existing detection code...
+    projectiles = detector.detect_projectiles(frame_stack)
 
-    # Predict potential collisions
-    collision_time, projectile_height, confidence = (
-        projectile_detector.predict_collision(projectiles, player_pos[0], player_pos[1])
-    )
+    # Enhanced data: Calculate velocity and trajectory info for each projectile
+    player_x, player_y = player_position
 
-    # Determine recommended action based on projectile height and confidence
-    recommended_action = 0  # Default: no defensive action
+    for i, projectile in enumerate(projectiles):
+        x, y = projectile["position"]
+        width, height = projectile.get("size", (0, 0))
 
-    # Only recommend action if confidence is high enough
-    if collision_time > 0 and collision_time < 10 and confidence > 0.4:
-        player_y = player_pos[1]
-
-        # If projectile is high, crouch
-        if projectile_height < player_y:
-            recommended_action = 5  # Crouch
-        # If projectile is low, jump
+        # If we have a previous position, calculate velocity
+        if "prev_position" in projectile:
+            prev_x, prev_y = projectile["prev_position"]
+            projectile["velocity"] = (x - prev_x, y - prev_y)
         else:
-            recommended_action = 4  # Jump
+            # If this is a new projectile, try to match with previous frames
+            # to estimate velocity
+            if i > 0 and len(frame_stack) > 1:
+                # Try to find similar projectile in previous detection
+                # This is simplified - could be more sophisticated
+                projectile["velocity"] = (0, 0)  # Default if no match found
+
+        # Calculate trajectory information
+        dx = player_x - x
+        dy = player_y - y
+        projectile["distance"] = np.sqrt(dx**2 + dy**2)
+
+        # Calculate time to impact if velocity is available
+        if "velocity" in projectile:
+            vel_x, vel_y = projectile["velocity"]
+            vel_magnitude = max(np.sqrt(vel_x**2 + vel_y**2), 0.01)  # Avoid div by zero
+            projectile["time_to_impact"] = projectile["distance"] / vel_magnitude
+
+            # Determine if projectile is approaching player
+            is_approaching = (
+                (vel_x > 0 and dx < 0)
+                or (vel_x < 0 and dx > 0)
+                or (vel_y > 0 and dy < 0)
+                or (vel_y < 0 and dy > 0)
+            )
+            projectile["is_approaching"] = is_approaching
+
+    # Enhanced recommendation logic based on projectile analysis
+    recommended_action = 0  # Default: no-op
+
+    # Find the most threatening projectile
+    threat_level = 0
+    for projectile in projectiles:
+        # Only consider approaching projectiles
+        if not projectile.get("is_approaching", False):
+            continue
+
+        # Calculate threat based on distance and time to impact
+        distance = projectile.get("distance", float("inf"))
+        time_to_impact = projectile.get("time_to_impact", float("inf"))
+
+        # Simple threat calculation - threat is higher for closer projectiles
+        # and shorter time to impact
+        current_threat = 0
+        if distance < 100 and time_to_impact < 30:
+            current_threat = (100 - distance) + (30 - time_to_impact)
+
+        if current_threat > threat_level:
+            threat_level = current_threat
+
+            # Determine appropriate defensive action
+            # This logic will depend on your game mechanics
+            pos_x, pos_y = projectile["position"]
+            vel_x, vel_y = projectile.get("velocity", (0, 0))
+
+            # Example logic: Jump (4) if projectile is coming low, crouch (5) if coming high
+            if pos_y > player_y + 10:
+                recommended_action = 4  # Jump
+            elif pos_y < player_y - 10:
+                recommended_action = 5  # Crouch
+            else:
+                # If coming directly at player, choose based on velocity
+                if abs(vel_y) > abs(vel_x):
+                    recommended_action = 4 if vel_y > 0 else 5
+                else:
+                    # If mostly horizontal, try to jump
+                    recommended_action = 4
 
     return {
         "projectiles": projectiles,
-        "collision_time": collision_time,
-        "projectile_height": projectile_height,
         "recommended_action": recommended_action,
-        "confidence": confidence,
     }

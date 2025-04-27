@@ -1,11 +1,12 @@
 import numpy as np
 import gymnasium as gym
-import retro
+import retro  # Use stable_retro instead of retro
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from stable_baselines3.common.monitor import Monitor
 import os
+import tempfile
 
-# Import the ProjectileDetector
+# projectile detector
 from projectile_detection import (
     ProjectileDetector,
     enhance_observation_with_projectiles,
@@ -60,6 +61,68 @@ MEMORY = {
 MAX_EPISODE_STEPS = 3600  # 2 minutes
 
 
+# Custom Monitor class that's more resilient
+class ResilientMonitor(Monitor):
+    """A more fault-tolerant version of Monitor that won't crash on I/O errors"""
+
+    def step(self, action):
+        """
+        Step the environment with the given action
+
+        :param action: the action
+        :return: observation, reward, terminated, truncated, info
+        """
+        try:
+            return super().step(action)
+        except ValueError as e:
+            if "I/O operation on closed file" in str(e):
+                print("Warning: Monitor file I/O error. Reopening file.")
+                # Create a new results writer
+                self._setup_results_writer()
+                # Proceed with step, but don't try to log
+                obs, reward, terminated, truncated, info = self.env.step(action)
+                return obs, reward, terminated, truncated, info
+            else:
+                raise e
+
+    def _setup_results_writer(self):
+        """Set up the results writer with required columns."""
+        try:
+            # Close the old writer if exists
+            if hasattr(self, "results_writer") and hasattr(
+                self.results_writer, "close"
+            ):
+                try:
+                    self.results_writer.close()
+                except:
+                    pass
+
+            # Create a new directory if needed
+            os.makedirs(os.path.dirname(self.file_handler.name), exist_ok=True)
+
+            # Create the results writer
+            from stable_baselines3.common.monitor import ResultsWriter
+
+            self.results_writer = ResultsWriter(
+                self.file_handler.name,
+                header={"t_start": self.t_start, **self.metadata},
+                extra_keys=self.info_keywords,
+            )
+        except Exception as e:
+            print(f"Warning: Failed to set up results writer: {e}")
+            # Use a dummy file as a fallback
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".monitor.csv")
+            print(f"Using temporary monitor file: {temp_file.name}")
+            self.file_handler = temp_file
+            from stable_baselines3.common.monitor import ResultsWriter
+
+            self.results_writer = ResultsWriter(
+                self.file_handler.name,
+                header={"t_start": self.t_start, **self.metadata},
+                extra_keys=self.info_keywords,
+            )
+
+
 # Enhanced environment wrapper
 class EnhancedKungFuMasterEnv(gym.Wrapper):
     def __init__(self, env):
@@ -72,6 +135,9 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.KUNGFU_ACTIONS = filtered_actions
         self.KUNGFU_ACTION_NAMES = filtered_action_names
         self.action_space = gym.spaces.Discrete(len(self.KUNGFU_ACTIONS))
+
+        # Flag to track whether reset has been called
+        self.reset_called = False
 
         # State tracking
         self.prev_score = 0
@@ -93,7 +159,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             0  # Successful avoidance of detected projectiles
         )
 
-        # Create projectile detector
+        # projectile detector
         self.projectile_detector = ProjectileDetector()
 
         # Raw observation buffer for projectile detection
@@ -145,17 +211,17 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         except:
             return 0
 
-    # REMOVED detect_active_projectiles_from_ram method as it used incorrect memory addresses
-
     def reset(self, **kwargs):
-        # Reset the environment
-        obs_result = self.env.reset(**kwargs)
+        # Set flag that reset has been called
+        self.reset_called = True
 
-        # Handle different return types
-        if isinstance(obs_result, tuple) and len(obs_result) == 2:
-            obs, info = obs_result
-        else:
-            obs = obs_result
+        # Reset the environment - specifically for Stable Retro
+        try:
+            obs, info = self.env.reset(**kwargs)
+        except Exception as e:
+            print(f"Error in reset: {e}")
+            # Create a dummy observation and info
+            obs = np.zeros((224, 240, 3), dtype=np.uint8)
             info = {}
 
         # Reset step counter and metrics
@@ -183,8 +249,21 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.raw_observation_buffer = []
 
         # Simple game start - press START a few times
-        for _ in range(5):
-            self.env.step(KUNGFU_ACTIONS[3])  # Press START
+        try:
+            # Only press START if reset() worked correctly
+            # (this prevents the error we were seeing)
+            for _ in range(5):
+                # Only try to press START if the environment seems ready
+                if hasattr(self.env, "step"):
+                    try:
+                        self.env.step(KUNGFU_ACTIONS[3])  # Press START
+                    except Exception as step_err:
+                        print(
+                            f"Warning: Could not press START button during reset: {step_err}"
+                        )
+                        break
+        except Exception as e:
+            print(f"Warning: Could not press START button during reset: {str(e)}")
 
         # Get initial state
         try:
@@ -202,6 +281,13 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             )
         except Exception as e:
             print(f"Error getting initial state: {str(e)}")
+            # Initialize with default values if we can't read RAM
+            self.prev_hp = 0
+            self.prev_x_pos = 0
+            self.prev_y_pos = 0
+            self.prev_stage = 0
+            self.prev_boss_hp = 0
+            self.prev_score = 0
 
         # Buffer the initial observation
         self._buffer_raw_observation(obs)
@@ -209,21 +295,28 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         return obs, info
 
     def step(self, action):
-        # Convert to actual action
+        # Check if reset has been called
+        if not self.reset_called:
+            print(
+                "Warning: step() called before reset(). Attempting to reset the environment."
+            )
+            self.reset()
+
+        # convet to actual action
         converted_action = self.KUNGFU_ACTIONS[action]
 
-        # Get current state before taking action
+        # get current hp and current position
         current_hp = self.get_hp()
         player_position = self.get_player_position()
 
-        # MODIFIED: Removed RAM-based projectile detection that used incorrect addresses
-        # Now rely solely on image-based projectile detection
-
-        # Image-based projectile detection if we have enough frames buffered
+        # many frames inside image projectile
         image_projectiles = []
+        # projectile info
         projectile_info = None
+        # recomend action
         recommended_action = 0
 
+        # obs >= 2
         if len(self.raw_observation_buffer) >= 2:
             # Convert buffer to numpy array for projectile detection
             frame_stack = np.array(self.raw_observation_buffer)
@@ -256,17 +349,22 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                     action_bonus = 0.1
 
         # Take step in environment
-        step_result = self.env.step(converted_action)
-
-        # Handle different return types
-        if len(step_result) == 4:
-            obs, reward, done, info = step_result
-            terminated = done
-            truncated = False
-        elif len(step_result) == 5:
-            obs, reward, terminated, truncated, info = step_result
-        else:
-            raise ValueError(f"Unexpected step result length: {len(step_result)}")
+        try:
+            obs, reward, terminated, truncated, info = self.env.step(converted_action)
+        except Exception as e:
+            print(f"Error during environment step: {str(e)}")
+            # Return default values as fallback
+            return (
+                (
+                    np.zeros_like(self.raw_observation_buffer[-1])
+                    if self.raw_observation_buffer
+                    else np.zeros((224, 240, 3), dtype=np.uint8)
+                ),
+                -1.0,  # Negative reward for error
+                True,  # Terminate episode
+                True,  # Truncate episode
+                {"error": str(e)},
+            )
 
         if not isinstance(info, dict):
             info = {}
@@ -426,29 +524,48 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         return obs, shaped_reward, terminated, truncated, info
 
 
-def make_enhanced_kungfu_env(is_play_mode=False, frame_stack=8):
+def make_enhanced_kungfu_env(
+    is_play_mode=False, frame_stack=8, use_projectile_features=False
+):
     """Create a Kung Fu Master environment with enhanced projectile detection
 
     Args:
         is_play_mode: Whether to render the environment
         frame_stack: Number of frames to stack (8 recommended for projectile detection)
+        use_projectile_features: Whether to use explicit projectile features
     """
     try:
+        # Stable Retro uses a different API
         render_mode = "human" if is_play_mode else None
         env = retro.make(game="KungFu-Nes", render_mode=render_mode)
-    except Exception:
+    except Exception as e:
+        print(f"First attempt failed: {str(e)}")
         try:
             render_mode = "human" if is_play_mode else None
             env = retro.make(game="KungFuMaster-Nes", render_mode=render_mode)
         except Exception as e:
-            raise e
+            print(f"Second attempt failed: {str(e)}")
+            # Last resort - try without render_mode parameter
+            try:
+                env = retro.make(game="KungFu-Nes")
+                if is_play_mode:
+                    env.render_mode = "human"
+            except Exception as e:
+                print(f"Third attempt failed: {str(e)}")
+                try:
+                    env = retro.make(game="KungFuMaster-Nes")
+                    if is_play_mode:
+                        env.render_mode = "human"
+                except Exception as e:
+                    raise Exception(f"Could not create Kung Fu environment: {str(e)}")
 
     # Apply our enhanced wrapper
     env = EnhancedKungFuMasterEnv(env)
 
-    # Set up monitoring
+    # Set up monitoring with our resilient monitor
     os.makedirs("logs", exist_ok=True)
-    env = Monitor(env, os.path.join("logs", "kungfu"))
+    monitor_path = os.path.join("logs", "kungfu")
+    env = ResilientMonitor(env, monitor_path)
 
     # Wrap in DummyVecEnv for compatibility with stable-baselines3
     env = DummyVecEnv([lambda: env])
@@ -458,6 +575,14 @@ def make_enhanced_kungfu_env(is_play_mode=False, frame_stack=8):
         f"Using enhanced frame stacking with n_stack={frame_stack} for improved projectile detection"
     )
     env = VecFrameStack(env, n_stack=frame_stack)
+
+    # Optionally add projectile features wrapper
+    if use_projectile_features:
+        print("Adding projectile feature wrapper for explicit projectile information")
+        # Import our projectile aware wrapper
+        from projectile_aware_wrapper import wrap_projectile_aware
+
+        env = wrap_projectile_aware(env, max_projectiles=5)
 
     return env
 
