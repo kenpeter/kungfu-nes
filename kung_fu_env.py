@@ -163,8 +163,10 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.successful_defensive_actions = 0
         self.successful_projectile_avoidance = 0
 
-        # projectile detector
-        self.projectile_detector = ProjectileDetector()
+        # projectile detector with adjusted parameters
+        self.projectile_detector = ProjectileDetector(
+            movement_threshold=5, min_projectile_size=2, max_projectile_size=30
+        )
 
         # Raw observation buffer for projectile detection
         self.raw_observation_buffer = []
