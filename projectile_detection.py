@@ -4,7 +4,8 @@ import numpy as np
 class ProjectileDetector:
     """
     A class to detect projectiles in frame stacks by analyzing pixel changes
-    between consecutive frames. Optimized for Kung Fu Master's projectiles.
+    across multiple frames. Optimized for Kung Fu Master's projectiles.
+    Utilizes full n-frame stack for more robust detection and tracking.
     """
 
     def __init__(
@@ -32,16 +33,25 @@ class ProjectileDetector:
             {"r": (200, 255), "g": (140, 220), "b": (20, 100)},
         ]
 
+        # movement threshold
         self.movement_threshold = movement_threshold
+        # projectile min
         self.min_projectile_size = min_projectile_size
+        # projectile max
         self.max_projectile_size = max_projectile_size
 
         # Track frame history for smoother detection
         self.previous_projectiles = []
 
+        # Store trajectory history for each tracked projectile
+        self.projectile_trajectories = []
+
+        # Projectile ID counter to maintain identity across frames
+        self.next_projectile_id = 1
+
     def detect_projectiles(self, frame_stack):
         """
-        Detect projectiles in a stack of frames.
+        Detect projectiles in a stack of frames, utilizing the full history.
 
         Args:
             frame_stack: Numpy array of stacked frames [stack_size, height, width, channels]
@@ -49,35 +59,47 @@ class ProjectileDetector:
 
         Returns:
             List of detected projectiles with their positions and velocities
-            Format: [{'x': x, 'y': y, 'vx': vx, 'vy': vy, 'size': size}, ...]
+            Format: [{'id': id, 'x': x, 'y': y, 'vx': vx, 'vy': vy, 'size': size, 'confidence': conf}, ...]
         """
-        if frame_stack.ndim == 4:  # RGB frames
-            # Use only the last two frames for movement detection
-            current_frame = frame_stack[-1]
-            previous_frame = frame_stack[-2]
-        else:
-            # Handle grayscale frames if needed
-            current_frame = frame_stack[-1]
-            previous_frame = frame_stack[-2]
+        stack_size = frame_stack.shape[0]
+        current_frame = frame_stack[-1]
 
-        # Calculate absolute difference between frames
-        frame_diff = np.abs(
-            current_frame.astype(np.int16) - previous_frame.astype(np.int16)
-        )
+        # Create a difference map using multiple frame comparisons
+        diff_accumulator = np.zeros_like(frame_stack[0], dtype=np.float32)
+        if diff_accumulator.ndim == 3:  # RGB
+            diff_accumulator = np.mean(diff_accumulator, axis=2)
 
-        # For RGB, convert to grayscale for movement detection
-        if frame_diff.ndim == 3:
-            diff_gray = np.mean(frame_diff, axis=2).astype(np.uint8)
-        else:
-            diff_gray = frame_diff.astype(np.uint8)
+        # up to 5 recent frames, more recent and more higher weight
+        for i in range(1, min(stack_size, 5)):
+            weight = 1.0 / (i)  # Higher weight for more recent differences
+            prev_idx = -i - 1
+            curr_idx = -i
 
-        # Threshold to find significant movement
-        movement_mask = diff_gray > self.movement_threshold
+            # Check if indices are valid
+            if abs(prev_idx) >= stack_size or abs(curr_idx) >= stack_size:
+                continue
+
+            frame_diff = np.abs(
+                frame_stack[curr_idx].astype(np.float32)
+                - frame_stack[prev_idx].astype(np.float32)
+            )
+
+            # Convert to grayscale if RGB
+            if frame_diff.ndim == 3:
+                frame_diff = np.mean(frame_diff, axis=2)
+
+            # Accumulate weighted differences
+            diff_accumulator += weight * frame_diff
+
+        # Threshold to find areas of consistent movement
+        movement_mask = diff_accumulator > self.movement_threshold
+        movement_mask = movement_mask.astype(np.uint8)
 
         # Find connected components (potential projectiles)
         labeled_mask, num_objects = self._connected_components(movement_mask)
 
-        projectiles = []
+        # Extract potential projectiles from current frame
+        current_projectiles = []
         for i in range(1, num_objects + 1):
             # Get object pixels
             obj_pixels = np.where(labeled_mask == i)
@@ -95,24 +117,186 @@ class ProjectileDetector:
 
             # Check if the object matches projectile color profiles
             if self._check_projectile_color(current_frame, obj_pixels):
-                # Estimate velocity by comparing with previous frames
-                vx, vy = self._estimate_velocity(x, y)
-
-                # Add to projectiles list
-                projectiles.append(
+                # Add to current projectiles list
+                current_projectiles.append(
                     {
                         "x": int(x),
                         "y": int(y),
-                        "vx": vx,
-                        "vy": vy,
                         "size": len(obj_pixels[0]),
+                        "pixels": obj_pixels,
                     }
                 )
 
-        # Update previous projectiles for velocity tracking
-        self.previous_projectiles = projectiles
+        # Match current detections with trajectories from previous frames
+        final_projectiles = self._track_projectiles_across_frames(
+            current_projectiles, frame_stack
+        )
 
-        return projectiles
+        # Update previous projectiles for next iteration
+        self.previous_projectiles = final_projectiles
+
+        return final_projectiles
+
+    def _track_projectiles_across_frames(self, current_projectiles, frame_stack):
+        """
+        Track projectiles across multiple frames to establish trajectories,
+        calculate velocities, and filter false positives.
+        """
+        stack_size = frame_stack.shape[0]
+        result_projectiles = []
+
+        # Step 1: Match current projectiles with existing trajectories
+        matched_indices = set()
+
+        # Copy trajectories for modification
+        updated_trajectories = []
+
+        for traj in self.projectile_trajectories:
+            # Predict where this projectile should be in current frame
+            last_pos = traj["positions"][-1]  # [x, y]
+            last_vel = (
+                traj["velocities"][-1] if traj["velocities"] else [0, 0]
+            )  # [vx, vy]
+
+            predicted_x = last_pos[0] + last_vel[0]
+            predicted_y = last_pos[1] + last_vel[1]
+
+            # Find closest detection in current frame
+            best_match = -1
+            min_dist = 20  # Max distance to consider as the same projectile
+
+            for i, proj in enumerate(current_projectiles):
+                if i in matched_indices:
+                    continue
+
+                dist = (
+                    (proj["x"] - predicted_x) ** 2 + (proj["y"] - predicted_y) ** 2
+                ) ** 0.5
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match = i
+
+            # If we found a match, update the trajectory
+            if best_match >= 0:
+                matched_proj = current_projectiles[best_match]
+                matched_indices.add(best_match)
+
+                # Calculate velocity
+                new_x, new_y = matched_proj["x"], matched_proj["y"]
+                new_vx = new_x - last_pos[0]
+                new_vy = new_y - last_pos[1]
+
+                # Check for velocity consistency
+                velocity_consistent = True
+                if len(traj["velocities"]) >= 2:
+                    prev_vx, prev_vy = traj["velocities"][-1]
+                    # Allow some variation but detect large changes
+                    if abs(new_vx - prev_vx) > 3 or abs(new_vy - prev_vy) > 3:
+                        velocity_consistent = False
+
+                # Update trajectory
+                updated_traj = {
+                    "id": traj["id"],
+                    "positions": traj["positions"] + [[new_x, new_y]],
+                    "velocities": traj["velocities"] + [[new_vx, new_vy]],
+                    "sizes": traj["sizes"] + [matched_proj["size"]],
+                    "age": traj["age"] + 1,
+                    "missed_frames": 0,
+                }
+
+                # Calculate confidence based on trajectory consistency and length
+                confidence = min(0.5 + 0.1 * updated_traj["age"], 0.95)
+                if not velocity_consistent:
+                    confidence *= 0.8
+
+                # Add to results if trajectory is mature (seen in multiple frames)
+                if updated_traj["age"] >= 2:
+                    # Use average velocity from last few frames for stability
+                    avg_vels = np.mean(
+                        updated_traj["velocities"][
+                            -min(3, len(updated_traj["velocities"])) :
+                        ],
+                        axis=0,
+                    )
+                    vx, vy = avg_vels[0], avg_vels[1]
+
+                    result_projectiles.append(
+                        {
+                            "id": updated_traj["id"],
+                            "x": new_x,
+                            "y": new_y,
+                            "vx": vx,
+                            "vy": vy,
+                            "size": matched_proj["size"],
+                            "confidence": confidence,
+                        }
+                    )
+
+                updated_trajectories.append(updated_traj)
+            else:
+                # No match found - projectile might be temporarily occluded
+                # Keep trajectory but mark it as missed for this frame
+                if (
+                    traj["missed_frames"] < 3
+                ):  # Only keep for a limited number of missed frames
+                    # Predict position using last velocity
+                    predicted_pos = [predicted_x, predicted_y]
+
+                    updated_traj = {
+                        "id": traj["id"],
+                        "positions": traj["positions"] + [predicted_pos],
+                        "velocities": traj["velocities"],  # Keep last velocity
+                        "sizes": traj["sizes"],
+                        "age": traj["age"],
+                        "missed_frames": traj["missed_frames"] + 1,
+                    }
+
+                    # Add to results with lower confidence
+                    if updated_traj["age"] >= 3:  # Only keep mature trajectories
+                        confidence = max(0.3 - 0.1 * updated_traj["missed_frames"], 0.1)
+                        vx, vy = updated_traj["velocities"][-1]
+
+                        result_projectiles.append(
+                            {
+                                "id": updated_traj["id"],
+                                "x": predicted_pos[0],
+                                "y": predicted_pos[1],
+                                "vx": vx,
+                                "vy": vy,
+                                "size": updated_traj["sizes"][-1],
+                                "confidence": confidence,
+                            }
+                        )
+
+                    updated_trajectories.append(updated_traj)
+
+        # Step 2: Create new trajectories for unmatched detections
+        for i, proj in enumerate(current_projectiles):
+            if i not in matched_indices:
+                # Start new trajectory
+                new_traj = {
+                    "id": self.next_projectile_id,
+                    "positions": [[proj["x"], proj["y"]]],
+                    "velocities": [],  # No velocity yet
+                    "sizes": [proj["size"]],
+                    "age": 1,
+                    "missed_frames": 0,
+                }
+
+                self.next_projectile_id += 1
+                updated_trajectories.append(new_traj)
+
+                # Don't add to results yet - wait until trajectory is confirmed in multiple frames
+
+        # Update trajectories for next iteration
+        # Only keep trajectories that are recent enough (limit age or missed frames)
+        self.projectile_trajectories = [
+            traj
+            for traj in updated_trajectories
+            if traj["missed_frames"] < 3 and traj["age"] < 15
+        ]
+
+        return result_projectiles
 
     def _connected_components(self, binary_image):
         """
@@ -178,34 +362,14 @@ class ProjectileDetector:
         # Default to movement-based detection for grayscale or if no color match
         return True
 
-    def _estimate_velocity(self, x, y):
-        """
-        Estimate velocity by finding the closest previous projectile
-        Returns estimated x and y velocity components
-        """
-        if not self.previous_projectiles:
-            return 0, 0
-
-        # Find closest previous projectile
-        min_dist = float("inf")
-        closest_proj = None
-
-        for proj in self.previous_projectiles:
-            dist = ((proj["x"] - x) ** 2 + (proj["y"] - y) ** 2) ** 0.5
-            if dist < min_dist:
-                min_dist = dist
-                closest_proj = proj
-
-        # If we found a close match (likely the same projectile)
-        if min_dist < 15:  # Threshold for considering it the same projectile
-            vx = x - closest_proj["x"]
-            vy = y - closest_proj["y"]
-            return vx, vy
-
-        return 0, 0
-
     def predict_collision(
-        self, projectiles, player_x, player_y, player_width=20, player_height=40
+        self,
+        projectiles,
+        player_x,
+        player_y,
+        player_width=20,
+        player_height=40,
+        lookahead_frames=15,
     ):
         """
         Predict if any projectiles will collide with the player in the near future
@@ -216,15 +380,27 @@ class ProjectileDetector:
             player_y: Player's y position
             player_width: Player width in pixels
             player_height: Player height in pixels
+            lookahead_frames: Maximum number of frames to predict ahead
 
         Returns:
             collision_time: Estimated frames until collision (-1 if no collision)
             projectile_height: Height of the incoming projectile (for jump/crouch decision)
+            confidence: Confidence level in the collision prediction (0-1)
         """
         collision_time = -1
         projectile_height = 0
+        collision_confidence = 0
 
-        for proj in projectiles:
+        # Sort projectiles by confidence to prioritize more reliable detections
+        sorted_projectiles = sorted(
+            projectiles, key=lambda p: p.get("confidence", 0), reverse=True
+        )
+
+        for proj in sorted_projectiles:
+            # Skip low confidence projectiles
+            if proj.get("confidence", 0) < 0.3:
+                continue
+
             # Skip projectiles moving away from the player
             if (proj["x"] < player_x and proj["vx"] < 0) or (
                 proj["x"] > player_x and proj["vx"] > 0
@@ -235,21 +411,32 @@ class ProjectileDetector:
             if abs(proj["vx"]) > 0.5:  # If projectile has significant x velocity
                 time_to_x = abs((proj["x"] - player_x) / proj["vx"])
 
+                # Skip if too far into the future
+                if time_to_x > lookahead_frames:
+                    continue
+
                 # Predict y position at collision time
                 future_y = proj["y"] + proj["vy"] * time_to_x
 
-                # Check if y position will be within player bounds
-                if (
-                    future_y >= player_y - player_height / 2
-                    and future_y <= player_y + player_height / 2
-                ):
+                # Calculate vertical distance from player center at collision time
+                v_distance = abs(future_y - player_y)
 
-                    # If this is the closest projectile on a collision course
-                    if collision_time == -1 or time_to_x < collision_time:
+                # Check if y position will be within player bounds with some margin
+                if v_distance <= (player_height / 2) + 5:
+                    # If this is the closest projectile on a collision course or higher confidence
+                    current_confidence = proj.get("confidence", 0.5) * (
+                        1 - time_to_x / lookahead_frames
+                    )
+
+                    if collision_time == -1 or (
+                        time_to_x < collision_time
+                        and current_confidence >= collision_confidence
+                    ):
                         collision_time = time_to_x
                         projectile_height = future_y
+                        collision_confidence = current_confidence
 
-        return collision_time, projectile_height
+        return collision_time, projectile_height, collision_confidence
 
 
 def enhance_observation_with_projectiles(obs, projectile_detector, player_pos):
@@ -267,26 +454,23 @@ def enhance_observation_with_projectiles(obs, projectile_detector, player_pos):
             'projectiles': List of detected projectiles,
             'collision_time': Estimated frames until collision,
             'projectile_height': Height of incoming projectile,
-            'recommended_action': Recommended defensive action (4=jump, 5=crouch, 0=none)
+            'recommended_action': Recommended defensive action (4=jump, 5=crouch, 0=none),
+            'confidence': Confidence in the collision prediction
         }
     """
-    # Process the observation to get frames
-    # Assuming obs is a stacked frame array [stack_size, height, width, channels]
-
-    # Detect projectiles
+    # Detect projectiles using the full frame stack
     projectiles = projectile_detector.detect_projectiles(obs)
 
     # Predict potential collisions
-    collision_time, projectile_height = projectile_detector.predict_collision(
-        projectiles, player_pos[0], player_pos[1]
+    collision_time, projectile_height, confidence = (
+        projectile_detector.predict_collision(projectiles, player_pos[0], player_pos[1])
     )
 
-    # Determine recommended action based on projectile height
+    # Determine recommended action based on projectile height and confidence
     recommended_action = 0  # Default: no defensive action
 
-    if (
-        collision_time > 0 and collision_time < 10
-    ):  # If collision is imminent (within 10 frames)
+    # Only recommend action if confidence is high enough
+    if collision_time > 0 and collision_time < 10 and confidence > 0.4:
         player_y = player_pos[1]
 
         # If projectile is high, crouch
@@ -301,4 +485,5 @@ def enhance_observation_with_projectiles(obs, projectile_detector, player_pos):
         "collision_time": collision_time,
         "projectile_height": projectile_height,
         "recommended_action": recommended_action,
+        "confidence": confidence,
     }

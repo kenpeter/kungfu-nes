@@ -45,7 +45,7 @@ KUNGFU_ACTION_NAMES = [
     "Crouch Punch",
 ]
 
-# Critical memory addresses
+# Critical memory addresses - REMOVED incorrect projectile addresses
 MEMORY = {
     "current_stage": 0x0058,  # Current Stage
     "player_hp": 0x04A6,  # Hero HP
@@ -54,9 +54,6 @@ MEMORY = {
     "game_mode": 0x0051,  # Game Mode
     "boss_hp": 0x04A5,  # Boss HP
     "score": [0x0531, 0x0532, 0x0533, 0x0534, 0x0535],  # Score digits
-    "enemy_projectile": 0x0420,  # Enemy projectile state (active/inactive)
-    "projectile_x": 0x0422,  # Projectile X position
-    "projectile_y": 0x0424,  # Projectile Y position
 }
 
 # Maximum episode duration
@@ -148,17 +145,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         except:
             return 0
 
-    def detect_active_projectiles_from_ram(self):
-        """Detect active projectiles directly from RAM"""
-        try:
-            projectile_state = self.get_ram_value(MEMORY["enemy_projectile"])
-            if projectile_state > 0:  # Projectile is active
-                x = self.get_ram_value(MEMORY["projectile_x"])
-                y = self.get_ram_value(MEMORY["projectile_y"])
-                return [{"x": x, "y": y, "active": True}]
-            return []
-        except:
-            return []
+    # REMOVED detect_active_projectiles_from_ram method as it used incorrect memory addresses
 
     def reset(self, **kwargs):
         # Reset the environment
@@ -229,8 +216,8 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         current_hp = self.get_hp()
         player_position = self.get_player_position()
 
-        # Check for projectiles before action (using RAM and/or image processing)
-        ram_projectiles = self.detect_active_projectiles_from_ram()
+        # MODIFIED: Removed RAM-based projectile detection that used incorrect addresses
+        # Now rely solely on image-based projectile detection
 
         # Image-based projectile detection if we have enough frames buffered
         image_projectiles = []
@@ -247,8 +234,8 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             image_projectiles = projectile_info["projectiles"]
             recommended_action = projectile_info["recommended_action"]
 
-        # Determine if there's an active projectile threat
-        projectile_threat = len(ram_projectiles) > 0 or len(image_projectiles) > 0
+        # Determine if there's an active projectile threat - now based only on image detection
+        projectile_threat = len(image_projectiles) > 0
 
         if projectile_threat:
             self.detected_projectiles += 1
