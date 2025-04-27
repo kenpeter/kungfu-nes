@@ -2,7 +2,7 @@ import os
 import argparse
 import time
 from stable_baselines3 import PPO
-from kungfu_env import make_kungfu_env, MODEL_PATH, KUNGFU_ACTION_NAMES
+from enhanced_kungfu_env import make_kungfu_env, MODEL_PATH, KUNGFU_ACTION_NAMES
 
 
 def play_game(model_path=None, human_play=False, num_episodes=5):
