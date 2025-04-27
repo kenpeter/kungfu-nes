@@ -271,7 +271,8 @@ class KungFuMasterEnv(gym.Wrapper):
 
             # Reward for well-timed defensive actions (jump/crouch)
             # If HP was maintained during an action that could be defensive, it's likely a good timing
-            if action == 4 or action == 5:  # Jump or Crouch actions
+            if action == 4 or action == 5:
+                # jump or crouch, defensive action +1
                 self.defensive_actions += 1
 
                 # If we didn't lose health during a defensive action, consider it successful
@@ -279,12 +280,14 @@ class KungFuMasterEnv(gym.Wrapper):
                     self.successful_defensive_actions += 1
 
                     # Small positive reward for potentially avoiding danger
-                    shaped_reward += 0.2
+                    # only + 0.2
+                    shaped_reward += 0.4
 
                     # Extra reward if the agent maintained health and performed well
                     # This especially helps with projectile timing
                     if self.n_steps % 30 == 0:  # Don't reward too frequently
-                        shaped_reward += 0.3
+                        # reward more? cannot be too much
+                        shaped_reward += 0.5
 
                     # Log successful defensive action occasionally
                     if self.n_steps % 200 == 0:
