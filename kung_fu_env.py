@@ -823,7 +823,7 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
         # Process image features
         try:
             # Print the actual shape for debugging
-            print(f"Image tensor shape: {image_tensor.shape}")
+            # print(f"Image tensor shape: {image_tensor.shape}")
 
             # Try first with standard channel order
             if len(image_tensor.shape) == 4:
@@ -917,11 +917,11 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                 projectile_features = projectile_features[:, : self.projectile_dim]
 
         # Combine features
-        print(
-            f"Before cat: image_features shape: {image_features.shape}, projectile_features shape: {projectile_features.shape}"
-        )
+        # print(
+        #     f"Before cat: image_features shape: {image_features.shape}, projectile_features shape: {projectile_features.shape}"
+        # )
         combined_features = torch.cat([image_features, projectile_features], dim=1)
-        print(f"Combined features shape: {combined_features.shape}")
+        # print(f"Combined features shape: {combined_features.shape}")
 
         # Verify the combined shape matches what our linear layer expects
         expected_input_size = self.linear[0].in_features
@@ -1042,8 +1042,6 @@ def make_enhanced_kungfu_env(
     try:
         # Print available games to debug
         import retro
-
-        print("Available games:", retro.data.list_games())
     except Exception as e:
         print(f"Could not list games: {e}")
 
