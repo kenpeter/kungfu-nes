@@ -753,8 +753,9 @@ class OpenCVProjectileDetector:
                 f"Analyzing {len(projectiles)} projectiles for threat assessment at player pos {player_position}"
             )
 
-        # Lower the confidence threshold and increase detection range
-        credible_projectiles = [p for p in projectiles if p.get("confidence", 0) > 0.3]
+        # Much more aggressive detection - ANY projectile is potentially a threat
+        # Include even low confidence projectiles
+        credible_projectiles = projectiles
 
         # Closest threatening projectile and its details
         closest_threat_time = float("inf")
@@ -764,51 +765,67 @@ class OpenCVProjectileDetector:
             x, y = proj["position"]
             vx, vy = proj["velocity"]
 
-            # Debug output for significant projectiles
+            # Debug output for all projectiles
             print(f"  Projectile at ({x},{y}) with velocity ({vx},{vy})")
 
-            # More lenient conditions for considering projectiles as threats
-            # Check if projectile is moving toward player
-            moving_toward_player = (x < player_x and vx > 0) or (
-                x > player_x and vx < 0
-            )
+            # Consider ALL projectiles as potential threats
+            # Instead of filtering by direction, just check if they're within range
 
-            # For static or slow-moving projectiles, treat them as threats if they're close
-            is_close = abs(x - player_x) < 40
+            # Distance-based threat assessment
+            horizontal_distance = abs(x - player_x)
+            vertical_distance = abs(y - player_y)
 
-            if moving_toward_player or is_close:
-                # Calculate time to potential x-collision
-                if abs(vx) > 0.1:  # If projectile has measurable horizontal velocity
-                    time_to_x = abs((x - player_x) / max(abs(vx), 0.1))
-                else:  # Stationary or slow projectile
-                    time_to_x = (
-                        abs(x - player_x) / 2
-                    )  # Assume it will take time to reach player
+            # Consider any projectile within this radius as a threat
+            threat_radius = 100
 
-                # Increased time window to consider threats (up to ~15 frames ahead)
-                if time_to_x <= 15:
-                    # Predict y position at collision
-                    future_y = y + vy * time_to_x if abs(vx) > 0.1 else y
+            # Simple distance calculation
+            distance = ((x - player_x) ** 2 + (y - player_y) ** 2) ** 0.5
 
-                    # More generous vertical threat zone
-                    player_height = 40  # Approximate player height
-                    vertical_margin = 20  # Larger buffer zone
+            # If projectile is close enough to be a threat
+            if distance < threat_radius:
+                print(
+                    f"  Projectile is within threat radius ({distance:.1f} < {threat_radius})"
+                )
+
+                # Estimate time to impact based on distance and velocity
+                if abs(vx) > 0.1:  # If moving horizontally
+                    time_to_x = horizontal_distance / max(abs(vx), 0.1)
+                else:  # Slow or stationary
+                    time_to_x = horizontal_distance / 5  # Assume some speed
+
+                # Extremely generous time window (up to 20 frames)
+                if time_to_x <= 20:
+                    print(
+                        f"  Potential threat - estimated time to player: {time_to_x:.1f} frames"
+                    )
+
+                    # Predict future y position
+                    future_y = y + (vy * time_to_x if abs(vx) > 0.1 else 0)
+
+                    # Very generous vertical threat zone
+                    player_height = 50  # Increased player height
+                    vertical_margin = 30  # Much larger buffer
 
                     # Player hit zone ranges from feet to head
                     lower_bound = player_y - player_height
                     upper_bound = player_y
 
                     print(
-                        f"  Projectile will be at y={future_y} when it reaches player x (in {time_to_x:.1f} frames)"
+                        f"  Projectile will be at y={future_y} when it reaches player x"
                     )
                     print(f"  Player vertical range: {lower_bound} to {upper_bound}")
 
-                    # If projectile will be in player's vertical range at collision time
-                    if (
+                    # If anywhere near the player's vertical range
+                    in_vertical_range = (
                         lower_bound - vertical_margin
                         <= future_y
                         <= upper_bound + vertical_margin
-                    ):
+                    )
+
+                    # Or if it's just generally close
+                    is_very_close = distance < 50
+
+                    if in_vertical_range or is_very_close:
                         print(
                             f"  THREAT DETECTED - time to impact: {time_to_x:.1f} frames"
                         )
@@ -817,21 +834,34 @@ class OpenCVProjectileDetector:
                         if time_to_x < closest_threat_time:
                             closest_threat_time = time_to_x
 
-                            # Determine optimal defensive action
-                            if future_y < lower_bound + player_height / 2:
-                                recommended_action = (
-                                    5  # Crouch if projectile will be in upper half
-                                )
+                            # Determine defensive action based on projectile position
+                            # Simple rule: if projectile is above player's center, crouch; otherwise jump
+                            if y < player_y - 10:
+                                recommended_action = 5  # Crouch if projectile is above
                                 print(
-                                    f"  Recommending CROUCH - projectile in upper body zone"
+                                    f"  Recommending CROUCH - projectile is above player"
                                 )
                             else:
                                 recommended_action = (
-                                    4  # Jump if projectile will be in lower half
+                                    4  # Jump if projectile is below or at level
                                 )
                                 print(
-                                    f"  Recommending JUMP - projectile in lower body zone"
+                                    f"  Recommending JUMP - projectile is at or below player"
                                 )
+
+        # If no specific threat detected but projectiles exist, be defensive anyway
+        if recommended_action == 0 and len(projectiles) > 0:
+            # If any projectile is within extreme close range, take defensive action
+            for proj in projectiles:
+                x, y = proj["position"]
+                distance = ((x - player_x) ** 2 + (y - player_y) ** 2) ** 0.5
+
+                if distance < 40:  # Extreme close range
+                    print(f"  PROXIMITY ALERT - projectile at distance {distance:.1f}")
+                    # Default to jump as a general defensive move
+                    recommended_action = 4
+                    print(f"  Recommending JUMP as general defensive action")
+                    break
 
         # Return the action for the closest threat
         return recommended_action
