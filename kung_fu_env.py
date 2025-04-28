@@ -14,8 +14,8 @@ from gymnasium import spaces
 from typing import Dict, List, Tuple, Type, Union, Optional
 import tempfile
 
-# Import projectile detector
-from projectile import OpenCVProjectileDetector, enhance_observation_with_projectiles
+# import the proj detector
+from projectile import ImprovedProjectileDetector, enhance_observation_with_projectiles
 
 # Define the Kung Fu Master action space
 KUNGFU_ACTIONS = [
@@ -163,8 +163,8 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.successful_defensive_actions = 0
         self.successful_projectile_avoidance = 0
 
-        # OpenCV-based projectile detector with adjusted parameters
-        self.projectile_detector = OpenCVProjectileDetector(min_size=4, max_size=30)
+        # use the actual proj detector
+        self.projectile_detector = ImprovedProjectileDetector(debug=True)
 
         # Raw observation buffer for projectile detection
         self.raw_observation_buffer = []
