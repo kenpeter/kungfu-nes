@@ -364,10 +364,11 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 image_projectiles = projectile_info.get("projectiles", [])
                 recommended_action = projectile_info.get("recommended_action", 0)
 
-                # Debug output for significant projectile detections
-                if len(image_projectiles) > 0:
+                # Enhanced logging for projectile threats
+                if recommended_action in [4, 5]:  # Jump or Crouch
+                    action_name = self.KUNGFU_ACTION_NAMES[recommended_action]
                     print(
-                        f"Detected {len(image_projectiles)} projectiles, recommended action: {KUNGFU_ACTION_NAMES[recommended_action]}"
+                        f"⚠️ DEFENSIVE ACTION REQUIRED: {action_name} - {len(image_projectiles)} projectiles detected!"
                     )
             except Exception as e:
                 print(f"Error in projectile detection: {e}")
