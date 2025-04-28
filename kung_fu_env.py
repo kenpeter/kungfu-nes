@@ -2,8 +2,8 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import gymnasium as gym  # Use gymnasium instead of gym
-import retro  # Use stable_retro explicitly
+import gymnasium as gym
+import retro
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.policies import ActorCriticPolicy
@@ -15,7 +15,7 @@ from typing import Dict, List, Tuple, Type, Union, Optional
 import tempfile
 
 # Import projectile detector
-from projectile import ProjectileDetector, enhance_observation_with_projectiles
+from projectile import OpenCVProjectileDetector, enhance_observation_with_projectiles
 
 # Define the Kung Fu Master action space
 KUNGFU_ACTIONS = [
@@ -163,16 +163,14 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.successful_defensive_actions = 0
         self.successful_projectile_avoidance = 0
 
-        # projectile detector with adjusted parameters
-        self.projectile_detector = ProjectileDetector(
-            movement_threshold=5, min_projectile_size=2, max_projectile_size=30
-        )
+        # OpenCV-based projectile detector with adjusted parameters
+        self.projectile_detector = OpenCVProjectileDetector(min_size=4, max_size=30)
 
         # Raw observation buffer for projectile detection
         self.raw_observation_buffer = []
-        self.max_buffer_size = 8  # Store the last 8 frames
+        self.max_buffer_size = 4  # Store the last 4 frames
 
-        print("Enhanced KungFuMasterEnv initialized with projectile detection")
+        print("Enhanced KungFuMasterEnv initialized with OpenCV projectile detection")
 
     def _buffer_raw_observation(self, obs):
         """Store raw observations for projectile detection"""
@@ -283,20 +281,25 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.successful_projectile_avoidance = 0
 
         # Log defensive timing stats from previous episode
-        projectile_avoidance_rate = 0
-        if self.projectile_defensive_actions > 0:
-            projectile_avoidance_rate = (
-                self.successful_projectile_avoidance / self.projectile_defensive_actions
-            ) * 100
-            print(
-                f"Episode projectile stats - Detected: {self.detected_projectiles}, "
-                f"Defensive actions: {self.projectile_defensive_actions}, "
-                f"Successful avoidance: {self.successful_projectile_avoidance}, "
-                f"Avoidance rate: {projectile_avoidance_rate:.1f}%"
-            )
+        if self.n_steps > 0:  # Only log if not the first episode
+            projectile_avoidance_rate = 0
+            if self.projectile_defensive_actions > 0:
+                projectile_avoidance_rate = (
+                    self.successful_projectile_avoidance
+                    / self.projectile_defensive_actions
+                ) * 100
+                print(
+                    f"Episode projectile stats - Detected: {self.detected_projectiles}, "
+                    f"Defensive actions: {self.projectile_defensive_actions}, "
+                    f"Successful avoidance: {self.successful_projectile_avoidance}, "
+                    f"Avoidance rate: {projectile_avoidance_rate:.1f}%"
+                )
 
         # Clear observation buffer
         self.raw_observation_buffer = []
+
+        # Reset projectile detector
+        self.projectile_detector.reset()
 
         # Get initial state
         self.prev_hp = self.get_hp()
@@ -350,15 +353,22 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         # Detect projectiles if we have enough frames
         if len(self.raw_observation_buffer) >= 2:
             try:
-                # Convert buffer to numpy array for projectile detection
-                frame_stack = np.array(self.raw_observation_buffer)
+                # Get the latest frame for detection
+                current_frame = self.raw_observation_buffer[-1]
 
-                # Detect projectiles from frame differences
+                # Detect projectiles using OpenCV
                 projectile_info = enhance_observation_with_projectiles(
-                    frame_stack, self.projectile_detector, player_position
+                    current_frame, self.projectile_detector, player_position
                 )
-                image_projectiles = projectile_info["projectiles"]
-                recommended_action = projectile_info["recommended_action"]
+
+                image_projectiles = projectile_info.get("projectiles", [])
+                recommended_action = projectile_info.get("recommended_action", 0)
+
+                # Debug output for significant projectile detections
+                if len(image_projectiles) > 0:
+                    print(
+                        f"Detected {len(image_projectiles)} projectiles, recommended action: {KUNGFU_ACTION_NAMES[recommended_action]}"
+                    )
             except Exception as e:
                 print(f"Error in projectile detection: {e}")
 
@@ -494,7 +504,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 if x_diff < 0:
                     shaped_reward += abs(x_diff) * 0.1
 
-            # ENHANCED PROJECTILE AVOIDANCE REWARDS
+            # ENHANCED PROJECTILE AVOIDANCE REWARDS - MORE STRICT VALIDATION
             if is_defensive_action and projectile_threat:
                 # If we didn't lose health during a defensive action against a projectile
                 if hp_diff >= 0:
@@ -505,7 +515,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                     shaped_reward += 1.0
 
                     # Log successful projectile avoidance occasionally
-                    if self.n_steps % 100 == 0:
+                    if self.n_steps % 50 == 0:
                         avoidance_rate = (
                             self.successful_projectile_avoidance
                             / max(1, self.projectile_defensive_actions)
@@ -515,8 +525,14 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                             f"({self.successful_projectile_avoidance}/{self.projectile_defensive_actions})"
                         )
                 else:
-                    # Small penalty for incorrect timing of defensive action
+                    # Penalty for incorrect timing of defensive action
                     shaped_reward -= 0.2
+                    print("Defensive action against projectile failed - took damage")
+            elif is_defensive_action and not projectile_threat:
+                # Penalty for defensive action when no threat exists
+                shaped_reward -= 0.1
+                if self.n_steps % 100 == 0:
+                    print("Defensive action with no projectile detected")
             elif is_defensive_action and hp_diff >= 0:
                 # Regular defensive action that maintained health
                 self.successful_defensive_actions += 1
@@ -577,7 +593,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         return obs, shaped_reward, terminated, truncated, info
 
 
-# a wraper add proj info (or anything) to obs (network)
+# a wrapper add proj info (or anything) to obs (network)
 class ProjectileAwareWrapper(gym.Wrapper):
     """A wrapper that adds projectile information to the observation space"""
 
@@ -711,18 +727,12 @@ class ProjectileAwareWrapper(gym.Wrapper):
         projectile_mask = np.zeros(self.max_projectiles, dtype=np.int8)
         recommended_action = np.zeros(1, dtype=np.int32)
 
-        # If we have enough frames, detect projectiles
-        if (
-            hasattr(self.env, "raw_observation_buffer")
-            and len(self.env.raw_observation_buffer) >= 2
-        ):
+        # If we have projectile detector, use it
+        if hasattr(self.env, "projectile_detector"):
             try:
-                # Convert buffer to numpy array for projectile detection
-                frame_stack = np.array(self.env.raw_observation_buffer)
-
-                # Detect projectiles from frame differences
+                # Get projectile info
                 projectile_info = enhance_observation_with_projectiles(
-                    frame_stack, self.env.projectile_detector, player_position
+                    obs, self.env.projectile_detector, player_position
                 )
 
                 # Safely get projectiles and recommended action
@@ -748,9 +758,6 @@ class ProjectileAwareWrapper(gym.Wrapper):
 
                         # Get size safely
                         size = proj.get("size", 0)
-                        if "width" in proj and "height" in proj:
-                            width, height = proj.get("width", 0), proj.get("height", 0)
-                            size = max(width, height)
 
                         # Calculate relative position to player
                         player_x, player_y = player_position
@@ -793,29 +800,6 @@ class ProjectileAwareWrapper(gym.Wrapper):
         }
 
         return enhanced_obs, reward, terminated, truncated, info
-
-
-# Helper function to wrap environment with projectile awareness
-def wrap_projectile_aware(env, max_projectiles=5):
-    """Wrap an environment to add projectile awareness"""
-    # Handle VecEnv case - unwrap to get the base env
-    if isinstance(env, VecEnv):
-        # Temporarily disable to make changes
-        env.close()
-
-        # Get the base environment
-        base_env = env.envs[0]
-
-        # Apply our wrapper
-        wrapped_env = ProjectileAwareWrapper(base_env, max_projectiles=max_projectiles)
-
-        # Re-wrap in DummyVecEnv
-        env = DummyVecEnv([lambda: wrapped_env])
-    else:
-        # Apply wrapper directly
-        env = ProjectileAwareWrapper(env, max_projectiles=max_projectiles)
-
-    return env
 
 
 # CNN for projectile detection
@@ -937,9 +921,6 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
 
         # Process image features
         try:
-            # Print the actual shape for debugging
-            # print(f"Image tensor shape: {image_tensor.shape}")
-
             # Try first with standard channel order
             if len(image_tensor.shape) == 4:
                 # Shape could be [batch, channels, height, width] or [batch, height, width, channels]
@@ -971,9 +952,6 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
         try:
             if isinstance(observations, dict) and "projectiles" in observations:
                 projectile_features = observations["projectiles"]
-                print(
-                    f"Original projectile features shape: {projectile_features.shape}"
-                )
 
                 # Flatten projectile features if needed
                 if len(projectile_features.shape) == 3:  # [batch, time, features]
@@ -982,10 +960,6 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                     projectile_features = projectile_features.unsqueeze(
                         0
                     )  # Add batch dimension
-
-                print(
-                    f"Projectile features shape after processing: {projectile_features.shape}"
-                )
             else:
                 # Create zero tensor for projectile features if not available
                 projectile_features = torch.zeros(
@@ -997,9 +971,6 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
             projectile_features = torch.zeros(
                 (batch_size, self.projectile_dim), device=image_tensor.device
             )
-
-        # Rest of your existing code for combining features...
-        # (Make sure tensor dimensions match before concatenating)
 
         # Ensure both tensors have the same batch dimension
         if image_features.shape[0] != projectile_features.shape[0]:
@@ -1032,11 +1003,7 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                 projectile_features = projectile_features[:, : self.projectile_dim]
 
         # Combine features
-        # print(
-        #     f"Before cat: image_features shape: {image_features.shape}, projectile_features shape: {projectile_features.shape}"
-        # )
         combined_features = torch.cat([image_features, projectile_features], dim=1)
-        # print(f"Combined features shape: {combined_features.shape}")
 
         # Verify the combined shape matches what our linear layer expects
         expected_input_size = self.linear[0].in_features
@@ -1056,8 +1023,6 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
             else:
                 # Truncate if too large
                 combined_features = combined_features[:, :expected_input_size]
-
-            print(f"Adjusted combined features shape: {combined_features.shape}")
 
         # Process through final layers
         return self.linear(combined_features)
@@ -1149,7 +1114,7 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
 
 
 def make_enhanced_kungfu_env(
-    is_play_mode=False, frame_stack=8, use_projectile_features=False
+    is_play_mode=False, frame_stack=4, use_projectile_features=False
 ):
     """Create a Kung Fu Master environment with enhanced projectile detection for Stable Retro"""
 
