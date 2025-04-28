@@ -350,6 +350,14 @@ class OpenCVProjectileDetector:
             return 0  # No action if no projectiles
 
         player_x, player_y = player_position
+        # FIX: If player y-coordinate is 0 or very small, use a default value
+        # This appears to be an issue with RAM reading or coordinate system
+        if player_y <= 10:
+            # Use a reasonable default y-coordinate in the middle of the screen
+            player_y = 100
+            print(
+                f"  Using default player Y position of {player_y} (original was {player_position[1]})"
+            )
 
         # Only consider projectiles with reasonable confidence
         credible_projectiles = [p for p in projectiles if p.get("confidence", 0) > 0.4]

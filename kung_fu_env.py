@@ -56,7 +56,7 @@ MEMORY = {
     "current_stage": 0x0058,  # Current Stage
     "player_hp": 0x04A6,  # Hero HP
     "player_x": 0x0094,  # Hero Screen Pos X
-    "player_y": 0x0097,  # Hero Screen Pos Y
+    "player_y": 0x00B6,  # Hero Screen Pos Y
     "game_mode": 0x0051,  # Game Mode
     "boss_hp": 0x04A5,  # Boss HP
     "score": [0x0531, 0x0532, 0x0533, 0x0534, 0x0535],  # Score digits
