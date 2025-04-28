@@ -9,6 +9,12 @@ from typing import Dict, List, Tuple, Any, Optional
 import time
 
 
+import cv2
+import numpy as np
+from typing import Dict, List, Tuple, Any, Optional
+import time
+
+
 class ImprovedProjectileDetector:
     """
     An improved class to detect projectiles in Kung Fu Master using OpenCV.
@@ -19,7 +25,7 @@ class ImprovedProjectileDetector:
         self,
         min_size=4,
         max_size=30,
-        movement_threshold=10,  # Reduced to detect subtle movements
+        movement_threshold=8,  # Further reduced for higher sensitivity
         projectile_color_ranges=None,
         debug=False,
     ):
@@ -76,9 +82,26 @@ class ImprovedProjectileDetector:
             "in_defensive_action": False,
             "defensive_action_start": 0,
             "defensive_action_type": None,
+            "last_health": 0,
+            "current_health": 0,
         }
 
-        print("Improved ProjectileDetector initialized")
+        # Enhanced success tracking
+        self.successful_avoidance_count = 0
+        self.failed_avoidance_count = 0
+
+        # Critical threats for immediate response
+        self.critical_threats = []
+
+        # Add counters for better debugging
+        self.total_threats_detected = 0
+        self.total_defensive_recommendations = 0
+
+        # Early detection parameters
+        self.early_detection_factor = 1.5  # Detect threats earlier
+        self.last_player_actions = []  # Track recent player actions
+
+        print("Improved ProjectileDetector initialized with enhanced threat detection")
 
     def reset(self):
         """Reset the detector state between episodes"""

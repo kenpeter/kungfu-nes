@@ -3,7 +3,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import gymnasium as gym
-import retro
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.policies import ActorCriticPolicy
@@ -14,8 +13,11 @@ from gymnasium import spaces
 from typing import Dict, List, Tuple, Type, Union, Optional
 import tempfile
 
-# import the proj detector
-from projectile import ImprovedProjectileDetector, enhance_observation_with_projectiles
+# import the projectile detector
+from projectile import (
+    ImprovedProjectileDetector,
+    enhance_observation_with_projectiles,
+)
 
 # Define the Kung Fu Master action space
 KUNGFU_ACTIONS = [
@@ -131,7 +133,7 @@ class ResilientMonitor(Monitor):
             )
 
 
-# Enhanced environment wrapper
+# Enhanced environment wrapper with improved reward shaping and action buffering
 class EnhancedKungFuMasterEnv(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -163,14 +165,21 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.successful_defensive_actions = 0
         self.successful_projectile_avoidance = 0
 
-        # use the actual proj detector
+        # Use the projectile detector
         self.projectile_detector = ImprovedProjectileDetector(debug=True)
 
         # Raw observation buffer for projectile detection
         self.raw_observation_buffer = []
         self.max_buffer_size = 4  # Store the last 4 frames
 
-        print("Enhanced KungFuMasterEnv initialized with OpenCV projectile detection")
+        # Action buffer for consistent defensive actions
+        self.action_buffer = []
+        self.action_buffer_size = 5  # Hold actions for 5 frames
+        self.last_defensive_action = 0
+        self.last_defensive_action_time = 0
+        self.defensive_cooldown = 10  # Frames between defensive actions
+
+        print("Enhanced KungFuMasterEnv initialized with improved projectile detection")
 
     def _buffer_raw_observation(self, obs):
         """Store raw observations for projectile detection"""
@@ -280,6 +289,11 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.successful_defensive_actions = 0
         self.successful_projectile_avoidance = 0
 
+        # Reset action buffer
+        self.action_buffer = []
+        self.last_defensive_action = 0
+        self.last_defensive_action_time = 0
+
         # Log defensive timing stats from previous episode
         if self.n_steps > 0:  # Only log if not the first episode
             projectile_avoidance_rate = 0
@@ -331,6 +345,18 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             )
             self.reset()
 
+        # Check action buffer for defensive actions
+        if self.action_buffer:
+            buffered_action = self.action_buffer.pop(0)
+            if action != buffered_action and (
+                buffered_action == 4 or buffered_action == 5
+            ):
+                # If the buffer contains a defensive action, override the agent's choice
+                print(
+                    f"ACTION OVERRIDE: Using buffered defensive action {self.KUNGFU_ACTION_NAMES[buffered_action]} instead of {self.KUNGFU_ACTION_NAMES[action]}"
+                )
+                action = buffered_action
+
         # Convert to actual action
         try:
             converted_action = self.KUNGFU_ACTIONS[action]
@@ -364,12 +390,24 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 image_projectiles = projectile_info.get("projectiles", [])
                 recommended_action = projectile_info.get("recommended_action", 0)
 
-                # Enhanced logging for projectile threats
+                # Fill action buffer if a defensive action is recommended
                 if recommended_action in [4, 5]:  # Jump or Crouch
                     action_name = self.KUNGFU_ACTION_NAMES[recommended_action]
-                    print(
-                        f"⚠️ DEFENSIVE ACTION REQUIRED: {action_name} - {len(image_projectiles)} projectiles detected!"
-                    )
+
+                    # Only buffer defensive action if we're not in cooldown period
+                    if (
+                        self.episode_steps - self.last_defensive_action_time
+                        > self.defensive_cooldown
+                    ):
+                        print(
+                            f"⚠️ BUFFERING DEFENSIVE ACTION: {action_name} - {len(image_projectiles)} projectiles detected!"
+                        )
+                        # Clear existing buffer and fill with the new action
+                        self.action_buffer = [
+                            recommended_action
+                        ] * self.action_buffer_size
+                        self.last_defensive_action = recommended_action
+                        self.last_defensive_action_time = self.episode_steps
             except Exception as e:
                 print(f"Error in projectile detection: {e}")
 
@@ -478,7 +516,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             # HP loss penalty
             hp_diff = current_hp - self.prev_hp
             if hp_diff < 0 and current_hp < 200:  # Normal health loss
-                shaped_reward += hp_diff * 0.5
+                shaped_reward += hp_diff * 0.5  # Penalize health loss
 
             # Stage completion bonus
             if current_stage > self.prev_stage:
@@ -505,18 +543,21 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 if x_diff < 0:
                     shaped_reward += abs(x_diff) * 0.1
 
-            # ENHANCED PROJECTILE AVOIDANCE REWARDS - MORE STRICT VALIDATION
+            # ENHANCED PROJECTILE AVOIDANCE REWARDS
             if is_defensive_action and projectile_threat:
                 # If we didn't lose health during a defensive action against a projectile
                 if hp_diff >= 0:
                     self.successful_defensive_actions += 1
                     self.successful_projectile_avoidance += 1
 
-                    # Significant reward for successful projectile avoidance
-                    shaped_reward += 1.0
+                    # HIGHER reward for successful projectile avoidance (increased from 1.0 to 5.0)
+                    shaped_reward += 5.0
+                    print(
+                        f"SUCCESS: {self.KUNGFU_ACTION_NAMES[action]} avoided projectile! Reward +5.0"
+                    )
 
-                    # Log successful projectile avoidance occasionally
-                    if self.n_steps % 50 == 0:
+                    # Log successful projectile avoidance
+                    if self.n_steps % 20 == 0:
                         avoidance_rate = (
                             self.successful_projectile_avoidance
                             / max(1, self.projectile_defensive_actions)
@@ -526,18 +567,31 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                             f"({self.successful_projectile_avoidance}/{self.projectile_defensive_actions})"
                         )
                 else:
-                    # Penalty for incorrect timing of defensive action
-                    shaped_reward -= 0.2
-                    print("Defensive action against projectile failed - took damage")
+                    # Increased penalty for incorrect timing of defensive action (from -0.2 to -1.0)
+                    shaped_reward -= 1.0
+                    print(
+                        f"FAILURE: Defensive action {self.KUNGFU_ACTION_NAMES[action]} failed - took damage. Penalty -1.0"
+                    )
             elif is_defensive_action and not projectile_threat:
-                # Penalty for defensive action when no threat exists
-                shaped_reward -= 0.1
-                if self.n_steps % 100 == 0:
-                    print("Defensive action with no projectile detected")
+                # Increased penalty for defensive action when no threat exists (from -0.1 to -0.5)
+                shaped_reward -= 0.5
+                if self.n_steps % 50 == 0:
+                    print(
+                        f"UNNECESSARY: Defensive action {self.KUNGFU_ACTION_NAMES[action]} with no projectile detected. Penalty -0.5"
+                    )
             elif is_defensive_action and hp_diff >= 0:
                 # Regular defensive action that maintained health
                 self.successful_defensive_actions += 1
-                shaped_reward += 0.3
+                shaped_reward += 0.5  # Slight increase from 0.3
+
+            # Extra reward for following recommended defensive actions
+            if action == recommended_action and recommended_action in [4, 5]:
+                shaped_reward += (
+                    1.0  # Reward for taking the recommended defensive action
+                )
+                print(
+                    f"GOOD DECISION: Agent followed recommended defensive action {self.KUNGFU_ACTION_NAMES[action]}. Reward +1.0"
+                )
 
             # Death penalty
             if current_hp == 0 and self.prev_hp > 0:
@@ -567,6 +621,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                     "detected_projectiles": self.detected_projectiles,
                     "projectile_defensive_actions": self.projectile_defensive_actions,
                     "successful_projectile_avoidance": self.successful_projectile_avoidance,
+                    "recommended_action": recommended_action,  # Include recommended action in info
                 }
             )
 
@@ -596,7 +651,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
 
 # a wrapper add proj info (or anything) to obs (network)
 class ProjectileAwareWrapper(gym.Wrapper):
-    """A wrapper that adds projectile information to the observation space"""
+    """An improved wrapper that adds projectile information to the observation space"""
 
     def __init__(self, env, max_projectiles=5):
         super().__init__(env)
@@ -605,8 +660,9 @@ class ProjectileAwareWrapper(gym.Wrapper):
         self.image_obs_space = self.observation_space
 
         # Additional features for each projectile:
-        # [relative_x, relative_y, velocity_x, velocity_y, size, distance, time_to_impact]
-        self.projectile_features = 7
+        # [relative_x, relative_y, velocity_x, velocity_y, size, distance, time_to_impact,
+        #  will_hit, target_area, recommended_action]
+        self.projectile_features = 10  # Increased from 7 to 10
 
         # Maximum number of projectiles to track
         self.max_projectiles = max_projectiles
@@ -630,8 +686,25 @@ class ProjectileAwareWrapper(gym.Wrapper):
                     shape=(1,),
                     dtype=np.int32,
                 ),
+                "projectile_threat": spaces.Box(  # New: binary indicator of projectile threat
+                    low=0,
+                    high=1,
+                    shape=(1,),
+                    dtype=np.int8,
+                ),
+                "time_since_last_threat": spaces.Box(  # New: frames since last threat
+                    low=0,
+                    high=100,
+                    shape=(1,),
+                    dtype=np.float32,
+                ),
             }
         )
+
+        # Track additional state for enhanced observations
+        self.frames_since_last_threat = 100  # Initialize high
+        self.last_recommended_action = 0
+        self.projectile_threat_active = False
 
     def reset(self, **kwargs):
         """Reset the environment and return enhanced observation with projectile data"""
@@ -652,12 +725,21 @@ class ProjectileAwareWrapper(gym.Wrapper):
             obs = np.zeros((224, 240, 3), dtype=np.uint8)
             info = {}
 
+        # Reset tracking state
+        self.frames_since_last_threat = 100
+        self.last_recommended_action = 0
+        self.projectile_threat_active = False
+
         # Create empty projectile vector data
         projectile_data = np.zeros(
             (self.max_projectiles, self.projectile_features), dtype=np.float32
         )
         projectile_mask = np.zeros(self.max_projectiles, dtype=np.int8)
         recommended_action = np.zeros(1, dtype=np.int32)
+        projectile_threat = np.zeros(1, dtype=np.int8)
+        time_since_last_threat = np.array(
+            [self.frames_since_last_threat], dtype=np.float32
+        )
 
         # Create enhanced observation
         enhanced_obs = {
@@ -665,6 +747,8 @@ class ProjectileAwareWrapper(gym.Wrapper):
             "projectiles": projectile_data,
             "projectile_mask": projectile_mask,
             "recommended_action": recommended_action,
+            "projectile_threat": projectile_threat,
+            "time_since_last_threat": time_since_last_threat,
         }
 
         # Return based on what we received
@@ -678,29 +762,20 @@ class ProjectileAwareWrapper(gym.Wrapper):
         # Take step in environment with error handling for different gym versions
         try:
             # Try with gymnasium API (5 return values)
-            try:
-                step_result = self.env.step(action)
-                if len(step_result) == 5:
-                    obs, reward, terminated, truncated, info = step_result
-                    done = terminated or truncated
-                elif len(step_result) == 4:
-                    # Old gym API
-                    obs, reward, done, info = step_result
-                    terminated = done
-                    truncated = False
-                else:
-                    # Unexpected format
-                    raise ValueError(
-                        f"Unexpected step result format with {len(step_result)} values"
-                    )
-            except ValueError as e:
-                print(f"Step format error: {e}")
-                obs = np.zeros((224, 240, 3), dtype=np.uint8)
-                reward = -1.0
-                terminated = True
-                truncated = True
-                info = {"error": str(e)}
-
+            step_result = self.env.step(action)
+            if len(step_result) == 5:
+                obs, reward, terminated, truncated, info = step_result
+                done = terminated or truncated
+            elif len(step_result) == 4:
+                # Old gym API
+                obs, reward, done, info = step_result
+                terminated = done
+                truncated = False
+            else:
+                # Unexpected format
+                raise ValueError(
+                    f"Unexpected step result format with {len(step_result)} values"
+                )
         except Exception as e:
             print(f"Error during environment step: {e}")
             # Return default values as fallback
@@ -721,7 +796,7 @@ class ProjectileAwareWrapper(gym.Wrapper):
             else (0, 0)
         )
 
-        # Initialize projectile data
+        # Initialize projectile data with improved features
         projectile_data = np.zeros(
             (self.max_projectiles, self.projectile_features), dtype=np.float32
         )
@@ -729,6 +804,7 @@ class ProjectileAwareWrapper(gym.Wrapper):
         recommended_action = np.zeros(1, dtype=np.int32)
 
         # If we have projectile detector, use it
+        projectile_threat_detected = False
         if hasattr(self.env, "projectile_detector"):
             try:
                 # Get projectile info
@@ -740,8 +816,26 @@ class ProjectileAwareWrapper(gym.Wrapper):
                 projectiles = projectile_info.get("projectiles", [])
                 recommended_action[0] = projectile_info.get("recommended_action", 0)
 
-                # Convert projectile info to feature vectors
-                # Each projectile: [relative_x, relative_y, velocity_x, velocity_y, size, distance, time_to_impact]
+                # Store recommended action
+                self.last_recommended_action = recommended_action[0]
+
+                # Check if there's an active threat
+                projectile_threat_detected = len(
+                    projectiles
+                ) > 0 and recommended_action[0] in [4, 5]
+
+                # Update threat timing
+                if projectile_threat_detected:
+                    self.frames_since_last_threat = 0
+                    self.projectile_threat_active = True
+                else:
+                    self.frames_since_last_threat = min(
+                        100, self.frames_since_last_threat + 1
+                    )
+                    if self.frames_since_last_threat > 10:  # Reset after 10 frames
+                        self.projectile_threat_active = False
+
+                # Convert projectile info to feature vectors with enhanced features
                 for i, proj in enumerate(projectiles[: self.max_projectiles]):
                     try:
                         # Safely extract projectile position and info
@@ -759,6 +853,7 @@ class ProjectileAwareWrapper(gym.Wrapper):
 
                         # Get size safely
                         size = proj.get("size", 0)
+                        confidence = proj.get("confidence", 0.5)
 
                         # Calculate relative position to player
                         player_x, player_y = player_position
@@ -770,7 +865,46 @@ class ProjectileAwareWrapper(gym.Wrapper):
                         vel_magnitude = max(np.sqrt(vel_x**2 + vel_y**2), 1e-6)
                         time_to_impact = distance / vel_magnitude
 
-                        # Store features
+                        # Determine if projectile will hit player (new feature)
+                        will_hit = 0.0
+                        target_area = 0.0  # 0 = none, -1 = upper body, 1 = lower body
+                        optimal_action = 0.0  # 0 = none, 4 = jump, 5 = crouch
+
+                        # Check for collision course
+                        if (x < player_x and vel_x > 0) or (x > player_x and vel_x < 0):
+                            # Calculate time to reach player x-coordinate
+                            time_to_x = (
+                                abs((player_x - x) / vel_x)
+                                if vel_x != 0
+                                else float("inf")
+                            )
+
+                            # Predict y position at collision
+                            future_y = y + (vel_y * time_to_x)
+
+                            # Player hitbox estimation
+                            player_height = 40
+                            player_top = player_y - player_height
+                            player_middle = player_y - player_height / 2
+                            player_bottom = player_y
+
+                            # Check if projectile will hit player
+                            if (
+                                time_to_x < 20
+                                and abs(future_y - player_middle)
+                                < player_height / 2 + 10
+                            ):
+                                will_hit = 1.0
+
+                                # Determine which part of the body would be hit
+                                if future_y < player_middle:
+                                    target_area = -1.0  # Upper body
+                                    optimal_action = 5.0  # Crouch
+                                else:
+                                    target_area = 1.0  # Lower body
+                                    optimal_action = 4.0  # Jump
+
+                        # Store enhanced features
                         projectile_data[i] = [
                             rel_x,
                             rel_y,
@@ -779,37 +913,46 @@ class ProjectileAwareWrapper(gym.Wrapper):
                             size,
                             distance,
                             time_to_impact,
+                            will_hit,  # New: binary hit prediction
+                            target_area,  # New: which part of body would be hit
+                            optimal_action,  # New: recommended defensive action
                         ]
                         projectile_mask[i] = 1  # Mark this projectile as valid
 
                     except Exception as e:
-                        print(
-                            f"Error processing projectile {i}: {e}, projectile data: {proj}"
-                        )
+                        print(f"Error processing projectile {i}: {e}")
                         # Skip this projectile
                         continue
 
             except Exception as e:
                 print(f"Error in projectile detection: {e}")
 
-        # Create enhanced observation
+        # Create enhanced observation with threat information
+        projectile_threat = np.array(
+            [1 if self.projectile_threat_active else 0], dtype=np.int8
+        )
+        time_since_last_threat = np.array(
+            [min(self.frames_since_last_threat, 100)], dtype=np.float32
+        )
+
         enhanced_obs = {
             "image": obs,
             "projectiles": projectile_data,
             "projectile_mask": projectile_mask,
             "recommended_action": recommended_action,
+            "projectile_threat": projectile_threat,
+            "time_since_last_threat": time_since_last_threat,
         }
 
         return enhanced_obs, reward, terminated, truncated, info
 
 
-# CNN for projectile detection
+# CNN for projectile detection with enhanced feature importance
 class ProjectileAwareCNN(BaseFeaturesExtractor):
     """
-    CNN for processing both game frames and projectile features.
+    Improved CNN for processing both game frames and projectile features.
 
-    :param observation_space: Observation space
-    :param features_dim: Number of features to extract
+    Gives more weight to projectile information for better defensive actions.
     """
 
     def __init__(self, observation_space: spaces.Dict, features_dim: int = 256):
@@ -824,15 +967,31 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                 0
             ]  # Number of input channels (e.g., 4 for frame stack)
             image_height, image_width = image_space.shape[1], image_space.shape[2]
+
+            # Calculate projectile feature dimensions
             self.projectile_dim = (
                 projectile_space.shape[0] * projectile_space.shape[1]
                 if len(projectile_space.shape) > 1
                 else projectile_space.shape[0]
             )
+
+            # Add dimensions for additional threat features
+            if "projectile_threat" in observation_space.keys():
+                self.threat_dim = 1
+            else:
+                self.threat_dim = 0
+
+            if "time_since_last_threat" in observation_space.keys():
+                self.time_dim = 1
+            else:
+                self.time_dim = 0
+
             print(
                 f"Image space: {image_space.shape}, Projectile space: {projectile_space.shape}"
             )
-            print(f"Projectile dim calculated: {self.projectile_dim}")
+            print(
+                f"Projectile dim: {self.projectile_dim}, Threat dim: {self.threat_dim}, Time dim: {self.time_dim}"
+            )
         else:
             # Fallback for standard observation spaces
             n_input_channels = observation_space.shape[0]
@@ -841,6 +1000,8 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                 observation_space.shape[2],
             )
             self.projectile_dim = 0
+            self.threat_dim = 0
+            self.time_dim = 0
             print(f"Standard observation space: {observation_space.shape}")
 
         # CNN for processing game frames
@@ -883,12 +1044,37 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
 
         print(f"CNN output features: {n_flatten}")
 
-        # Linear layer for combining CNN features with projectile features
-        # Calculate the total input size
-        total_features = n_flatten + self.projectile_dim
+        # NEW: Create separate networks for processing different feature types
+
+        # 1. Network for processing projectile features
+        self.projectile_network = (
+            nn.Sequential(
+                nn.Linear(self.projectile_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+                nn.ReLU(),
+            )
+            if self.projectile_dim > 0
+            else None
+        )
+
+        # 2. Network for processing threat indicators
+        self.threat_network = (
+            nn.Sequential(nn.Linear(self.threat_dim + self.time_dim, 16), nn.ReLU())
+            if (self.threat_dim + self.time_dim) > 0
+            else None
+        )
+
+        # Calculate the total input size for final linear layer
+        total_features = n_flatten
+        if self.projectile_network is not None:
+            total_features += 64  # Output from projectile network
+        if self.threat_network is not None:
+            total_features += 16  # Output from threat network
+
         print(f"Total input features to linear layer: {total_features}")
 
-        # Create the linear layer to combine features
+        # Final linear layer to combine all features
         self.linear = nn.Sequential(
             nn.Linear(total_features, features_dim),
             nn.ReLU(),
@@ -902,7 +1088,7 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
 
     def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Process image and projectile observations
+        Process image and projectile observations with enhanced weight on projectile features.
 
         :param observations: Dict containing 'image' and 'projectiles' tensors
         :return: Tensor of extracted features
@@ -949,87 +1135,104 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                 (batch_size, self.n_flatten), device=image_tensor.device
             )
 
-        # Handle projectile features or create zeros if not available
-        try:
-            if isinstance(observations, dict) and "projectiles" in observations:
+        # Initialize combined features with image features
+        combined_features = [image_features]
+
+        # Process projectile features if available
+        if (
+            self.projectile_network is not None
+            and isinstance(observations, dict)
+            and "projectiles" in observations
+        ):
+            try:
                 projectile_features = observations["projectiles"]
 
+                # Apply projectile mask if available
+                if "projectile_mask" in observations:
+                    mask = observations["projectile_mask"]
+                    if len(mask.shape) == 2:  # [batch, num_projectiles]
+                        # Expand mask to match projectile features
+                        proj_shape = projectile_features.shape
+                        if len(proj_shape) == 3:  # [batch, num_projectiles, features]
+                            expanded_mask = mask.unsqueeze(-1).expand(
+                                -1, -1, proj_shape[2]
+                            )
+                            # Apply mask (zero out invalid projectiles)
+                            projectile_features = projectile_features * expanded_mask
+
                 # Flatten projectile features if needed
-                if len(projectile_features.shape) == 3:  # [batch, time, features]
+                if (
+                    len(projectile_features.shape) == 3
+                ):  # [batch, num_projectiles, features]
                     projectile_features = projectile_features.reshape(batch_size, -1)
                 elif len(projectile_features.shape) == 1:  # [features]
                     projectile_features = projectile_features.unsqueeze(
                         0
                     )  # Add batch dimension
-            else:
-                # Create zero tensor for projectile features if not available
-                projectile_features = torch.zeros(
-                    (batch_size, self.projectile_dim), device=image_tensor.device
-                )
 
+                # Process through projectile network
+                # Give 30% more weight to projectile features
+                projectile_output = self.projectile_network(projectile_features) * 1.3
+                combined_features.append(projectile_output)
+
+            except Exception as e:
+                print(f"Error processing projectile features: {e}")
+                # Create placeholder features
+                placeholder = torch.zeros((batch_size, 64), device=image_tensor.device)
+                combined_features.append(placeholder)
+
+        # Process threat information if available
+        if self.threat_network is not None:
+            try:
+                threat_inputs = []
+
+                if (
+                    isinstance(observations, dict)
+                    and "projectile_threat" in observations
+                ):
+                    threat = observations["projectile_threat"]
+                    if len(threat.shape) == 1:
+                        threat = threat.unsqueeze(0)
+                    threat_inputs.append(threat)
+
+                if (
+                    isinstance(observations, dict)
+                    and "time_since_last_threat" in observations
+                ):
+                    time_since = observations["time_since_last_threat"]
+                    if len(time_since.shape) == 1:
+                        time_since = time_since.unsqueeze(0)
+                    # Normalize time to 0-1 range
+                    time_since = time_since / 100.0
+                    threat_inputs.append(time_since)
+
+                if threat_inputs:
+                    # Combine threat feature tensors
+                    threat_tensor = torch.cat(threat_inputs, dim=1)
+
+                    # Process through threat network
+                    # Give 50% more weight to threat information
+                    threat_output = self.threat_network(threat_tensor) * 1.5
+                    combined_features.append(threat_output)
+
+            except Exception as e:
+                print(f"Error processing threat features: {e}")
+                placeholder = torch.zeros((batch_size, 16), device=image_tensor.device)
+                combined_features.append(placeholder)
+
+        # Combine all feature outputs
+        try:
+            final_combined = torch.cat(combined_features, dim=1)
         except Exception as e:
-            print(f"Error processing projectiles: {e}")
-            projectile_features = torch.zeros(
-                (batch_size, self.projectile_dim), device=image_tensor.device
-            )
-
-        # Ensure both tensors have the same batch dimension
-        if image_features.shape[0] != projectile_features.shape[0]:
-            print(
-                f"Batch size mismatch: image={image_features.shape[0]}, projectile={projectile_features.shape[0]}"
-            )
-            # Fix batch size mismatch
-            if image_features.shape[0] > projectile_features.shape[0]:
-                projectile_features = projectile_features.expand(
-                    image_features.shape[0], -1
-                )
-            else:
-                image_features = image_features.expand(projectile_features.shape[0], -1)
-
-        # Check if projectile_features needs resizing to match expected dimensions
-        if projectile_features.shape[1] != self.projectile_dim:
-            print(
-                f"Projectile feature dim mismatch: got {projectile_features.shape[1]}, expected {self.projectile_dim}"
-            )
-            # Resize to match expected dimensions
-            if projectile_features.shape[1] < self.projectile_dim:
-                # Pad with zeros if smaller
-                padding = torch.zeros(
-                    (batch_size, self.projectile_dim - projectile_features.shape[1]),
-                    device=projectile_features.device,
-                )
-                projectile_features = torch.cat([projectile_features, padding], dim=1)
-            else:
-                # Truncate if larger
-                projectile_features = projectile_features[:, : self.projectile_dim]
-
-        # Combine features
-        combined_features = torch.cat([image_features, projectile_features], dim=1)
-
-        # Verify the combined shape matches what our linear layer expects
-        expected_input_size = self.linear[0].in_features
-        actual_input_size = combined_features.shape[1]
-
-        if expected_input_size != actual_input_size:
-            print(
-                f"Linear input size mismatch: got {actual_input_size}, expected {expected_input_size}"
-            )
-            if actual_input_size < expected_input_size:
-                # Pad with zeros if too small
-                padding = torch.zeros(
-                    (batch_size, expected_input_size - actual_input_size),
-                    device=combined_features.device,
-                )
-                combined_features = torch.cat([combined_features, padding], dim=1)
-            else:
-                # Truncate if too large
-                combined_features = combined_features[:, :expected_input_size]
+            print(f"Error combining features: {e}")
+            # Fall back to just image features
+            final_combined = image_features
 
         # Process through final layers
-        return self.linear(combined_features)
+        return self.linear(final_combined)
 
 
-# Policy that uses the ProjectileAwareCNN
+# Policy that uses the enhanced ProjectileAwareCNN
 class ProjectileAwarePolicy(ActorCriticPolicy):
     def __init__(
         self,
@@ -1041,7 +1244,7 @@ class ProjectileAwarePolicy(ActorCriticPolicy):
         *args,
         **kwargs,
     ):
-        # Use our custom CNN feature extractor
+        # Use our enhanced CNN feature extractor
         features_extractor_class = ProjectileAwareCNN
         features_extractor_kwargs = dict(features_dim=256)
 
@@ -1059,7 +1262,7 @@ class ProjectileAwarePolicy(ActorCriticPolicy):
 
 
 def create_enhanced_kungfu_model(env, resume=False, model_path=None):
-    """Create a custom PPO model with projectile awareness"""
+    """Create a custom PPO model with enhanced projectile awareness"""
     # Default model path if none provided
     if model_path is None:
         model_path = "model/kungfu_projectile_model.zip"
@@ -1080,9 +1283,8 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Simplified initialization - compatible with older versions of stable-baselines3
+    # Enhanced parameters for better learning
     try:
-        # Try with the most common parameters first
         model = PPO(
             policy=ProjectileAwarePolicy,
             env=env,
@@ -1093,16 +1295,22 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.01,
+            ent_coef=0.01,  # Encourage exploration
             vf_coef=0.5,
             max_grad_norm=0.5,
             tensorboard_log="./logs/tensorboard/",
             verbose=1,
             device=device,
+            # More frequent model saving
+            policy_kwargs=dict(
+                net_arch=[dict(pi=[64, 64], vf=[64, 64])],  # Deeper networks
+                optimizer_class=torch.optim.Adam,
+                optimizer_kwargs=dict(eps=1e-5),
+            ),
         )
     except TypeError as e:
         print(f"Error with initial PPO parameters: {e}")
-        # Try with even fewer parameters as a fallback
+        # Try with fewer parameters as a fallback
         model = PPO(
             policy=ProjectileAwarePolicy,
             env=env,
@@ -1115,8 +1323,8 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
 
 
 def make_enhanced_kungfu_env(
-    is_play_mode=False, frame_stack=4, use_projectile_features=False
-):
+    is_play_mode=False, frame_stack=4, use_projectile_features=True
+):  # Changed default to True
     """Create a Kung Fu Master environment with enhanced projectile detection for Stable Retro"""
 
     # Create base environment
@@ -1238,7 +1446,7 @@ def make_enhanced_kungfu_env(
         print(f"Error applying frame stacking: {e}")
         raise
 
-    # Optionally add projectile features wrapper
+    # Optionally add projectile features wrapper - now enabled by default
     if use_projectile_features:
         try:
             print(
