@@ -16,20 +16,27 @@ from kung_fu_env import (
 )
 
 
-# Enhanced SaveCallback with projectile metrics tracking
-class EnhancedSaveCallback(BaseCallback):
-    """Callback for saving the model and tracking projectile avoidance metrics"""
+# Improved BestModelSaveCallback - Only saves the best models based on metrics
+class BestModelSaveCallback(BaseCallback):
+    """
+    Callback that saves the model only when performance metrics improve.
+    Tracks multiple metrics like mean reward, projectile avoidance rate, etc.
+    """
 
     def __init__(
-        self, check_freq=10000, log_freq=1000, log_dir="logs", model_path=None
+        self, log_freq=1000, log_dir="logs", model_path=None, save_threshold=0.05
     ):
         super().__init__()
-        self.check_freq = check_freq
         self.log_freq = log_freq
         self.best_mean_reward = -float("inf")
         self.best_projectile_avoidance = -float("inf")
+        self.best_projectile_defense_count = -float("inf")
+        self.best_stage_progress = -float("inf")
         self.log_dir = log_dir
         self.model_path = model_path or MODEL_PATH
+        self.save_threshold = (
+            save_threshold  # Minimum improvement threshold to save model
+        )
 
         # Create necessary directories
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
@@ -43,16 +50,10 @@ class EnhancedSaveCallback(BaseCallback):
             with open(self.metrics_file, "w") as f:
                 f.write(
                     "timestamp,steps,mean_reward,defensive_success_rate,projectiles_detected,"
-                    "projectile_defensive_actions,projectile_avoidance_rate\n"
+                    "projectile_defensive_actions,projectile_avoidance_rate,max_stage\n"
                 )
 
     def _on_step(self):
-        # Save model periodically
-        if self.n_calls % self.check_freq == 0:
-            path = f"{self.model_path.split('.')[0]}_{self.n_calls}.zip"
-            self.model.save(path)
-            print(f"Model saved to {path}")
-
         # Log training metrics periodically
         if self.n_calls % self.log_freq == 0:
             # Get basic metrics
@@ -63,6 +64,7 @@ class EnhancedSaveCallback(BaseCallback):
             projectiles_detected = 0
             projectile_defensive_actions = 0
             projectile_avoidance_rate = 0
+            max_stage = 0
 
             if len(self.model.ep_info_buffer) > 0:
                 # Extract metrics from episode info buffer
@@ -93,17 +95,22 @@ class EnhancedSaveCallback(BaseCallback):
                         ep_info.get("projectile_avoidance_rate", 0)
                         for ep_info in valid_episodes
                     ]
+                    stages = [
+                        ep_info.get("current_stage", 0) for ep_info in valid_episodes
+                    ]
 
                     projectiles_detected = np.mean(projectiles)
                     projectile_defensive_actions = np.mean(proj_actions)
                     projectile_avoidance_rate = np.mean(proj_avoidance)
+                    max_stage = np.max(stages) if stages else 0
 
             # Log to console with enhanced metrics
             print(
                 f"Step: {self.n_calls}, Mean reward: {mean_reward:.2f}, "
                 f"Defensive success rate: {defensive_success_rate:.1f}%, "
                 f"Projectiles detected: {projectiles_detected:.1f}, "
-                f"Projectile avoidance rate: {projectile_avoidance_rate:.1f}%"
+                f"Projectile avoidance rate: {projectile_avoidance_rate:.1f}%, "
+                f"Max stage: {max_stage}"
             )
 
             # Log metrics to CSV file
@@ -111,29 +118,110 @@ class EnhancedSaveCallback(BaseCallback):
             with open(self.metrics_file, "a") as f:
                 f.write(
                     f"{timestamp},{self.n_calls},{mean_reward:.2f},{defensive_success_rate:.1f},"
-                    f"{projectiles_detected:.1f},{projectile_defensive_actions:.1f},{projectile_avoidance_rate:.1f}\n"
+                    f"{projectiles_detected:.1f},{projectile_defensive_actions:.1f},"
+                    f"{projectile_avoidance_rate:.1f},{max_stage}\n"
                 )
 
-            # Save model if mean reward improves
-            if mean_reward > self.best_mean_reward:
+            # Only save model when metrics significantly improve
+            saved_model = False
+
+            # 1. Save if mean reward improves by threshold percentage or more
+            if mean_reward > (self.best_mean_reward * (1 + self.save_threshold)) or (
+                mean_reward > 0 and self.best_mean_reward < 0
+            ):
+                relative_improvement = (
+                    (mean_reward - self.best_mean_reward)
+                    / max(1, abs(self.best_mean_reward))
+                ) * 100
                 self.best_mean_reward = mean_reward
                 best_path = f"{self.model_path.split('.')[0]}_best_reward.zip"
                 self.model.save(best_path)
                 print(
-                    f"New best model with reward {mean_reward:.2f} saved to {best_path}"
+                    f"New best model with reward {mean_reward:.2f} saved to {best_path} "
+                    f"(+{relative_improvement:.1f}% improvement)"
                 )
+                saved_model = True
 
-            # Also save model if projectile avoidance rate improves
+            # 2. Save if projectile avoidance rate significantly improves
             if (
-                projectile_avoidance_rate > self.best_projectile_avoidance
-                and projectile_avoidance_rate > 0
-            ):
+                projectile_avoidance_rate
+                > (self.best_projectile_avoidance * (1 + self.save_threshold))
+            ) and projectile_avoidance_rate > 10:
+                relative_improvement = (
+                    (projectile_avoidance_rate - self.best_projectile_avoidance)
+                    / max(1, self.best_projectile_avoidance)
+                ) * 100
                 self.best_projectile_avoidance = projectile_avoidance_rate
                 best_proj_path = f"{self.model_path.split('.')[0]}_best_projectile.zip"
-                self.model.save(best_proj_path)
-                print(
-                    f"New best projectile avoidance model ({projectile_avoidance_rate:.1f}%) saved to {best_proj_path}"
-                )
+
+                # Only save if we haven't already saved a model this step
+                if not saved_model:
+                    self.model.save(best_proj_path)
+                    print(
+                        f"New best projectile avoidance model ({projectile_avoidance_rate:.1f}%) "
+                        f"saved to {best_proj_path} (+{relative_improvement:.1f}% improvement)"
+                    )
+                    saved_model = True
+                else:
+                    print(
+                        f"New best projectile avoidance rate ({projectile_avoidance_rate:.1f}%), "
+                        f"but model already saved this step"
+                    )
+
+            # 3. Save if defense count significantly improves
+            if (
+                projectile_defensive_actions
+                > (self.best_projectile_defense_count * (1 + self.save_threshold))
+            ) and projectile_defensive_actions > 5:
+                relative_improvement = (
+                    (projectile_defensive_actions - self.best_projectile_defense_count)
+                    / max(1, self.best_projectile_defense_count)
+                ) * 100
+                self.best_projectile_defense_count = projectile_defensive_actions
+
+                # Only save if we haven't already saved a model this step
+                if not saved_model:
+                    defense_path = (
+                        f"{self.model_path.split('.')[0]}_best_defense_count.zip"
+                    )
+                    self.model.save(defense_path)
+                    print(
+                        f"New best defense count model ({projectile_defensive_actions:.1f}) "
+                        f"saved to {defense_path} (+{relative_improvement:.1f}% improvement)"
+                    )
+                    saved_model = True
+                else:
+                    print(
+                        f"New best defense count ({projectile_defensive_actions:.1f}), "
+                        f"but model already saved this step"
+                    )
+
+            # 4. Save if max stage progress improves
+            if max_stage > self.best_stage_progress:
+                self.best_stage_progress = max_stage
+
+                # Only save if we haven't already saved a model this step
+                if not saved_model:
+                    stage_path = (
+                        f"{self.model_path.split('.')[0]}_stage_{max_stage}.zip"
+                    )
+                    self.model.save(stage_path)
+                    print(
+                        f"New stage progress! Model reaching stage {max_stage} "
+                        f"saved to {stage_path}"
+                    )
+                    saved_model = True
+                else:
+                    print(
+                        f"New stage progress to stage {max_stage}, "
+                        f"but model already saved this step"
+                    )
+
+            # 5. Always save the latest model at regular intervals
+            if self.n_calls % (self.log_freq * 10) == 0:
+                latest_path = f"{self.model_path.split('.')[0]}_latest.zip"
+                self.model.save(latest_path)
+                print(f"Latest model snapshot saved to {latest_path}")
 
         return True
 
@@ -183,9 +271,9 @@ def train_enhanced_model(model, timesteps, model_path=None):
     # Set model path
     model_path = model_path or MODEL_PATH
 
-    # Create enhanced callback
-    save_callback = EnhancedSaveCallback(
-        check_freq=10000, log_freq=1000, model_path=model_path
+    # Create enhanced callback - much less frequent automatic saves
+    save_callback = BestModelSaveCallback(
+        log_freq=1000, model_path=model_path, save_threshold=0.05
     )
 
     print(f"Starting enhanced training for {timesteps} timesteps")

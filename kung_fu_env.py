@@ -1301,7 +1301,6 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
             tensorboard_log="./logs/tensorboard/",
             verbose=1,
             device=device,
-            # More frequent model saving
             policy_kwargs=dict(
                 net_arch=[dict(pi=[64, 64], vf=[64, 64])],  # Deeper networks
                 optimizer_class=torch.optim.Adam,
