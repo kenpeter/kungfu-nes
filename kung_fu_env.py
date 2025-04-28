@@ -232,9 +232,13 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
 
     def get_player_position(self):
         """Get player position as (x, y) tuple"""
-        x = self.get_ram_value(MEMORY["player_x"])
-        y = self.get_ram_value(MEMORY["player_y"])
-        return (x, y)
+        try:
+            x = self.get_ram_value(MEMORY["player_x"])
+            y = self.get_ram_value(MEMORY["player_y"])
+            return (x, y)
+        except Exception as e:
+            print(f"Error getting player position: {e}")
+            return (0, 0)  # Return default position
 
     def get_score(self):
         """Get score from RAM"""
@@ -334,6 +338,9 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         # Get current hp and current position before step
         current_hp = self.get_hp()
         player_position = self.get_player_position()
+        if not isinstance(player_position, tuple) or len(player_position) != 2:
+            print(f"Warning: Invalid player position format: {player_position}")
+            player_position = (0, 0)
 
         # Initialize projectile variables
         image_projectiles = []
@@ -570,6 +577,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         return obs, shaped_reward, terminated, truncated, info
 
 
+# a wraper add proj info (or anything) to obs (network)
 class ProjectileAwareWrapper(gym.Wrapper):
     """A wrapper that adds projectile information to the observation space"""
 
@@ -716,38 +724,63 @@ class ProjectileAwareWrapper(gym.Wrapper):
                 projectile_info = enhance_observation_with_projectiles(
                     frame_stack, self.env.projectile_detector, player_position
                 )
-                projectiles = projectile_info["projectiles"]
-                recommended_action[0] = projectile_info["recommended_action"]
+
+                # Safely get projectiles and recommended action
+                projectiles = projectile_info.get("projectiles", [])
+                recommended_action[0] = projectile_info.get("recommended_action", 0)
 
                 # Convert projectile info to feature vectors
                 # Each projectile: [relative_x, relative_y, velocity_x, velocity_y, size, distance, time_to_impact]
                 for i, proj in enumerate(projectiles[: self.max_projectiles]):
-                    # Extract projectile position and info
-                    x, y = proj["position"]
-                    vel_x, vel_y = proj.get("velocity", (0, 0))
-                    width, height = proj.get("size", (0, 0))
-                    size = max(width, height)
+                    try:
+                        # Safely extract projectile position and info
+                        position = proj.get("position", (0, 0))
+                        if not isinstance(position, tuple) or len(position) != 2:
+                            position = (0, 0)
 
-                    # Calculate relative position to player
-                    player_x, player_y = player_position
-                    rel_x = x - player_x
-                    rel_y = y - player_y
+                        velocity = proj.get("velocity", (0, 0))
+                        if not isinstance(velocity, tuple) or len(velocity) != 2:
+                            velocity = (0, 0)
 
-                    # Calculate distance and estimated time to impact
-                    distance = np.sqrt(rel_x**2 + rel_y**2)
-                    time_to_impact = distance / max(np.sqrt(vel_x**2 + vel_y**2), 1e-6)
+                        # Extract components safely
+                        x, y = position
+                        vel_x, vel_y = velocity
 
-                    # Store features
-                    projectile_data[i] = [
-                        rel_x,
-                        rel_y,
-                        vel_x,
-                        vel_y,
-                        size,
-                        distance,
-                        time_to_impact,
-                    ]
-                    projectile_mask[i] = 1  # Mark this projectile as valid
+                        # Get size safely
+                        size = proj.get("size", 0)
+                        if "width" in proj and "height" in proj:
+                            width, height = proj.get("width", 0), proj.get("height", 0)
+                            size = max(width, height)
+
+                        # Calculate relative position to player
+                        player_x, player_y = player_position
+                        rel_x = x - player_x
+                        rel_y = y - player_y
+
+                        # Calculate distance and estimated time to impact
+                        distance = np.sqrt(rel_x**2 + rel_y**2)
+                        vel_magnitude = max(np.sqrt(vel_x**2 + vel_y**2), 1e-6)
+                        time_to_impact = distance / vel_magnitude
+
+                        # Store features
+                        projectile_data[i] = [
+                            rel_x,
+                            rel_y,
+                            vel_x,
+                            vel_y,
+                            size,
+                            distance,
+                            time_to_impact,
+                        ]
+                        projectile_mask[i] = 1  # Mark this projectile as valid
+
+                    except Exception as e:
+                        print(
+                            f"Error processing projectile {i}: {e}, projectile data: {proj}"
+                        )
+                        # Skip this projectile
+                        continue
+
             except Exception as e:
                 print(f"Error in projectile detection: {e}")
 

@@ -451,112 +451,64 @@ class ProjectileDetector:
 
 def enhance_observation_with_projectiles(frame_stack, detector, player_position):
     """
-    Detect projectiles and enhance observation with projectile information
+    Enhance observation with detected projectiles
 
-    Args:
-        frame_stack: Stack of recent frames
-        detector: ProjectileDetector instance
-        player_position: (x, y) position of the player
-
-    Returns:
-        Dictionary with projectile information and recommended action
+    :param frame_stack: Stack of consecutive frames
+    :param detector: ProjectileDetector instance
+    :param player_position: (x, y) coordinates of player
+    :return: Dictionary with projectile information
     """
-    # Existing detection code...
-    projectiles = detector.detect_projectiles(frame_stack)
+    try:
+        # Validate player_position format
+        if not isinstance(player_position, tuple) or len(player_position) != 2:
+            print(f"Warning: Invalid player_position format: {player_position}")
+            player_position = (0, 0)  # Default to origin
 
-    # Enhanced data: Calculate velocity and trajectory info for each projectile
-    player_x, player_y = player_position
+        # Detect projectiles
+        projectiles = detector.detect_projectiles(frame_stack)
 
-    for i, projectile in enumerate(projectiles):
-        x, y = (
-            projectile["position"]
-            if "position" in projectile
-            else (projectile["x"], projectile["y"])
-        )
-        width, height = projectile.get("size", (0, 0))
-        if not isinstance(width, tuple):
-            width, height = (
-                width,
-                width,
-            )  # Use size as both width and height if not a tuple
+        # Calculate recommended defensive action
+        recommended_action = 0  # Default: no action
 
-        # Make sure position is set
-        projectile["position"] = (x, y)
+        if projectiles:
+            # Analyze projectile trajectories to determine best defensive action
+            for proj in projectiles:
+                # Extract projectile info safely
+                position = proj.get("position", (0, 0))
+                if not isinstance(position, tuple):
+                    # Handle invalid position
+                    position = (0, 0)
 
-        # If we have a previous position, calculate velocity
-        if "prev_position" in projectile:
-            prev_x, prev_y = projectile["prev_position"]
-            projectile["velocity"] = (x - prev_x, y - prev_y)
-        else:
-            # If this is a new projectile, try to match with previous frames
-            # to estimate velocity
-            if i > 0 and len(frame_stack) > 1:
-                # Try to find similar projectile in previous detection
-                # This is simplified - could be more sophisticated
-                projectile["velocity"] = (0, 0)  # Default if no match found
+                velocity = proj.get("velocity", (0, 0))
+                if not isinstance(velocity, tuple):
+                    # Handle invalid velocity
+                    velocity = (0, 0)
 
-        # Calculate trajectory information
-        dx = player_x - x
-        dy = player_y - y
-        projectile["distance"] = np.sqrt(dx**2 + dy**2)
+                # Calculate threat level based on distance and velocity
+                x, y = position
+                vx, vy = velocity
+                player_x, player_y = player_position
 
-        # Calculate time to impact if velocity is available
-        if "velocity" in projectile:
-            vel_x, vel_y = projectile["velocity"]
-            vel_magnitude = max(np.sqrt(vel_x**2 + vel_y**2), 0.01)  # Avoid div by zero
-            projectile["time_to_impact"] = projectile["distance"] / vel_magnitude
+                # Calculate relative position to player
+                rel_x = x - player_x
+                rel_y = y - player_y
 
-            # Determine if projectile is approaching player
-            is_approaching = (
-                (vel_x > 0 and dx < 0)
-                or (vel_x < 0 and dx > 0)
-                or (vel_y > 0 and dy < 0)
-                or (vel_y < 0 and dy > 0)
-            )
-            projectile["is_approaching"] = is_approaching
+                # Simple distance calculation
+                distance = (rel_x**2 + rel_y**2) ** 0.5
 
-    # Enhanced recommendation logic based on projectile analysis
-    recommended_action = 0  # Default: no-op
+                # Check if projectile is approaching player
+                approaching = (rel_x * vx + rel_y * vy) < 0
 
-    # Find the most threatening projectile
-    threat_level = 0
-    for projectile in projectiles:
-        # Only consider approaching projectiles
-        if not projectile.get("is_approaching", False):
-            continue
+                if approaching and distance < 50:
+                    # Determine if jump or crouch is better based on projectile height
+                    if y < player_y - 10:  # Projectile is above player's feet
+                        recommended_action = 5  # Crouch
+                    else:
+                        recommended_action = 4  # Jump
 
-        # Calculate threat based on distance and time to impact
-        distance = projectile.get("distance", float("inf"))
-        time_to_impact = projectile.get("time_to_impact", float("inf"))
+        return {"projectiles": projectiles, "recommended_action": recommended_action}
 
-        # Simple threat calculation - threat is higher for closer projectiles
-        # and shorter time to impact
-        current_threat = 0
-        if distance < 100 and time_to_impact < 30:
-            current_threat = (100 - distance) + (30 - time_to_impact)
-
-        if current_threat > threat_level:
-            threat_level = current_threat
-
-            # Determine appropriate defensive action
-            # This logic will depend on your game mechanics
-            pos_x, pos_y = projectile["position"]
-            vel_x, vel_y = projectile.get("velocity", (0, 0))
-
-            # Example logic: Jump (4) if projectile is coming low, crouch (5) if coming high
-            if pos_y > player_y + 10:
-                recommended_action = 4  # Jump
-            elif pos_y < player_y - 10:
-                recommended_action = 5  # Crouch
-            else:
-                # If coming directly at player, choose based on velocity
-                if abs(vel_y) > abs(vel_x):
-                    recommended_action = 4 if vel_y > 0 else 5
-                else:
-                    # If mostly horizontal, try to jump
-                    recommended_action = 4
-
-    return {
-        "projectiles": projectiles,
-        "recommended_action": recommended_action,
-    }
+    except Exception as e:
+        print(f"Error in enhance_observation_with_projectiles: {e}")
+        # Return empty results as fallback
+        return {"projectiles": [], "recommended_action": 0}
