@@ -430,7 +430,7 @@ def main():
     args = parser.parse_args()
 
     # Fixed frame stack size of 8 for better projectile detection
-    frame_stack = 8
+    frame_stack = 4
 
     # Create enhanced environment with projectile features if requested
     print(
