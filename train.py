@@ -289,10 +289,11 @@ def train_enhanced_model(model, timesteps, model_path=None):
     print(f"Training completed. Final model saved to {model_path}")
 
 
-def evaluate_enhanced_model(model, n_eval_episodes=5):
+def evaluate_enhanced_model(model, n_eval_episodes=5, env=None):
     """Evaluate model with focus on projectile avoidance"""
     print(f"Evaluating enhanced model over {n_eval_episodes} episodes...")
-    eval_env = make_enhanced_kungfu_env(is_play_mode=True)
+    # Use the provided environment or create a new one
+    eval_env = env if env is not None else make_enhanced_kungfu_env(is_play_mode=True)
 
     # Metrics
     mean_reward = 0
@@ -304,7 +305,18 @@ def evaluate_enhanced_model(model, n_eval_episodes=5):
     total_successful_projectile_avoidance = 0
 
     for i in range(n_eval_episodes):
-        obs = eval_env.reset()[0]
+
+        # Handle different return types from reset()
+        reset_result = eval_env.reset()
+
+        # Check what type of result we got
+        if isinstance(reset_result, tuple):
+            # If it's a tuple, unpack it (usually obs, info)
+            obs = reset_result[0]
+        else:
+            # If it's not a tuple, it's just the observation
+            obs = reset_result
+
         done = False
         total_reward = 0
         steps = 0
@@ -554,8 +566,19 @@ def main():
             # Use standard model
             model = PPO.load(model_path, env=env)
 
-        evaluate_enhanced_model(model, n_eval_episodes=5)
+        # Close the environment before creating a new one for evaluation
         env.close()
+
+        # Create a new environment for evaluation
+        eval_env = make_enhanced_kungfu_env(
+            is_play_mode=True,
+            frame_stack=frame_stack,
+            use_projectile_features=args.use_projectile_features,
+        )
+
+        # Pass the evaluation environment to the evaluation function
+        evaluate_enhanced_model(model, n_eval_episodes=5, env=eval_env)
+        eval_env.close()
         return
 
     # Create or load model

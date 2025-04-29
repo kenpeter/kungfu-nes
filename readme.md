@@ -5,6 +5,23 @@ python train.py --render --timesteps 10000 --resume
 
 
 
+python train.py --render --resume --timesteps 1000 --model-path model/kungfu_with_projectile_features_10000.zip
+
+
+
+python train.py --render --resume --timesteps 1000 --model-path model/kungfu_with_projectile_features_best_reward.zip
+
+
+
+python train.py --render --resume --timesteps 1000 --model-path model/kungfu_with_projectile_features_latest.zip
+
+
+
+python train.py --render --resume --timesteps 1000 --model-path model/kungfu_with_projectile_features.zip
+
+
+
+
 
 
 
