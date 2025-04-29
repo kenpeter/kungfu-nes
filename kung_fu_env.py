@@ -67,7 +67,7 @@ MEMORY = {
 # Maximum episode duration
 MAX_EPISODE_STEPS = 3600  # 2 minutes
 
-# Set default model path
+# Set default model path - using a single model path
 MODEL_PATH = "model/kungfu.zip"
 
 
@@ -1044,7 +1044,7 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
 
         print(f"CNN output features: {n_flatten}")
 
-        # NEW: Create separate networks for processing different feature types
+        # Create separate networks for processing different feature types
 
         # 1. Network for processing projectile features
         self.projectile_network = (
@@ -1094,142 +1094,180 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
         :return: Tensor of extracted features
         """
         # Check if observations is a dict or a tensor
-        if isinstance(observations, dict):
-            image_tensor = observations["image"]
-        else:
-            # If not a dict, assume it's the image tensor directly
-            image_tensor = observations
-
-        # Get batch size safely
-        if len(image_tensor.shape) >= 1:
-            batch_size = image_tensor.shape[0]
-        else:
-            batch_size = 1
-
-        # Process image features
         try:
-            # Try first with standard channel order
-            if len(image_tensor.shape) == 4:
-                # Shape could be [batch, channels, height, width] or [batch, height, width, channels]
-                if image_tensor.shape[3] < image_tensor.shape[1]:
-                    # Likely [batch, height, width, channels]
-                    image_features = self.cnn(image_tensor.permute(0, 3, 1, 2) / 255.0)
-                else:
-                    # Already in expected format [batch, channels, height, width]
-                    image_features = self.cnn(image_tensor / 255.0)
-            elif len(image_tensor.shape) == 3:
-                # Add batch dimension if missing
-                image_features = self.cnn(image_tensor.unsqueeze(0) / 255.0)
+            if isinstance(observations, dict):
+                image_tensor = observations["image"]
             else:
-                # Unexpected shape
-                print(f"Warning: Unexpected image tensor shape: {image_tensor.shape}")
+                # If not a dict, assume it's the image tensor directly
+                image_tensor = observations
+
+            # Ensure image tensor is not None
+            if image_tensor is None:
+                raise ValueError("Image tensor is None")
+
+            # Get batch size safely
+            if len(image_tensor.shape) >= 1:
+                batch_size = image_tensor.shape[0]
+            else:
+                batch_size = 1
+
+            # Process image features
+            try:
+                # Try first with standard channel order
+                if len(image_tensor.shape) == 4:
+                    # Shape could be [batch, channels, height, width] or [batch, height, width, channels]
+                    if image_tensor.shape[3] in [3, 12]:  # RGB or stacked RGB frames
+                        # Likely [batch, height, width, channels]
+                        image_features = self.cnn(
+                            image_tensor.permute(0, 3, 1, 2) / 255.0
+                        )
+                    else:
+                        # Already in expected format [batch, channels, height, width]
+                        image_features = self.cnn(image_tensor / 255.0)
+                elif len(image_tensor.shape) == 3:
+                    # Add batch dimension if missing
+                    image_features = self.cnn(image_tensor.unsqueeze(0) / 255.0)
+                else:
+                    # Unexpected shape
+                    print(
+                        f"Warning: Unexpected image tensor shape: {image_tensor.shape}"
+                    )
+                    # Create placeholder features
+                    image_features = torch.zeros(
+                        (batch_size, self.n_flatten), device=image_tensor.device
+                    )
+
+            except Exception as e:
+                print(f"Error processing image: {e}")
                 # Create placeholder features
                 image_features = torch.zeros(
                     (batch_size, self.n_flatten), device=image_tensor.device
                 )
 
-        except Exception as e:
-            print(f"Error processing image: {e}")
-            # Create placeholder features
-            image_features = torch.zeros(
-                (batch_size, self.n_flatten), device=image_tensor.device
-            )
+            # Initialize combined features with image features
+            combined_features = [image_features]
 
-        # Initialize combined features with image features
-        combined_features = [image_features]
+            # Process projectile features if available
+            if (
+                self.projectile_network is not None
+                and isinstance(observations, dict)
+                and "projectiles" in observations
+                and observations["projectiles"] is not None
+            ):
+                try:
+                    projectile_features = observations["projectiles"]
 
-        # Process projectile features if available
-        if (
-            self.projectile_network is not None
-            and isinstance(observations, dict)
-            and "projectiles" in observations
-        ):
+                    # Apply projectile mask if available
+                    if (
+                        "projectile_mask" in observations
+                        and observations["projectile_mask"] is not None
+                    ):
+                        mask = observations["projectile_mask"]
+                        if len(mask.shape) == 2:  # [batch, num_projectiles]
+                            # Expand mask to match projectile features
+                            proj_shape = projectile_features.shape
+                            if (
+                                len(proj_shape) == 3
+                            ):  # [batch, num_projectiles, features]
+                                expanded_mask = mask.unsqueeze(-1).expand(
+                                    -1, -1, proj_shape[2]
+                                )
+                                # Apply mask (zero out invalid projectiles)
+                                projectile_features = (
+                                    projectile_features * expanded_mask
+                                )
+
+                    # Flatten projectile features if needed
+                    if (
+                        len(projectile_features.shape) == 3
+                    ):  # [batch, num_projectiles, features]
+                        projectile_features = projectile_features.reshape(
+                            batch_size, -1
+                        )
+                    elif len(projectile_features.shape) == 1:  # [features]
+                        projectile_features = projectile_features.unsqueeze(
+                            0
+                        )  # Add batch dimension
+
+                    # Process through projectile network
+                    # Give 30% more weight to projectile features
+                    projectile_output = (
+                        self.projectile_network(projectile_features) * 1.3
+                    )
+                    combined_features.append(projectile_output)
+
+                except Exception as e:
+                    print(f"Error processing projectile features: {e}")
+                    # Create placeholder features
+                    placeholder = torch.zeros(
+                        (batch_size, 64), device=image_tensor.device
+                    )
+                    combined_features.append(placeholder)
+
+            # Process threat information if available
+            if self.threat_network is not None:
+                try:
+                    threat_inputs = []
+
+                    if (
+                        isinstance(observations, dict)
+                        and "projectile_threat" in observations
+                        and observations["projectile_threat"] is not None
+                    ):
+                        threat = observations["projectile_threat"]
+                        if len(threat.shape) == 1:
+                            threat = threat.unsqueeze(0)
+                        threat_inputs.append(threat)
+
+                    if (
+                        isinstance(observations, dict)
+                        and "time_since_last_threat" in observations
+                        and observations["time_since_last_threat"] is not None
+                    ):
+                        time_since = observations["time_since_last_threat"]
+                        if len(time_since.shape) == 1:
+                            time_since = time_since.unsqueeze(0)
+                        # Normalize time to 0-1 range
+                        time_since = time_since / 100.0
+                        threat_inputs.append(time_since)
+
+                    if threat_inputs:
+                        # Combine threat feature tensors
+                        threat_tensor = torch.cat(threat_inputs, dim=1)
+
+                        # Process through threat network
+                        # Give 50% more weight to threat information
+                        threat_output = self.threat_network(threat_tensor) * 1.5
+                        combined_features.append(threat_output)
+                    else:
+                        # If no threat inputs, create a placeholder
+                        placeholder = torch.zeros(
+                            (batch_size, 16), device=image_tensor.device
+                        )
+                        combined_features.append(placeholder)
+
+                except Exception as e:
+                    print(f"Error processing threat features: {e}")
+                    placeholder = torch.zeros(
+                        (batch_size, 16), device=image_tensor.device
+                    )
+                    combined_features.append(placeholder)
+
+            # Combine all feature outputs
             try:
-                projectile_features = observations["projectiles"]
-
-                # Apply projectile mask if available
-                if "projectile_mask" in observations:
-                    mask = observations["projectile_mask"]
-                    if len(mask.shape) == 2:  # [batch, num_projectiles]
-                        # Expand mask to match projectile features
-                        proj_shape = projectile_features.shape
-                        if len(proj_shape) == 3:  # [batch, num_projectiles, features]
-                            expanded_mask = mask.unsqueeze(-1).expand(
-                                -1, -1, proj_shape[2]
-                            )
-                            # Apply mask (zero out invalid projectiles)
-                            projectile_features = projectile_features * expanded_mask
-
-                # Flatten projectile features if needed
-                if (
-                    len(projectile_features.shape) == 3
-                ):  # [batch, num_projectiles, features]
-                    projectile_features = projectile_features.reshape(batch_size, -1)
-                elif len(projectile_features.shape) == 1:  # [features]
-                    projectile_features = projectile_features.unsqueeze(
-                        0
-                    )  # Add batch dimension
-
-                # Process through projectile network
-                # Give 30% more weight to projectile features
-                projectile_output = self.projectile_network(projectile_features) * 1.3
-                combined_features.append(projectile_output)
-
+                final_combined = torch.cat(combined_features, dim=1)
             except Exception as e:
-                print(f"Error processing projectile features: {e}")
-                # Create placeholder features
-                placeholder = torch.zeros((batch_size, 64), device=image_tensor.device)
-                combined_features.append(placeholder)
+                print(f"Error combining features: {e}")
+                # Fall back to just image features
+                final_combined = image_features
 
-        # Process threat information if available
-        if self.threat_network is not None:
-            try:
-                threat_inputs = []
+            # Process through final layers
+            return self.linear(final_combined)
 
-                if (
-                    isinstance(observations, dict)
-                    and "projectile_threat" in observations
-                ):
-                    threat = observations["projectile_threat"]
-                    if len(threat.shape) == 1:
-                        threat = threat.unsqueeze(0)
-                    threat_inputs.append(threat)
-
-                if (
-                    isinstance(observations, dict)
-                    and "time_since_last_threat" in observations
-                ):
-                    time_since = observations["time_since_last_threat"]
-                    if len(time_since.shape) == 1:
-                        time_since = time_since.unsqueeze(0)
-                    # Normalize time to 0-1 range
-                    time_since = time_since / 100.0
-                    threat_inputs.append(time_since)
-
-                if threat_inputs:
-                    # Combine threat feature tensors
-                    threat_tensor = torch.cat(threat_inputs, dim=1)
-
-                    # Process through threat network
-                    # Give 50% more weight to threat information
-                    threat_output = self.threat_network(threat_tensor) * 1.5
-                    combined_features.append(threat_output)
-
-            except Exception as e:
-                print(f"Error processing threat features: {e}")
-                placeholder = torch.zeros((batch_size, 16), device=image_tensor.device)
-                combined_features.append(placeholder)
-
-        # Combine all feature outputs
-        try:
-            final_combined = torch.cat(combined_features, dim=1)
         except Exception as e:
-            print(f"Error combining features: {e}")
-            # Fall back to just image features
-            final_combined = image_features
-
-        # Process through final layers
-        return self.linear(final_combined)
+            print(f"Critical error in feature extraction: {e}")
+            # Return a zero tensor as fallback
+            return torch.zeros((1, self.features_dim), device=self.device)
 
 
 # Policy that uses the enhanced ProjectileAwareCNN
@@ -1265,7 +1303,7 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
     """Create a custom PPO model with enhanced projectile awareness"""
     # Default model path if none provided
     if model_path is None:
-        model_path = "model/kungfu_projectile_model.zip"
+        model_path = MODEL_PATH
 
     # Resume from existing model if requested
     if resume and os.path.exists(model_path):
@@ -1323,7 +1361,7 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
 
 def make_enhanced_kungfu_env(
     is_play_mode=False, frame_stack=4, use_projectile_features=True
-):  # Changed default to True
+):
     """Create a Kung Fu Master environment with enhanced projectile detection for Stable Retro"""
 
     # Create base environment
@@ -1445,7 +1483,7 @@ def make_enhanced_kungfu_env(
         print(f"Error applying frame stacking: {e}")
         raise
 
-    # Optionally add projectile features wrapper - now enabled by default
+    # Always add projectile features wrapper
     if use_projectile_features:
         try:
             print(

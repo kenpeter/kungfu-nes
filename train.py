@@ -16,24 +16,21 @@ from kung_fu_env import (
 )
 
 
-# Improved BestModelSaveCallback - Only saves the best models based on metrics
+# Simplified BestModelSaveCallback - Only saves one model when performance improves
 class BestModelSaveCallback(BaseCallback):
     """
-    Callback that saves the model only when performance metrics improve.
-    Tracks multiple metrics like mean reward, projectile avoidance rate, etc.
+    Callback that saves the model only when mean reward improves significantly.
+    Only keeps one best model file at model/kungfu.zip
     """
 
     def __init__(
-        self, log_freq=1000, log_dir="logs", model_path=None, save_threshold=0.05
+        self, log_freq=1000, log_dir="logs", model_path=MODEL_PATH, save_threshold=0.05
     ):
         super().__init__()
         self.log_freq = log_freq
         self.best_mean_reward = -float("inf")
-        self.best_projectile_avoidance = -float("inf")
-        self.best_projectile_defense_count = -float("inf")
-        self.best_stage_progress = -float("inf")
         self.log_dir = log_dir
-        self.model_path = model_path or MODEL_PATH
+        self.model_path = model_path
         self.save_threshold = (
             save_threshold  # Minimum improvement threshold to save model
         )
@@ -43,7 +40,7 @@ class BestModelSaveCallback(BaseCallback):
         os.makedirs(log_dir, exist_ok=True)
 
         # Enhanced metrics file
-        self.metrics_file = os.path.join(log_dir, "enhanced_training_metrics.csv")
+        self.metrics_file = os.path.join(log_dir, "training_metrics.csv")
 
         # Check if file exists, if not create header
         if not os.path.exists(self.metrics_file):
@@ -122,10 +119,7 @@ class BestModelSaveCallback(BaseCallback):
                     f"{projectile_avoidance_rate:.1f},{max_stage}\n"
                 )
 
-            # Only save model when metrics significantly improve
-            saved_model = False
-
-            # 1. Save if mean reward improves by threshold percentage or more
+            # Only save model when mean reward significantly improves
             if mean_reward > (self.best_mean_reward * (1 + self.save_threshold)) or (
                 mean_reward > 0 and self.best_mean_reward < 0
             ):
@@ -134,164 +128,38 @@ class BestModelSaveCallback(BaseCallback):
                     / max(1, abs(self.best_mean_reward))
                 ) * 100
                 self.best_mean_reward = mean_reward
-                best_path = f"{self.model_path.split('.')[0]}_best_reward.zip"
-                self.model.save(best_path)
+
+                # Save to the single model path
+                self.model.save(self.model_path)
                 print(
-                    f"New best model with reward {mean_reward:.2f} saved to {best_path} "
+                    f"New best model with reward {mean_reward:.2f} saved to {self.model_path} "
                     f"(+{relative_improvement:.1f}% improvement)"
                 )
-                saved_model = True
-
-            # 2. Save if projectile avoidance rate significantly improves
-            if (
-                projectile_avoidance_rate
-                > (self.best_projectile_avoidance * (1 + self.save_threshold))
-            ) and projectile_avoidance_rate > 10:
-                relative_improvement = (
-                    (projectile_avoidance_rate - self.best_projectile_avoidance)
-                    / max(1, self.best_projectile_avoidance)
-                ) * 100
-                self.best_projectile_avoidance = projectile_avoidance_rate
-                best_proj_path = f"{self.model_path.split('.')[0]}_best_projectile.zip"
-
-                # Only save if we haven't already saved a model this step
-                if not saved_model:
-                    self.model.save(best_proj_path)
-                    print(
-                        f"New best projectile avoidance model ({projectile_avoidance_rate:.1f}%) "
-                        f"saved to {best_proj_path} (+{relative_improvement:.1f}% improvement)"
-                    )
-                    saved_model = True
-                else:
-                    print(
-                        f"New best projectile avoidance rate ({projectile_avoidance_rate:.1f}%), "
-                        f"but model already saved this step"
-                    )
-
-            # 3. Save if defense count significantly improves
-            if (
-                projectile_defensive_actions
-                > (self.best_projectile_defense_count * (1 + self.save_threshold))
-            ) and projectile_defensive_actions > 5:
-                relative_improvement = (
-                    (projectile_defensive_actions - self.best_projectile_defense_count)
-                    / max(1, self.best_projectile_defense_count)
-                ) * 100
-                self.best_projectile_defense_count = projectile_defensive_actions
-
-                # Only save if we haven't already saved a model this step
-                if not saved_model:
-                    defense_path = (
-                        f"{self.model_path.split('.')[0]}_best_defense_count.zip"
-                    )
-                    self.model.save(defense_path)
-                    print(
-                        f"New best defense count model ({projectile_defensive_actions:.1f}) "
-                        f"saved to {defense_path} (+{relative_improvement:.1f}% improvement)"
-                    )
-                    saved_model = True
-                else:
-                    print(
-                        f"New best defense count ({projectile_defensive_actions:.1f}), "
-                        f"but model already saved this step"
-                    )
-
-            # 4. Save if max stage progress improves
-            if max_stage > self.best_stage_progress:
-                self.best_stage_progress = max_stage
-
-                # Only save if we haven't already saved a model this step
-                if not saved_model:
-                    stage_path = (
-                        f"{self.model_path.split('.')[0]}_stage_{max_stage}.zip"
-                    )
-                    self.model.save(stage_path)
-                    print(
-                        f"New stage progress! Model reaching stage {max_stage} "
-                        f"saved to {stage_path}"
-                    )
-                    saved_model = True
-                else:
-                    print(
-                        f"New stage progress to stage {max_stage}, "
-                        f"but model already saved this step"
-                    )
-
-            # 5. Always save the latest model at regular intervals
-            if self.n_calls % (self.log_freq * 10) == 0:
-                latest_path = f"{self.model_path.split('.')[0]}_latest.zip"
-                self.model.save(latest_path)
-                print(f"Latest model snapshot saved to {latest_path}")
 
         return True
 
 
-def create_enhanced_model(env, resume=False, model_path=None):
-    """Create a new PPO model with enhanced architecture for projectile detection"""
-    # Set model path
-    model_path = model_path or MODEL_PATH
-
-    # Improved network architecture - deeper for better feature extraction
-    policy_kwargs = dict(
-        net_arch=dict(pi=[256, 128, 64], vf=[256, 128, 64]),
-        normalize_images=True,
-    )
-
-    if resume and os.path.exists(model_path):
-        print(f"Loading existing model from {model_path}")
-        model = PPO.load(model_path, env=env, tensorboard_log="./logs/tensorboard/")
-        print("Model loaded successfully")
-    else:
-        print("Creating new model with enhanced architecture")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device: {device}")
-
-        model = PPO(
-            "CnnPolicy",
-            env,
-            policy_kwargs=policy_kwargs,
-            verbose=1,
-            learning_rate=0.0001,  # Lower learning rate for stability
-            n_steps=2048,  # Collect more experience before updating
-            batch_size=64,  # Smaller batch size for more updates
-            n_epochs=10,  # More gradient updates per batch
-            gamma=0.99,  # Discount factor
-            gae_lambda=0.95,  # GAE parameter
-            clip_range=0.2,  # PPO clipping parameter
-            ent_coef=0.01,  # Higher entropy for more exploration
-            device=device,
-            tensorboard_log="./logs/tensorboard/",
-        )
-
-    return model
-
-
-def train_enhanced_model(model, timesteps, model_path=None):
+def train_model(model, timesteps, model_path=MODEL_PATH):
     """Train the model with focus on projectile avoidance"""
-    # Set model path
-    model_path = model_path or MODEL_PATH
-
-    # Create enhanced callback - much less frequent automatic saves
+    # Create callback
     save_callback = BestModelSaveCallback(
         log_freq=1000, model_path=model_path, save_threshold=0.05
     )
 
-    print(f"Starting enhanced training for {timesteps} timesteps")
+    print(f"Starting training for {timesteps} timesteps")
     model.learn(
         total_timesteps=timesteps,
         callback=save_callback,
-        tb_log_name="kungfu_enhanced_training",
+        tb_log_name="kungfu_training",
         progress_bar=True,
     )
 
-    # Save final model
-    model.save(model_path)
-    print(f"Training completed. Final model saved to {model_path}")
+    print(f"Training completed")
 
 
-def evaluate_enhanced_model(model, n_eval_episodes=5, env=None):
+def evaluate_model(model, n_eval_episodes=5, env=None):
     """Evaluate model with focus on projectile avoidance"""
-    print(f"Evaluating enhanced model over {n_eval_episodes} episodes...")
+    print(f"Evaluating model over {n_eval_episodes} episodes...")
     # Use the provided environment or create a new one
     eval_env = env if env is not None else make_enhanced_kungfu_env(is_play_mode=True)
 
@@ -421,7 +289,7 @@ def evaluate_enhanced_model(model, n_eval_episodes=5, env=None):
         ) * 100
 
     # Print evaluation summary
-    print(f"\nEnhanced evaluation results over {n_eval_episodes} episodes:")
+    print(f"\nEvaluation results over {n_eval_episodes} episodes:")
     print(f"- Mean reward: {mean_reward:.2f}")
     print(f"- Mean max stage: {mean_stages_cleared:.1f}")
     print(f"- Average projectiles detected: {mean_projectiles:.1f}")
@@ -436,7 +304,7 @@ def evaluate_enhanced_model(model, n_eval_episodes=5, env=None):
     return mean_reward, mean_stages_cleared, overall_projectile_avoidance_rate
 
 
-def plot_training_metrics(metrics_file="logs/enhanced_training_metrics.csv"):
+def plot_training_metrics(metrics_file="logs/training_metrics.csv"):
     """Plot training metrics from CSV file"""
     if not os.path.exists(metrics_file):
         print(f"Metrics file {metrics_file} not found.")
@@ -492,7 +360,7 @@ def plot_training_metrics(metrics_file="logs/enhanced_training_metrics.csv"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train an enhanced AI to play Kung Fu Master with projectile detection"
+        description="Train an AI to play Kung Fu Master with projectile detection"
     )
     parser.add_argument(
         "--timesteps", type=int, default=500000, help="Number of timesteps to train"
@@ -510,61 +378,33 @@ def main():
         "--eval-only", action="store_true", help="Only evaluate the model, no training"
     )
     parser.add_argument(
-        "--model-path",
-        type=str,
-        default=None,
-        help="Path to a specific model to evaluate",
-    )
-    parser.add_argument(
         "--plot-metrics",
         action="store_true",
         help="Plot training metrics after training",
     )
-    # Add new argument for using projectile features
-    parser.add_argument(
-        "--use-projectile-features",
-        action="store_true",
-        help="Use explicit projectile features in observations",
-        default=True,
-    )
     args = parser.parse_args()
 
-    # Fixed frame stack size of 8 for better projectile detection
+    # Fixed frame stack size for better projectile detection
     frame_stack = 4
 
-    # Create enhanced environment with projectile features if requested
+    # Create enhanced environment with projectile features always enabled
     print(
         f"Creating enhanced Kung Fu environment with frame stacking (n_stack={frame_stack}) for projectile detection..."
     )
     env = make_enhanced_kungfu_env(
         is_play_mode=args.render,
         frame_stack=frame_stack,
-        use_projectile_features=args.use_projectile_features,
-    )
-
-    # Model paths with feature indication
-    model_suffix = "_with_projectile_features" if args.use_projectile_features else ""
-    model_path = (
-        args.model_path
-        if args.model_path
-        else f"{MODEL_PATH.split('.')[0]}{model_suffix}.zip"
+        use_projectile_features=True,  # Always use projectile features
     )
 
     # Evaluation only mode
     if args.eval_only:
-        if not os.path.exists(model_path):
-            print(f"Error: Model file {model_path} not found.")
+        if not os.path.exists(MODEL_PATH):
+            print(f"Error: Model file {MODEL_PATH} not found.")
             return
 
-        print(f"Loading model from {model_path} for evaluation...")
-        if args.use_projectile_features:
-            # Use appropriate model loading based on features
-            model = create_enhanced_kungfu_model(
-                env, resume=True, model_path=model_path
-            )
-        else:
-            # Use standard model
-            model = PPO.load(model_path, env=env)
+        print(f"Loading model from {MODEL_PATH} for evaluation...")
+        model = create_enhanced_kungfu_model(env, resume=True, model_path=MODEL_PATH)
 
         # Close the environment before creating a new one for evaluation
         env.close()
@@ -573,27 +413,20 @@ def main():
         eval_env = make_enhanced_kungfu_env(
             is_play_mode=True,
             frame_stack=frame_stack,
-            use_projectile_features=args.use_projectile_features,
+            use_projectile_features=True,  # Always use projectile features
         )
 
         # Pass the evaluation environment to the evaluation function
-        evaluate_enhanced_model(model, n_eval_episodes=5, env=eval_env)
+        evaluate_model(model, n_eval_episodes=5, env=eval_env)
         eval_env.close()
         return
 
-    # Create or load model
-    if args.use_projectile_features:
-        # Use custom model with projectile awareness
-        print("Creating model with projectile feature support...")
-        model = create_enhanced_kungfu_model(
-            env, resume=args.resume, model_path=model_path
-        )
-    else:
-        # Use standard model
-        model = create_enhanced_model(env, resume=args.resume, model_path=model_path)
+    # Create or load model - always use projectile features
+    print("Creating model with projectile feature support...")
+    model = create_enhanced_kungfu_model(env, resume=args.resume, model_path=MODEL_PATH)
 
     # Train model
-    train_enhanced_model(model, args.timesteps, model_path=model_path)
+    train_model(model, args.timesteps, model_path=MODEL_PATH)
 
     # Plot metrics if requested
     if args.plot_metrics:
@@ -601,7 +434,7 @@ def main():
 
     # Evaluate model if requested
     if args.eval:
-        evaluate_enhanced_model(model)
+        evaluate_model(model)
 
     # Clean up
     env.close()
