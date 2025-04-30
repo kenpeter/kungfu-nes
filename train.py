@@ -2,10 +2,14 @@ import os
 import argparse
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import datetime
 import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.policies import ActorCriticPolicy
 import matplotlib.pyplot as plt
 import logging
 import signal
@@ -13,11 +17,7 @@ import atexit
 import traceback
 import time
 import gc
-import multiprocessing as mp
-import tempfile
-from copy import deepcopy
 import sys
-import subprocess
 
 # Configure logging
 logging.basicConfig(
@@ -34,11 +34,10 @@ formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(messag
 console.setFormatter(formatter)
 logger.addHandler(console)
 
-# Import our custom environment and policy
+# Import custom environment
 try:
     from kung_fu_env import (
-        make_enhanced_kungfu_env,
-        create_enhanced_kungfu_model,
+        make_kungfu_env,
         MODEL_PATH,
         RetroEnvManager,
     )
@@ -93,503 +92,489 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# Import gym to avoid issues
+try:
+    import gymnasium as gym
+except ImportError:
+    import gym
 
-# Enhanced BestModelSaveCallback with breakthrough tracking
-class BestModelSaveCallback(BaseCallback):
-    """
-    Enhanced callback that saves the model when performance improves and tracks breakthrough metrics.
-    """
 
+# Direct Future Prediction feature extractor
+class DFPFeaturesExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space, features_dim=512):
+        super().__init__(observation_space, features_dim)
+        self.image_space = observation_space.spaces["image"]
+        n_input_channels = self.image_space.shape[
+            2
+        ]  # e.g., 12 for 4 frames * 3 channels
+
+        self.measurement_dim = observation_space.spaces["measurements"].shape[0]
+        self.goal_dim = observation_space.spaces["goals"].shape[0]
+        logger.info(f"DFP Feature Extractor - Image shape: {self.image_space.shape}")
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            dummy_img = torch.zeros(
+                (
+                    1,
+                    n_input_channels,
+                    self.image_space.shape[0],
+                    self.image_space.shape[1],
+                )
+            )
+            cnn_out = self.cnn(dummy_img)
+            self.cnn_out_size = cnn_out.shape[1]
+        logger.info(f"CNN output features: {self.cnn_out_size}")
+
+        measurement_input_size = self.measurement_dim + self.goal_dim
+        self.measurement_net = nn.Sequential(
+            nn.Linear(measurement_input_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+        )
+        self.measurement_out_size = 128
+
+        combined_size = self.cnn_out_size + self.measurement_out_size
+        self.combined_net = nn.Sequential(
+            nn.Linear(combined_size, features_dim), nn.ReLU()
+        )
+
+    def forward(self, observations):
+        image_tensor = observations["image"]
+        if len(image_tensor.shape) == 3:
+            image_tensor = image_tensor.unsqueeze(0)
+        image_tensor = image_tensor.permute(
+            0, 3, 1, 2
+        )  # (batch, H, W, C) to (batch, C, H, W)
+        image_features = self.cnn(image_tensor / 255.0)
+
+        measurement_input = []
+        if len(observations["measurements"].shape) == 1:
+            measurement_input.append(observations["measurements"].unsqueeze(0))
+        else:
+            measurement_input.append(observations["measurements"])
+        if len(observations["goals"].shape) == 1:
+            measurement_input.append(observations["goals"].unsqueeze(0))
+        else:
+            measurement_input.append(observations["goals"])
+        measurement_tensor = torch.cat(measurement_input, dim=1)
+        measurement_features = self.measurement_net(measurement_tensor)
+
+        combined_features = torch.cat([image_features, measurement_features], dim=1)
+        return self.combined_net(combined_features)
+
+
+# DFP prediction head for value function
+class DFPPredictionHead(nn.Module):
     def __init__(
-        self,
-        log_freq=1000,
-        log_dir="logs",
-        model_path=MODEL_PATH,
-        save_threshold=0.05,
-        checkpoint_freq=100000,  # Add periodic checkpoints
+        self, input_dim, measurement_dims=3, prediction_horizons=[1, 3, 5, 10, 20]
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.measurement_dims = measurement_dims
+        self.prediction_horizons = prediction_horizons
+        self.n_horizons = len(prediction_horizons)
+        self.output_dim = measurement_dims * self.n_horizons
+        self.prediction_net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, self.output_dim),
+        )
+
+    def forward(self, features):
+        predictions = self.prediction_net(features)
+        return predictions
+
+    def get_measurements_for_horizon(self, predictions, horizon_idx):
+        start_idx = horizon_idx * self.measurement_dims
+        end_idx = start_idx + self.measurement_dims
+        return predictions[:, start_idx:end_idx]
+
+
+# Custom DFP policy for PPO
+class DFPPolicy(ActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule, *args, **kwargs):
+        self.features_extractor_class = DFPFeaturesExtractor
+        self.features_extractor_kwargs = {"features_dim": 512}
+        super().__init__(observation_space, action_space, lr_schedule, *args, **kwargs)
+        self.dfp_predictor = DFPPredictionHead(
+            input_dim=512, measurement_dims=3, prediction_horizons=[1, 3, 5, 10, 20]
+        )
+
+    def _build_mlp_extractor(self):
+        super()._build_mlp_extractor()
+        self.dfp_predictor = DFPPredictionHead(
+            input_dim=self.features_dim,
+            measurement_dims=3,
+            prediction_horizons=[1, 3, 5, 10, 20],
+        )
+
+    def forward(self, obs, deterministic=False):
+        features = self.extract_features(obs)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(latent_vf)
+        return actions, values, log_prob
+
+    def predict_future_measurements(self, obs):
+        features = self.extract_features(obs)
+        predictions = self.dfp_predictor(features)
+        return predictions
+
+    def evaluate_actions(self, obs, actions):
+        features = self.extract_features(obs)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(latent_vf)
+        entropy = distribution.entropy()
+        return values, log_prob, entropy
+
+
+# Custom DFP loss function for PPO
+class DFPLoss:
+    def __init__(self, policy, prediction_weight=0.5):
+        self.policy = policy
+        self.prediction_weight = prediction_weight
+        self.prediction_loss = nn.MSELoss()
+
+    def __call__(self, rollout_data):
+        obs = rollout_data.observations
+        actions = rollout_data.actions
+        values, log_prob, entropy = self.policy.evaluate_actions(obs, actions)
+        advantages = rollout_data.advantages
+        returns = rollout_data.returns
+        policy_loss = -(advantages * log_prob).mean()
+        value_loss = nn.functional.mse_loss(values, returns)
+        entropy_loss = -entropy.mean()
+        prediction_loss = torch.tensor(0.0)
+        if hasattr(rollout_data, "future_measurements"):
+            future_measurements = rollout_data.future_measurements
+            predictions = self.policy.predict_future_measurements(obs)
+            for i, horizon in enumerate(self.policy.dfp_predictor.prediction_horizons):
+                horizon_key = f"future_{horizon}"
+                if horizon_key in future_measurements:
+                    horizon_preds = (
+                        self.policy.dfp_predictor.get_measurements_for_horizon(
+                            predictions, i
+                        )
+                    )
+                    targets = future_measurements[horizon_key]
+                    horizon_loss = self.prediction_loss(horizon_preds, targets)
+                    prediction_loss += horizon_loss
+        total_loss = (
+            policy_loss
+            + 0.5 * value_loss
+            - 0.01 * entropy_loss
+            + self.prediction_weight * prediction_loss
+        )
+        return total_loss
+
+
+def create_dfp_model(env, resume=False, model_path=MODEL_PATH):
+    if resume and os.path.exists(model_path):
+        logger.info(f"Loading existing DFP model from {model_path}")
+        try:
+            model = PPO.load(model_path, env=env, policy=DFPPolicy)
+            logger.info("Model loaded successfully")
+            return model
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            logger.info("Creating new model instead")
+
+    logger.info("Creating new DFP model")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {device}")
+
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
+    model = PPO(
+        policy=DFPPolicy,
+        env=env,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        tensorboard_log="./logs/tensorboard/",
+        verbose=1,
+        device=device,
+        policy_kwargs=dict(
+            net_arch=[dict(pi=[256, 256], vf=[256, 256])],
+            optimizer_class=torch.optim.Adam,
+            optimizer_kwargs=dict(eps=1e-5),
+        ),
+    )
+
+    return model
+
+
+# Simplified training callback with logging
+class TrainingCallback(BaseCallback):
+    def __init__(
+        self, log_freq=1000, log_dir="logs", model_path=MODEL_PATH, save_freq=50000
     ):
         super().__init__()
         self.log_freq = log_freq
+        self.save_freq = save_freq
         self.best_mean_reward = -float("inf")
-        self.best_breakthrough_count = 0
-        self.best_max_stage = 0
         self.log_dir = log_dir
         self.model_path = model_path
-        self.save_threshold = save_threshold
-        self.checkpoint_freq = checkpoint_freq
-        self.last_checkpoint_step = 0
 
-        # Create necessary directories
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs(os.path.join(log_dir, "checkpoints"), exist_ok=True)
 
-        # Enhanced metrics file
         self.metrics_file = os.path.join(log_dir, "training_metrics.csv")
 
-        # Check if file exists, if not create header
         if not os.path.exists(self.metrics_file):
             with open(self.metrics_file, "w") as f:
                 f.write(
-                    "timestamp,steps,mean_reward,defensive_success_rate,projectiles_detected,"
-                    "projectile_defensive_actions,projectile_avoidance_rate,max_stage,"
-                    "breakthrough_rewards,offensive_success_rate,consecutive_defenses,stagnation\n"
+                    "timestamp,steps,mean_reward,mean_score,mean_damage,mean_progress,max_stage\n"
                 )
 
     def _on_step(self):
-        # Log training metrics periodically
         if self.n_calls % self.log_freq == 0:
-            # Get basic metrics
             mean_reward = self.model.logger.name_to_value.get("rollout/ep_rew_mean", 0)
 
-            # Initialize enhanced metrics
-            defensive_success_rate = 0
-            projectiles_detected = 0
-            projectile_defensive_actions = 0
-            projectile_avoidance_rate = 0
+            mean_score = 0
+            mean_damage = 0
+            mean_progress = 0
             max_stage = 0
-            breakthrough_rewards = 0
-            offensive_success_rate = 0
-            consecutive_defenses = 0
-            stagnation_counter = 0
 
             if hasattr(self.model, "ep_info_buffer") and self.model.ep_info_buffer:
-                # Extract metrics from episode info buffer
                 valid_episodes = [
-                    info
-                    for info in self.model.ep_info_buffer
-                    if isinstance(info, dict) and "defensive_success_rate" in info
+                    info for info in self.model.ep_info_buffer if isinstance(info, dict)
                 ]
-
                 if valid_episodes:
-                    # Basic defensive metrics
-                    defensive_rates = [
-                        ep_info.get("defensive_success_rate", 0)
-                        for ep_info in valid_episodes
+                    scores = [
+                        ep_info.get("score_increase", 0) for ep_info in valid_episodes
                     ]
-                    defensive_success_rate = np.mean(defensive_rates)
-
-                    # Enhanced projectile metrics
-                    projectiles = [
-                        ep_info.get("detected_projectiles", 0)
-                        for ep_info in valid_episodes
+                    damages = [
+                        ep_info.get("damage_taken", 0) for ep_info in valid_episodes
                     ]
-                    proj_actions = [
-                        ep_info.get("projectile_defensive_actions", 0)
-                        for ep_info in valid_episodes
-                    ]
-                    proj_avoidance = [
-                        ep_info.get("projectile_avoidance_rate", 0)
-                        for ep_info in valid_episodes
+                    progress = [
+                        ep_info.get("progress_made", 0) for ep_info in valid_episodes
                     ]
                     stages = [
                         ep_info.get("current_stage", 0) for ep_info in valid_episodes
                     ]
 
-                    # New metrics
-                    breakthroughs = [
-                        ep_info.get("breakthrough_rewards_given", 0)
-                        for ep_info in valid_episodes
-                    ]
-                    offensive_rates = [
-                        ep_info.get("offensive_success_rate", 0)
-                        for ep_info in valid_episodes
-                    ]
-                    defense_counts = [
-                        ep_info.get("consecutive_defenses", 0)
-                        for ep_info in valid_episodes
-                    ]
-                    stagnation_values = [
-                        ep_info.get("stagnation_counter", 0)
-                        for ep_info in valid_episodes
-                    ]
-
-                    projectiles_detected = np.mean(projectiles)
-                    projectile_defensive_actions = np.mean(proj_actions)
-                    projectile_avoidance_rate = np.mean(proj_avoidance)
+                    mean_score = np.mean([sum(s) for s in scores]) if scores else 0
+                    mean_damage = np.mean([sum(d) for d in damages]) if damages else 0
+                    mean_progress = (
+                        np.mean([sum(p) for p in progress]) if progress else 0
+                    )
                     max_stage = np.max(stages) if stages else 0
-                    breakthrough_rewards = np.mean(breakthroughs)
-                    offensive_success_rate = np.mean(offensive_rates)
-                    consecutive_defenses = np.mean(defense_counts)
-                    stagnation_counter = np.mean(stagnation_values)
 
-            # Log to console with enhanced metrics
             logger.info(
                 f"Step: {self.n_calls}, Mean reward: {mean_reward:.2f}, "
-                f"Defensive success rate: {defensive_success_rate:.1f}%, "
-                f"Projectiles detected: {projectiles_detected:.1f}, "
-                f"Proj. avoidance: {projectile_avoidance_rate:.1f}%, "
-                f"Breakthroughs: {breakthrough_rewards:.1f}, "
-                f"Max stage: {max_stage}, "
-                f"Stagnation: {stagnation_counter:.1f}"
+                f"Mean score: {mean_score:.1f}, Mean damage: {mean_damage:.1f}, "
+                f"Mean progress: {mean_progress:.1f}, Max stage: {max_stage}"
             )
 
-            # Log metrics to CSV file
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 with open(self.metrics_file, "a") as f:
                     f.write(
-                        f"{timestamp},{self.n_calls},{mean_reward:.2f},{defensive_success_rate:.1f},"
-                        f"{projectiles_detected:.1f},{projectile_defensive_actions:.1f},"
-                        f"{projectile_avoidance_rate:.1f},{max_stage},"
-                        f"{breakthrough_rewards:.1f},{offensive_success_rate:.1f},"
-                        f"{consecutive_defenses:.1f},{stagnation_counter:.1f}\n"
+                        f"{timestamp},{self.n_calls},{mean_reward:.2f},{mean_score:.1f},"
+                        f"{mean_damage:.1f},{mean_progress:.1f},{max_stage}\n"
                     )
             except Exception as e:
                 logger.error(f"Error writing to metrics file: {e}")
 
-            # Save model based on combined metrics: reward, breakthroughs, and max stage
-            save_model = False
-            save_reason = ""
-
-            # Check for reward improvement
-            if mean_reward > (self.best_mean_reward * (1 + self.save_threshold)) or (
-                mean_reward > 0 and self.best_mean_reward < 0
-            ):
-                relative_improvement = (
-                    (mean_reward - self.best_mean_reward)
-                    / max(1, abs(self.best_mean_reward))
-                ) * 100
-                self.best_mean_reward = mean_reward
-                save_model = True
-                save_reason = f"reward improved to {mean_reward:.2f} (+{relative_improvement:.1f}%)"
-
-            # Check for breakthrough count improvement
-            if breakthrough_rewards > self.best_breakthrough_count:
-                self.best_breakthrough_count = breakthrough_rewards
-                save_model = True
-                if save_reason:
-                    save_reason += " and "
-                save_reason += f"breakthroughs increased to {breakthrough_rewards:.1f}"
-
-            # Check for stage improvement
-            if max_stage > self.best_max_stage:
-                self.best_max_stage = max_stage
-                save_model = True
-                if save_reason:
-                    save_reason += " and "
-                save_reason += f"max stage reached {max_stage}"
-
-            # Save if any improvement was detected
-            if save_model:
+            if self.n_calls % self.save_freq == 0:
                 try:
-                    # Save to the single model path
-                    self.model.save(self.model_path)
-                    logger.info(
-                        f"New best model saved to {self.model_path} - {save_reason}"
+                    self.model.save(
+                        f"{os.path.dirname(self.model_path)}/kungfu_step_{self.n_calls}.zip"
                     )
-                except Exception as e:
-                    logger.error(f"Error saving best model: {e}")
-
-            # Periodically save checkpoints regardless of performance
-            if self.n_calls - self.last_checkpoint_step >= self.checkpoint_freq:
-                try:
-                    checkpoint_path = os.path.join(
-                        self.log_dir, "checkpoints", f"kungfu_step_{self.n_calls}.zip"
-                    )
-                    self.model.save(checkpoint_path)
-                    logger.info(f"Periodic checkpoint saved at step {self.n_calls}")
-                    self.last_checkpoint_step = self.n_calls
+                    logger.info(f"Model checkpoint saved at step {self.n_calls}")
                 except Exception as e:
                     logger.error(f"Error saving checkpoint: {e}")
+
+            if mean_reward > self.best_mean_reward:
+                self.best_mean_reward = mean_reward
+                try:
+                    self.model.save(self.model_path)
+                    logger.info(f"New best model saved with reward {mean_reward:.2f}")
+                except Exception as e:
+                    logger.error(f"Error saving best model: {e}")
 
         return True
 
 
-def run_subprocess_eval(model_path, num_episodes=10, render=True):
-    """
-    Run evaluation in a separate subprocess to guarantee clean environment creation
-    """
-    logger.info("Starting evaluation in a separate process...")
-
-    # Construct the command to run the evaluation script
-    cmd = [
-        sys.executable,  # Current Python interpreter
-        "eval_subprocess.py",  # The evaluation script (we'll create this)
-        "--model",
-        model_path,
-        "--episodes",
-        str(num_episodes),
-    ]
-
-    if render:
-        cmd.append("--render")
-
-    # Run the subprocess
-    try:
-        # Run process and capture output
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-
-        # Log the output
-        if result.stdout:
-            for line in result.stdout.splitlines():
-                logger.info(f"Eval subprocess: {line}")
-
-        if result.stderr:
-            for line in result.stderr.splitlines():
-                logger.error(f"Eval subprocess error: {line}")
-
-        # Check return code
-        if result.returncode != 0:
-            logger.error(
-                f"Evaluation subprocess failed with return code {result.returncode}"
-            )
-        else:
-            logger.info("Evaluation subprocess completed successfully")
-
-        return result.returncode == 0
-
-    except Exception as e:
-        logger.error(f"Error running evaluation subprocess: {e}")
-        logger.error(traceback.format_exc())
-        return False
-
-
-def train_model(model, timesteps, model_path=MODEL_PATH):
-    """Train the model with focus on projectile avoidance and progress"""
-    # Create callbacks
-    save_callback = BestModelSaveCallback(
-        log_freq=1000,
-        model_path=model_path,
-        save_threshold=0.05,
-        checkpoint_freq=100000,
-    )
-
-    try:
-        logger.info(f"Starting training for {timesteps} timesteps")
-
-        model.learn(
-            total_timesteps=timesteps,
-            callback=save_callback,
-            tb_log_name="kungfu_training",
-            progress_bar=True,
-        )
-        logger.info("Training completed successfully")
-
-        # Final evaluation after training - using subprocess
-        logger.info("Performing final evaluation in a separate process...")
-
-        # Make sure the model is saved first
-        model.save(model_path)
-
-        # Run evaluation in a separate process
-        run_subprocess_eval(model_path, num_episodes=10, render=True)
-
-    except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
-    except Exception as e:
-        logger.error(f"Error during training: {e}")
-        logger.error(traceback.format_exc())
-
-
-def plot_training_metrics(
-    metrics_file="logs/training_metrics.csv",
-    eval_metrics_file="logs/eval/eval_metrics.csv",
-):
-    """Plot enhanced training metrics from CSV file"""
+def plot_training_metrics(metrics_file="logs/training_metrics.csv"):
     plots_dir = "logs/plots"
     os.makedirs(plots_dir, exist_ok=True)
 
-    # Plot training metrics
     if os.path.exists(metrics_file):
         try:
-            # Load metrics
             metrics = pd.read_csv(metrics_file)
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
-            # Create figure with multiple subplots - expanded to include breakthrough metrics
-            fig, axes = plt.subplots(3, 2, figsize=(15, 14))
-
-            # Plot mean reward
             axes[0, 0].plot(metrics["steps"], metrics["mean_reward"])
             axes[0, 0].set_title("Mean Reward vs. Training Steps")
             axes[0, 0].set_xlabel("Steps")
             axes[0, 0].set_ylabel("Mean Reward")
             axes[0, 0].grid(True)
 
-            # Plot defensive success rate
-            axes[0, 1].plot(metrics["steps"], metrics["defensive_success_rate"])
-            axes[0, 1].set_title("Defensive Success Rate vs. Training Steps")
+            axes[0, 1].plot(metrics["steps"], metrics["mean_score"])
+            axes[0, 1].set_title("Mean Score vs. Training Steps")
             axes[0, 1].set_xlabel("Steps")
-            axes[0, 1].set_ylabel("Success Rate (%)")
+            axes[0, 1].set_ylabel("Score")
             axes[0, 1].grid(True)
 
-            # Plot projectiles detected
-            axes[1, 0].plot(metrics["steps"], metrics["projectiles_detected"])
-            axes[1, 0].set_title("Projectiles Detected vs. Training Steps")
+            axes[1, 0].plot(metrics["steps"], metrics["mean_damage"])
+            axes[1, 0].set_title("Mean Damage vs. Training Steps")
             axes[1, 0].set_xlabel("Steps")
-            axes[1, 0].set_ylabel("Avg Projectiles Detected")
+            axes[1, 0].set_ylabel("Damage")
             axes[1, 0].grid(True)
 
-            # Plot projectile avoidance rate
-            axes[1, 1].plot(metrics["steps"], metrics["projectile_avoidance_rate"])
-            axes[1, 1].set_title("Projectile Avoidance Rate vs. Training Steps")
+            axes[1, 1].plot(metrics["steps"], metrics["mean_progress"])
+            axes[1, 1].set_title("Mean Progress vs. Training Steps")
             axes[1, 1].set_xlabel("Steps")
-            axes[1, 1].set_ylabel("Avoidance Rate (%)")
+            axes[1, 1].set_ylabel("Progress")
             axes[1, 1].grid(True)
 
-            # Plot breakthrough rewards - NEW
-            if "breakthrough_rewards" in metrics.columns:
-                axes[2, 0].plot(metrics["steps"], metrics["breakthrough_rewards"])
-                axes[2, 0].set_title("Breakthrough Rewards vs. Training Steps")
-                axes[2, 0].set_xlabel("Steps")
-                axes[2, 0].set_ylabel("Avg Breakthroughs")
-                axes[2, 0].grid(True)
-
-            # Plot offensive success rate - NEW
-            if "offensive_success_rate" in metrics.columns:
-                axes[2, 1].plot(metrics["steps"], metrics["offensive_success_rate"])
-                axes[2, 1].set_title("Offensive Success Rate vs. Training Steps")
-                axes[2, 1].set_xlabel("Steps")
-                axes[2, 1].set_ylabel("Success Rate (%)")
-                axes[2, 1].grid(True)
-
             plt.tight_layout()
-
-            # Save figure
             plt.savefig(os.path.join(plots_dir, "training_metrics.png"))
             plt.close()
 
             logger.info(
                 f"Training metrics plotted and saved to {plots_dir}/training_metrics.png"
             )
-
-            # Create an additional plot to track balance between defense and offense
-            if (
-                "consecutive_defenses" in metrics.columns
-                and "offensive_success_rate" in metrics.columns
-            ):
-                plt.figure(figsize=(10, 6))
-
-                # Plot consecutive defenses
-                plt.plot(
-                    metrics["steps"],
-                    metrics["consecutive_defenses"],
-                    label="Consecutive Defensive Actions",
-                    color="blue",
-                )
-
-                # Plot offensive success on second y-axis
-                plt2 = plt.twinx()
-                plt2.plot(
-                    metrics["steps"],
-                    metrics["offensive_success_rate"],
-                    label="Offensive Success Rate",
-                    color="red",
-                )
-
-                plt.title("Defense vs Offense Balance During Training")
-                plt.xlabel("Training Steps")
-                plt.ylabel("Consecutive Defenses")
-                plt2.set_ylabel("Offensive Success Rate (%)")
-
-                # Add legend
-                lines1, labels1 = plt.gca().get_legend_handles_labels()
-                lines2, labels2 = plt2.get_legend_handles_labels()
-                plt2.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
-
-                plt.grid(True)
-                plt.savefig(os.path.join(plots_dir, "defense_offense_balance.png"))
-                plt.close()
-
-                logger.info(
-                    f"Defense/offense balance plot saved to {plots_dir}/defense_offense_balance.png"
-                )
-
-            # Create stagnation plot if available
-            if "stagnation" in metrics.columns:
-                plt.figure(figsize=(10, 6))
-                plt.plot(
-                    metrics["steps"],
-                    metrics["stagnation"],
-                    label="Stagnation Counter",
-                    color="red",
-                )
-                plt.title("Agent Stagnation During Training")
-                plt.xlabel("Training Steps")
-                plt.ylabel("Stagnation Counter")
-                plt.grid(True)
-                plt.legend()
-                plt.savefig(os.path.join(plots_dir, "stagnation.png"))
-                plt.close()
-
-                logger.info(f"Stagnation plot saved to {plots_dir}/stagnation.png")
-
         except Exception as e:
             logger.error(f"Error plotting training metrics: {str(e)}")
             logger.error(traceback.format_exc())
     else:
         logger.warning(f"Metrics file {metrics_file} not found.")
 
-    # Plot evaluation metrics if they exist
-    if os.path.exists(eval_metrics_file):
-        try:
-            # Load evaluation metrics
-            eval_metrics = pd.read_csv(eval_metrics_file)
 
-            # Create evaluation metrics plot
-            plt.figure(figsize=(12, 8))
+def train_model(model, timesteps):
+    callback = TrainingCallback(log_freq=1000, save_freq=50000)
+    try:
+        logger.info(f"Starting training for {timesteps} timesteps")
+        model.learn(
+            total_timesteps=timesteps,
+            callback=callback,
+            tb_log_name="kungfu_dfp_training",
+            progress_bar=True,
+        )
+        logger.info("Training completed successfully")
+        model.save(MODEL_PATH)
+        logger.info(f"Final model saved to {MODEL_PATH}")
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
+        model.save(f"{os.path.dirname(MODEL_PATH)}/kungfu_interrupted.zip")
+        logger.info("Interrupted model saved")
+    except Exception as e:
+        logger.error(f"Error during training: {e}")
+        logger.error(traceback.format_exc())
 
-            # Plot reward
-            plt.subplot(2, 2, 1)
-            plt.plot(eval_metrics["steps"], eval_metrics["mean_reward"], "bo-")
-            plt.title("Evaluation Reward")
-            plt.xlabel("Steps")
-            plt.ylabel("Mean Reward")
-            plt.grid(True)
 
-            # Plot max stage
-            plt.subplot(2, 2, 2)
-            plt.plot(eval_metrics["steps"], eval_metrics["max_stage"], "go-")
-            plt.title("Evaluation Max Stage")
-            plt.xlabel("Steps")
-            plt.ylabel("Stage")
-            plt.grid(True)
+def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
+    try:
+        logger.info(f"Evaluating model from {model_path}")
+        env = make_kungfu_env(is_play_mode=render, frame_stack=4, use_dfp=True)
+        active_environments.add(env)
+        model = PPO.load(model_path, env=env, policy=DFPPolicy)
+        episode_rewards = []
+        episode_scores = []
+        episode_damages = []
+        episode_progress = []
+        max_stage_reached = 0
 
-            # Plot projectile avoidance
-            plt.subplot(2, 2, 3)
-            plt.plot(
-                eval_metrics["steps"], eval_metrics["projectile_avoidance_rate"], "ro-"
-            )
-            plt.title("Evaluation Projectile Avoidance")
-            plt.xlabel("Steps")
-            plt.ylabel("Avoidance Rate (%)")
-            plt.grid(True)
+        for episode in range(num_episodes):
+            obs = env.reset()
+            done = False
+            episode_reward = 0
+            episode_score = 0
+            episode_damage = 0
+            episode_prog = 0
+            current_stage = 0
 
-            # Plot breakthroughs
-            plt.subplot(2, 2, 4)
-            plt.plot(eval_metrics["steps"], eval_metrics["breakthroughs"], "mo-")
-            plt.title("Evaluation Breakthroughs")
-            plt.xlabel("Steps")
-            plt.ylabel("Avg Breakthroughs")
-            plt.grid(True)
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                episode_reward += reward
+                if isinstance(info, dict):
+                    episode_score += info.get("score_increase", 0)
+                    episode_damage += info.get("damage_taken", 0)
+                    episode_prog += info.get("progress_made", 0)
+                    current_stage = max(current_stage, info.get("current_stage", 0))
 
-            plt.tight_layout()
-            plt.savefig(os.path.join(plots_dir, "evaluation_metrics.png"))
-            plt.close()
+            episode_rewards.append(episode_reward)
+            episode_scores.append(episode_score)
+            episode_damages.append(episode_damage)
+            episode_progress.append(episode_prog)
+            max_stage_reached = max(max_stage_reached, current_stage)
 
             logger.info(
-                f"Evaluation metrics plotted and saved to {plots_dir}/evaluation_metrics.png"
+                f"Episode {episode+1}/{num_episodes}: Reward={episode_reward:.2f}, "
+                f"Score={episode_score:.1f}, Damage={episode_damage:.1f}, "
+                f"Progress={episode_prog:.1f}, Stage={current_stage}"
             )
 
-        except Exception as e:
-            logger.error(f"Error plotting evaluation metrics: {str(e)}")
-            logger.error(traceback.format_exc())
-    else:
-        logger.info(f"Evaluation metrics file {eval_metrics_file} not found.")
+        avg_reward = np.mean(episode_rewards)
+        avg_score = np.mean(episode_scores)
+        avg_damage = np.mean(episode_damages)
+        avg_progress = np.mean(episode_progress)
+
+        logger.info(f"Evaluation results over {num_episodes} episodes:")
+        logger.info(f"Average reward: {avg_reward:.2f}")
+        logger.info(f"Average score: {avg_score:.1f}")
+        logger.info(f"Average damage: {avg_damage:.1f}")
+        logger.info(f"Average progress: {avg_progress:.1f}")
+        logger.info(f"Max stage reached: {max_stage_reached}")
+
+        env.close()
+        active_environments.discard(env)
+
+        return {
+            "avg_reward": avg_reward,
+            "avg_score": avg_score,
+            "avg_damage": avg_damage,
+            "avg_progress": avg_progress,
+            "max_stage": max_stage_reached,
+        }
+    except Exception as e:
+        logger.error(f"Error during evaluation: {e}")
+        logger.error(traceback.format_exc())
+        return None
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train an AI to play Kung Fu Master with improved projectile avoidance and progression"
+        description="Train a Direct Future Prediction agent for Kung Fu Master"
     )
     parser.add_argument(
-        "--timesteps", type=int, default=500000, help="Number of timesteps to train"
+        "--timesteps", type=int, default=1000000, help="Number of timesteps to train"
     )
     parser.add_argument(
         "--resume", action="store_true", help="Resume training from saved model"
     )
     parser.add_argument(
-        "--render", action="store_true", help="Render the game during training"
+        "--render", action="store_true", help="Render the environment during training"
     )
     parser.add_argument(
         "--eval-only", action="store_true", help="Only evaluate the model, no training"
@@ -599,93 +584,37 @@ def main():
         action="store_true",
         help="Plot training metrics after training",
     )
-    parser.add_argument(
-        "--analyze",
-        action="store_true",
-        help="Run a detailed analysis of agent performance",
-    )
     args = parser.parse_args()
 
-    # Evaluation only mode - use subprocess
     if args.eval_only:
         if not os.path.exists(MODEL_PATH):
             logger.error(f"Error: Model file {MODEL_PATH} not found.")
             return
-
         logger.info(f"Running evaluation-only mode on model: {MODEL_PATH}")
-        run_subprocess_eval(MODEL_PATH, num_episodes=10, render=True)
+        evaluate_model(MODEL_PATH, num_episodes=10, render=True)
         return
-
-    # Analysis mode - use subprocess
-    if args.analyze:
-        if not os.path.exists(MODEL_PATH):
-            logger.error(f"Error: Model file {MODEL_PATH} not found.")
-            return
-
-        logger.info(f"Running analysis mode on model: {MODEL_PATH}")
-        # Create a special eval subprocess command for analysis
-        cmd = [
-            sys.executable,  # Current Python interpreter
-            "eval_subprocess.py",  # The evaluation script
-            "--model",
-            MODEL_PATH,
-            "--episodes",
-            "20",
-            "--analyze",  # Special flag for analysis mode
-        ]
-
-        if args.render:
-            cmd.append("--render")
-
-        subprocess.run(cmd)
-        return
-
-    # Fixed frame stack size for better projectile detection
-    frame_stack = 4
 
     try:
-        # Create enhanced environment with projectile features always enabled
-        logger.info(
-            f"Creating enhanced Kung Fu environment with frame stacking (n_stack={frame_stack}) for projectile detection..."
-        )
-
-        # Force garbage collection before creating environment
+        logger.info("Creating Kung Fu Master environment with DFP...")
         gc.collect()
         time.sleep(1)
-
-        env = make_enhanced_kungfu_env(
-            is_play_mode=args.render,
-            frame_stack=frame_stack,
-            use_projectile_features=True,  # Always use projectile features
-        )
-
-        # Register environment for cleanup
+        env = make_kungfu_env(is_play_mode=args.render, frame_stack=4, use_dfp=True)
         active_environments.add(env)
-
-        # Create or load model
-        logger.info("Creating model with projectile feature support...")
-        model = create_enhanced_kungfu_model(
-            env, resume=args.resume, model_path=MODEL_PATH
-        )
-
-        # Train model
-        train_model(model, args.timesteps, model_path=MODEL_PATH)
-
-        # Plot metrics if requested
+        logger.info("Creating DFP model...")
+        model = create_dfp_model(env, resume=args.resume, model_path=MODEL_PATH)
+        train_model(model, args.timesteps)
         if args.plot_metrics:
             plot_training_metrics()
-
-        # Clean up
+        logger.info("Evaluating trained model...")
+        evaluate_model(MODEL_PATH, num_episodes=5, render=True)
         logger.info("Closing training environment")
         env.close()
         active_environments.discard(env)
         logger.info("Training completed")
-
     except Exception as e:
         logger.error(f"Unhandled exception in main: {e}")
         logger.error(traceback.format_exc())
     finally:
-        # Make sure we clean up all resources
         cleanup_all_resources()
 
 
@@ -698,5 +627,4 @@ if __name__ == "__main__":
         logger.error(f"Unhandled exception in main program: {e}")
         logger.error(traceback.format_exc())
     finally:
-        # Make sure we clean up all resources on exit
         cleanup_all_resources()
