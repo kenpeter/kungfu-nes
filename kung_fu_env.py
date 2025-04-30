@@ -12,12 +12,87 @@ from stable_baselines3 import PPO
 from gymnasium import spaces
 from typing import Dict, List, Tuple, Type, Union, Optional
 import tempfile
+import atexit
+import gc
+import logging
+import time
 
-# import the projectile detector
-from projectile import (
-    ImprovedProjectileDetector,
-    enhance_observation_with_projectiles,
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    filename="kungfu_env.log",
 )
+logger = logging.getLogger("kungfu_env")
+
+# Setup console handler for important messages
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logger.addHandler(console)
+
+# import the projectile detector - use try/except to handle import errors gracefully
+try:
+    from projectile import (
+        ImprovedProjectileDetector,
+        enhance_observation_with_projectiles,
+    )
+
+    PROJECTILE_DETECTOR_AVAILABLE = True
+except ImportError:
+    logger.warning("Failed to import projectile detector. Using fallback detection.")
+    PROJECTILE_DETECTOR_AVAILABLE = False
+
+    # Define fallback projectile detection if module isn't available
+    class ImprovedProjectileDetector:
+        def __init__(self, debug=False):
+            self.debug = debug
+            logger.info("Using fallback projectile detector")
+
+        def reset(self):
+            pass
+
+        def detect_projectiles(self, frame):
+            return []
+
+    def enhance_observation_with_projectiles(obs, detector, player_position):
+        return {"projectiles": [], "recommended_action": 0}
+
+
+# Singleton for retro environment management
+class RetroEnvManager:
+    _instance = None
+    _active_envs = set()
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = RetroEnvManager()
+        return cls._instance
+
+    def __init__(self):
+        self._active_envs = set()
+        # Register cleanup on exit
+        atexit.register(self.cleanup_all_envs)
+
+    def register_env(self, env):
+        self._active_envs.add(env)
+
+    def unregister_env(self, env):
+        if env in self._active_envs:
+            self._active_envs.remove(env)
+
+    def cleanup_all_envs(self):
+        logger.info(f"Cleaning up {len(self._active_envs)} environments")
+        for env in list(self._active_envs):
+            try:
+                if hasattr(env, "close"):
+                    env.close()
+            except Exception as e:
+                logger.error(f"Error closing environment: {e}")
+        self._active_envs.clear()
+        # Force garbage collection
+        gc.collect()
+
 
 # Define the Kung Fu Master action space
 KUNGFU_ACTIONS = [
@@ -75,6 +150,19 @@ MODEL_PATH = "model/kungfu.zip"
 class ResilientMonitor(Monitor):
     """A more fault-tolerant version of Monitor that won't crash on I/O errors"""
 
+    def __init__(self, env, filename, **kwargs):
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+        # Add unique timestamp to prevent conflicts
+        timestamp = int(time.time())
+        filename_with_timestamp = f"{filename}.{timestamp}"
+
+        super().__init__(env, filename_with_timestamp, **kwargs)
+        logger.info(
+            f"ResilientMonitor initialized with file: {filename_with_timestamp}"
+        )
+
     def step(self, action):
         """
         Step the environment with the given action
@@ -86,7 +174,7 @@ class ResilientMonitor(Monitor):
             return super().step(action)
         except ValueError as e:
             if "I/O operation on closed file" in str(e):
-                print("Warning: Monitor file I/O error. Reopening file.")
+                logger.warning("Monitor file I/O error. Reopening file.")
                 # Create a new results writer
                 self._setup_results_writer()
                 # Proceed with step, but don't try to log
@@ -119,10 +207,10 @@ class ResilientMonitor(Monitor):
                 extra_keys=self.info_keywords,
             )
         except Exception as e:
-            print(f"Warning: Failed to set up results writer: {e}")
+            logger.error(f"Failed to set up results writer: {e}")
             # Use a dummy file as a fallback
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".monitor.csv")
-            print(f"Using temporary monitor file: {temp_file.name}")
+            logger.info(f"Using temporary monitor file: {temp_file.name}")
             self.file_handler = temp_file
             from stable_baselines3.common.monitor import ResultsWriter
 
@@ -131,6 +219,21 @@ class ResilientMonitor(Monitor):
                 header={"t_start": self.t_start, **self.metadata},
                 extra_keys=self.info_keywords,
             )
+
+    def close(self):
+        """Closes the environment"""
+        super().close()
+        # Make sure file handlers are closed
+        if hasattr(self, "file_handler") and hasattr(self.file_handler, "close"):
+            try:
+                self.file_handler.close()
+            except:
+                pass
+        if hasattr(self, "results_writer") and hasattr(self.results_writer, "close"):
+            try:
+                self.results_writer.close()
+            except:
+                pass
 
 
 # Enhanced environment wrapper with improved reward shaping and action buffering
@@ -157,6 +260,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.prev_stage = 0
         self.n_steps = 0
         self.episode_steps = 0
+        self.total_training_steps = 0  # Added for curriculum learning
 
         # Enhanced metrics for projectile avoidance
         self.detected_projectiles = 0
@@ -165,8 +269,25 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.successful_defensive_actions = 0
         self.successful_projectile_avoidance = 0
 
-        # Use the projectile detector
-        self.projectile_detector = ImprovedProjectileDetector(debug=True)
+        # Track offensive actions and success
+        self.offensive_actions = 0
+        self.successful_offensive_actions = 0
+        self.consecutive_defenses = 0  # Track consecutive defensive actions
+
+        # Track progression through the game
+        self.passed_projectile_positions = set()  # Store sections we've passed
+        # break through?
+        self.breakthrough_rewards_given = 0
+        self.last_progress_time = 0  # Track when significant progress was last made
+        self.stagnation_counter = 0  # Count steps without progress
+
+        # Initialize projectile detector
+        if PROJECTILE_DETECTOR_AVAILABLE:
+            self.projectile_detector = ImprovedProjectileDetector(debug=True)
+            logger.info("Initialized improved projectile detector")
+        else:
+            self.projectile_detector = ImprovedProjectileDetector(debug=False)
+            logger.warning("Using fallback projectile detector")
 
         # Raw observation buffer for projectile detection
         self.raw_observation_buffer = []
@@ -177,9 +298,11 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.action_buffer_size = 5  # Hold actions for 5 frames
         self.last_defensive_action = 0
         self.last_defensive_action_time = 0
-        self.defensive_cooldown = 10  # Frames between defensive actions
+        self.defensive_cooldown = 20  # Frames between defensive actions
 
-        print("Enhanced KungFuMasterEnv initialized with improved projectile detection")
+        logger.info(
+            "Enhanced KungFuMasterEnv initialized with improved projectile detection"
+        )
 
     def _buffer_raw_observation(self, obs):
         """Store raw observations for projectile detection"""
@@ -212,10 +335,10 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 return self.env._memory
 
             # If all else fails, return dummy RAM
-            print("Warning: Unable to access RAM through known methods")
+            logger.warning("Unable to access RAM through known methods")
             return np.zeros(0x10000, dtype=np.uint8)
         except Exception as e:
-            print(f"Error accessing RAM: {e}")
+            logger.error(f"Error accessing RAM: {e}")
             return np.zeros(0x10000, dtype=np.uint8)
 
     def get_ram_value(self, address):
@@ -226,7 +349,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 return int(ram[address])
             return 0
         except Exception as e:
-            print(f"Error accessing RAM at address 0x{address:04x}: {e}")
+            logger.error(f"Error accessing RAM at address 0x{address:04x}: {e}")
             return 0
 
     def get_stage(self):
@@ -244,7 +367,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             y = self.get_ram_value(MEMORY["player_y"])
             return (x, y)
         except Exception as e:
-            print(f"Error getting player position: {e}")
+            logger.error(f"Error getting player position: {e}")
             return (0, 0)  # Return default position
 
     def get_score(self):
@@ -256,7 +379,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 score += digit * (10 ** (4 - i))
             return score
         except Exception as e:
-            print(f"Error getting score: {e}")
+            logger.error(f"Error getting score: {e}")
             return 0
 
     def reset(self, **kwargs):
@@ -276,7 +399,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 obs = obs_result
                 info = {}
         except Exception as e:
-            print(f"Error in reset: {e}")
+            logger.error(f"Error in reset: {e}")
             # Create a dummy observation and info
             obs = np.zeros((224, 240, 3), dtype=np.uint8)
             info = {}
@@ -288,6 +411,15 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.projectile_defensive_actions = 0
         self.successful_defensive_actions = 0
         self.successful_projectile_avoidance = 0
+
+        # Reset offensive metrics
+        self.offensive_actions = 0
+        self.successful_offensive_actions = 0
+        self.consecutive_defenses = 0
+        self.passed_projectile_positions = set()
+        # break through
+        self.breakthrough_rewards_given = 0
+        self.last_progress_time = 0
 
         # Reset action buffer
         self.action_buffer = []
@@ -302,11 +434,12 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                     self.successful_projectile_avoidance
                     / self.projectile_defensive_actions
                 ) * 100
-                print(
+                logger.info(
                     f"Episode projectile stats - Detected: {self.detected_projectiles}, "
                     f"Defensive actions: {self.projectile_defensive_actions}, "
                     f"Successful avoidance: {self.successful_projectile_avoidance}, "
-                    f"Avoidance rate: {projectile_avoidance_rate:.1f}%"
+                    f"Avoidance rate: {projectile_avoidance_rate:.1f}%, "
+                    f"Breakthroughs: {self.breakthrough_rewards_given}"
                 )
 
         # Clear observation buffer
@@ -322,7 +455,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         self.prev_boss_hp = self.get_ram_value(MEMORY["boss_hp"])
         self.prev_score = self.get_score()
 
-        print(
+        logger.info(
             f"Initial state - Stage: {self.prev_stage}, HP: {self.prev_hp}, "
             f"Pos: ({self.prev_x_pos}, {self.prev_y_pos}), Score: {self.prev_score}"
         )
@@ -340,35 +473,50 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
         """Take a step in the environment with Stable Retro compatibility"""
         # Check if reset has been called
         if not self.reset_called:
-            print(
-                "Warning: step() called before reset(). Attempting to reset the environment."
+            logger.warning(
+                "step() called before reset(). Attempting to reset the environment."
             )
             self.reset()
 
-        # Check action buffer for defensive actions
+        # Increment total training steps counter
+        self.total_training_steps += 1
+
+        # Identify offensive actions
+        is_offensive_action = action in [1, 8, 9, 11, 12]  # Punch, Kick, combinations
+
+        # Check action buffer for defensive actions - MODIFIED FOR PROGRESSIVE REDUCTION
         if self.action_buffer:
             buffered_action = self.action_buffer.pop(0)
-            if action != buffered_action and (
-                buffered_action == 4 or buffered_action == 5
-            ):
-                # If the buffer contains a defensive action, override the agent's choice
-                print(
-                    f"ACTION OVERRIDE: Using buffered defensive action {self.KUNGFU_ACTION_NAMES[buffered_action]} instead of {self.KUNGFU_ACTION_NAMES[action]}"
-                )
-                action = buffered_action
+
+            # Only use buffer if there's an immediate projectile threat
+            # And reduce probability of override as training progresses
+            override_chance = max(0.5, 1.0 - (self.total_training_steps / 2000000))
+
+            if np.random.rand() < override_chance and buffered_action in [4, 5]:
+                # Don't override if we're trying to do an offensive action after many defenses
+                if is_offensive_action and self.consecutive_defenses > 5:
+                    logger.info(
+                        f"ALLOWING OFFENSIVE ACTION: {self.KUNGFU_ACTION_NAMES[action]} after many defenses"
+                    )
+                else:
+                    # Otherwise, use the buffered defensive action
+                    logger.debug(
+                        f"ACTION OVERRIDE ({override_chance:.2f}): Using buffered defensive action {self.KUNGFU_ACTION_NAMES[buffered_action]} instead of {self.KUNGFU_ACTION_NAMES[action]}"
+                    )
+                    action = buffered_action
 
         # Convert to actual action
         try:
             converted_action = self.KUNGFU_ACTIONS[action]
         except Exception as e:
-            print(f"Error converting action {action}: {e}")
+            logger.error(f"Error converting action {action}: {e}")
             converted_action = self.KUNGFU_ACTIONS[0]  # Default to no-op
 
         # Get current hp and current position before step
         current_hp = self.get_hp()
         player_position = self.get_player_position()
         if not isinstance(player_position, tuple) or len(player_position) != 2:
-            print(f"Warning: Invalid player position format: {player_position}")
+            logger.warning(f"Invalid player position format: {player_position}")
             player_position = (0, 0)
 
         # Initialize projectile variables
@@ -394,12 +542,17 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 if recommended_action in [4, 5]:  # Jump or Crouch
                     action_name = self.KUNGFU_ACTION_NAMES[recommended_action]
 
+                    # Adaptive cooldown based on consecutive defenses
+                    adaptive_cooldown = self.defensive_cooldown + (
+                        self.consecutive_defenses * 5
+                    )
+
                     # Only buffer defensive action if we're not in cooldown period
                     if (
                         self.episode_steps - self.last_defensive_action_time
-                        > self.defensive_cooldown
+                        > adaptive_cooldown
                     ):
-                        print(
+                        logger.info(
                             f"⚠️ BUFFERING DEFENSIVE ACTION: {action_name} - {len(image_projectiles)} projectiles detected!"
                         )
                         # Clear existing buffer and fill with the new action
@@ -409,7 +562,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                         self.last_defensive_action = recommended_action
                         self.last_defensive_action_time = self.episode_steps
             except Exception as e:
-                print(f"Error in projectile detection: {e}")
+                logger.error(f"Error in projectile detection: {e}")
 
         # Determine if there's an active projectile threat
         projectile_threat = len(image_projectiles) > 0
@@ -422,8 +575,13 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
 
         if is_defensive_action:
             self.defensive_actions += 1
+            self.consecutive_defenses += 1
             if projectile_threat:
                 self.projectile_defensive_actions += 1
+        elif is_offensive_action:
+            self.offensive_actions += 1
+            # Reset consecutive defenses when offensive action is taken
+            self.consecutive_defenses = max(0, self.consecutive_defenses - 2)
 
         # Take step in environment with error handling for different gym versions
         try:
@@ -442,8 +600,8 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 truncated = False
             else:
                 # Unexpected format
-                print(
-                    f"Warning: Unexpected step result format with {len(step_result)} values"
+                logger.warning(
+                    f"Unexpected step result format with {len(step_result)} values"
                 )
                 obs = (
                     np.zeros_like(self.raw_observation_buffer[-1])
@@ -456,7 +614,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 info = {}
 
         except Exception as e:
-            print(f"Error during environment step: {e}")
+            logger.error(f"Error during environment step: {e}")
             # Fall back to a safe return value format
             obs = (
                 np.zeros_like(self.raw_observation_buffer[-1])
@@ -495,7 +653,7 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             # Log status occasionally
             if self.n_steps % 100 == 0:
                 time_left = (MAX_EPISODE_STEPS - self.episode_steps) / 30  # in seconds
-                print(
+                logger.info(
                     f"Stage: {current_stage}, Position: ({current_x_pos}, {current_y_pos}), "
                     f"HP: {current_hp}, Score: {current_score}, Time left: {time_left:.1f}s"
                 )
@@ -506,23 +664,37 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             # Shape the reward
             shaped_reward = reward
 
-            # Score reward
+            # Score reward - IMPROVED WITH EMPHASIS ON ENEMY DEFEAT
             score_diff = current_score - self.prev_score
             if score_diff > 0:
+                # Basic score rewards
                 shaped_reward += score_diff * 0.05
+
+                # Special bonus for significant score increases (enemy defeats)
                 if score_diff >= 100:
-                    print(f"Score increased by {score_diff}! Current: {current_score}")
+                    shaped_reward += 10.0  # Significant reward for defeating enemies
+                    self.successful_offensive_actions += 1
+
+                    # Reset defensive bias after successful offense
+                    self.consecutive_defenses = max(0, self.consecutive_defenses - 3)
+
+                    logger.info(
+                        f"ENEMY DEFEAT: Score increased by {score_diff}! +10.0 reward. Current: {current_score}"
+                    )
 
             # HP loss penalty
             hp_diff = current_hp - self.prev_hp
             if hp_diff < 0 and current_hp < 200:  # Normal health loss
                 shaped_reward += hp_diff * 0.5  # Penalize health loss
 
-            # Stage completion bonus
+            # Stage completion bonus - INCREASED
             if current_stage > self.prev_stage:
-                print(f"Stage up! {self.prev_stage} -> {current_stage}")
-                shaped_reward += 50.0
+                logger.info(f"STAGE UP! {self.prev_stage} -> {current_stage}")
+                shaped_reward += 100.0  # DOUBLED from 50 to 100
                 self.episode_steps = max(0, self.episode_steps - 600)
+
+                # Reset passed positions for new stage
+                self.passed_projectile_positions = set()
 
             # Boss damage bonus
             boss_hp_diff = (
@@ -531,29 +703,105 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                 else 0
             )
             if boss_hp_diff > 0:
-                shaped_reward += boss_hp_diff * 0.3
+                shaped_reward += boss_hp_diff * 0.5  # Increased from 0.3 to 0.5
 
-            # Movement rewards based on stage
+            # Movement rewards based on stage - IMPROVED WITH PROGRESS MULTIPLIER
             x_diff = current_x_pos - self.prev_x_pos
+            progress_multiplier = 1.0 + (
+                0.1 * self.episode_steps / 100
+            )  # Grows over time
 
             if current_stage in [1, 3]:  # Move right in stages 1, 3
                 if x_diff > 0:
-                    shaped_reward += x_diff * 0.1
+                    # Increased from 0.1 to 0.5 and add progress multiplier
+                    shaped_reward += x_diff * 0.5 * progress_multiplier
             else:  # Move left in stages 0, 2, 4
                 if x_diff < 0:
-                    shaped_reward += abs(x_diff) * 0.1
+                    shaped_reward += abs(x_diff) * 0.5 * progress_multiplier
 
-            # ENHANCED PROJECTILE AVOIDANCE REWARDS
+            # NEW - BREAKTHROUGH REWARDS FOR MAKING PROGRESS WITH PROJECTILES
+            # This approach detects when an agent makes progress while projectiles are present
+            # We track progress in fixed-width sections of the stage
+
+            # 30 pixel for each game section
+            section_width = 30  # Width of each game section to track
+            # current section
+            current_section = current_x_pos // section_width
+            # prev section
+            prev_section = self.prev_x_pos // section_width
+
+            # we track whether we move from one section to another section
+            if current_section != prev_section and self.detected_projectiles > 0:
+                # we need to move in the right direction
+                moving_correctly = (
+                    current_stage in [1, 3] and current_section > prev_section
+                ) or (  # Moving right in stages 1,3
+                    current_stage not in [1, 3] and current_section < prev_section
+                )  # Moving left in stages 0,2,4
+
+                if moving_correctly:
+                    section_key = f"{current_stage}_{current_section}"
+                    if section_key not in self.passed_projectile_positions:
+                        # we progress the new section, give big reward
+                        self.passed_projectile_positions.add(section_key)
+                        self.breakthrough_rewards_given += 1
+
+                        # Progressive reward scaling with more breakthroughs
+                        breakthrough_reward = 15.0 * (
+                            1 + 0.3 * self.breakthrough_rewards_given
+                        )
+                        shaped_reward += breakthrough_reward
+
+                        logger.info(
+                            f"BREAKTHROUGH: Agent made progress to section {current_section} with projectiles present! +{breakthrough_reward:.1f} reward"
+                        )
+
+                        # Reset consecutive defenses to encourage more progress
+                        self.consecutive_defenses = 0
+
+            # if we move a lot, reward a lot (even without proj)
+            progress_distance = abs(current_x_pos - self.prev_x_pos)
+            # reward at > 20 pixel
+            if progress_distance > 20:
+                # Check if we're moving in the correct direction for the stage
+                correct_direction = (
+                    current_stage in [1, 3] and current_x_pos > self.prev_x_pos
+                ) or (  # Right in stages 1,3
+                    current_stage not in [1, 3] and current_x_pos < self.prev_x_pos
+                )  # Left in stages 0,2,4
+
+                if correct_direction:
+                    progress_reward = 5.0 + (0.1 * progress_distance)
+                    shaped_reward += progress_reward
+                    logger.debug(
+                        f"SIGNIFICANT PROGRESS: Moved {progress_distance} pixels in the right direction! +{progress_reward:.1f} reward"
+                    )
+
+            # ENHANCED PROJECTILE AVOIDANCE REWARDS - WITH DYNAMIC SCALING
+            # Calculate defensive bias that decreases over time through curriculum learning
+            defensive_bias = max(0.5, 1.0 - (self.total_training_steps / 2000000))
+
             if is_defensive_action and projectile_threat:
                 # If we didn't lose health during a defensive action against a projectile
                 if hp_diff >= 0:
                     self.successful_defensive_actions += 1
                     self.successful_projectile_avoidance += 1
 
-                    # HIGHER reward for successful projectile avoidance (increased from 1.0 to 5.0)
-                    shaped_reward += 5.0
-                    print(
-                        f"SUCCESS: {self.KUNGFU_ACTION_NAMES[action]} avoided projectile! Reward +5.0"
+                    # REDUCED reward for successful projectile avoidance that scales down over time
+                    base_reward = 2.0  # Reduced from 5.0 to 2.0
+
+                    # Add decay factor based on consecutive successful avoidances
+                    decay_factor = max(
+                        0.5, 1.0 - (0.01 * self.successful_projectile_avoidance)
+                    )
+
+                    # Apply the defensive bias from curriculum learning
+                    final_reward = base_reward * decay_factor * defensive_bias
+                    shaped_reward += final_reward
+
+                    logger.debug(
+                        f"SUCCESS: {self.KUNGFU_ACTION_NAMES[action]} avoided projectile! "
+                        f"Reward +{final_reward:.2f} (bias: {defensive_bias:.2f}, decay: {decay_factor:.2f})"
                     )
 
                     # Log successful projectile avoidance
@@ -562,44 +810,81 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                             self.successful_projectile_avoidance
                             / max(1, self.projectile_defensive_actions)
                         ) * 100
-                        print(
+                        logger.info(
                             f"Projectile avoidance success rate: {avoidance_rate:.1f}% "
                             f"({self.successful_projectile_avoidance}/{self.projectile_defensive_actions})"
                         )
                 else:
-                    # Increased penalty for incorrect timing of defensive action (from -0.2 to -1.0)
+                    # Keep penalty for incorrect timing of defensive action
                     shaped_reward -= 1.0
-                    print(
+                    logger.debug(
                         f"FAILURE: Defensive action {self.KUNGFU_ACTION_NAMES[action]} failed - took damage. Penalty -1.0"
                     )
             elif is_defensive_action and not projectile_threat:
-                # Increased penalty for defensive action when no threat exists (from -0.1 to -0.5)
-                shaped_reward -= 0.5
+                # Increased penalty for unnecessary defensive actions as training progresses
+                unnecessary_penalty = 0.5 * (
+                    1.0 + (self.total_training_steps / 5000000)
+                )
+                shaped_reward -= unnecessary_penalty
+
                 if self.n_steps % 50 == 0:
-                    print(
-                        f"UNNECESSARY: Defensive action {self.KUNGFU_ACTION_NAMES[action]} with no projectile detected. Penalty -0.5"
+                    logger.debug(
+                        f"UNNECESSARY: Defensive action {self.KUNGFU_ACTION_NAMES[action]} with no projectile detected. "
+                        f"Penalty -{unnecessary_penalty:.2f}"
                     )
             elif is_defensive_action and hp_diff >= 0:
                 # Regular defensive action that maintained health
                 self.successful_defensive_actions += 1
-                shaped_reward += 0.5  # Slight increase from 0.3
+                shaped_reward += 0.3  # Reduced from 0.5 to 0.3
 
-            # Extra reward for following recommended defensive actions
+            # Extra reward for following recommended defensive actions - SCALED DOWN OVER TIME
             if action == recommended_action and recommended_action in [4, 5]:
-                shaped_reward += (
-                    1.0  # Reward for taking the recommended defensive action
-                )
-                print(
-                    f"GOOD DECISION: Agent followed recommended defensive action {self.KUNGFU_ACTION_NAMES[action]}. Reward +1.0"
+                recommendation_reward = 1.0 * defensive_bias
+                shaped_reward += recommendation_reward
+                logger.debug(
+                    f"GOOD DECISION: Agent followed recommended defensive action {self.KUNGFU_ACTION_NAMES[action]}. "
+                    f"Reward +{recommendation_reward:.2f}"
                 )
 
-            # Death penalty
-            if current_hp == 0 and self.prev_hp > 0:
-                shaped_reward -= 10.0
-                print("Agent died! Applying penalty.")
+            # NEW - OFFENSIVE SUCCESS REWARDS
+            if is_offensive_action and score_diff > 0:
+                # Reward offensive actions that increase score
+                shaped_reward += 1.0 + (
+                    0.01 * score_diff
+                )  # Base reward plus score-based bonus
+                logger.debug(
+                    f"OFFENSIVE SUCCESS: {self.KUNGFU_ACTION_NAMES[action]} led to score increase! Reward +{1.0 + (0.01 * score_diff):.2f}"
+                )
 
-            # Time urgency
-            time_penalty = -0.001 * (self.episode_steps / MAX_EPISODE_STEPS)
+            # Additional stagnation penalty - detect when agent is stuck
+            self.stagnation_counter += 1
+
+            # Consider significant movement as progress
+            if progress_distance > 10 and correct_direction:
+                self.stagnation_counter = 0
+                self.last_progress_time = self.episode_steps
+
+            # Apply increasing penalty if agent hasn't made progress in a while
+            if self.stagnation_counter > 200:  # No significant progress for 200 steps
+                stagnation_penalty = min(5.0, 0.01 * (self.stagnation_counter - 200))
+                shaped_reward -= stagnation_penalty
+
+                if self.stagnation_counter % 100 == 0:
+                    logger.info(
+                        f"STAGNATION PENALTY: No progress for {self.stagnation_counter} steps. Penalty: -{stagnation_penalty:.2f}"
+                    )
+
+                # If extremely stuck and doing defensive actions, apply larger penalty
+                if self.stagnation_counter > 500 and is_defensive_action:
+                    shaped_reward -= 1.0
+                    if self.stagnation_counter % 100 == 0:
+                        logger.info(
+                            "SEVERE STAGNATION: Penalizing defensive actions to encourage exploration"
+                        )
+
+            # Time urgency - More aggressive as episode progresses
+            time_factor = min(3.0, 1.0 + (self.episode_steps / MAX_EPISODE_STEPS * 2))
+            time_penalty = -0.001 * time_factor
             shaped_reward += time_penalty
 
             # Update previous values
@@ -621,7 +906,12 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
                     "detected_projectiles": self.detected_projectiles,
                     "projectile_defensive_actions": self.projectile_defensive_actions,
                     "successful_projectile_avoidance": self.successful_projectile_avoidance,
-                    "recommended_action": recommended_action,  # Include recommended action in info
+                    "recommended_action": recommended_action,
+                    "offensive_actions": self.offensive_actions,
+                    "successful_offensive_actions": self.successful_offensive_actions,
+                    "breakthrough_rewards_given": self.breakthrough_rewards_given,
+                    "consecutive_defenses": self.consecutive_defenses,
+                    "stagnation_counter": self.stagnation_counter,
                 }
             )
 
@@ -641,12 +931,41 @@ class EnhancedKungFuMasterEnv(gym.Wrapper):
             else:
                 info["projectile_avoidance_rate"] = 0
 
+            if self.offensive_actions > 0:
+                info["offensive_success_rate"] = (
+                    self.successful_offensive_actions / self.offensive_actions
+                ) * 100
+            else:
+                info["offensive_success_rate"] = 0
+
         except Exception as e:
-            print(f"Error in reward shaping: {e}")
+            logger.error(f"Error in reward shaping: {e}")
             shaped_reward = reward
 
         # Return with gymnasium API by default
         return obs, shaped_reward, terminated, truncated, info
+
+    def close(self):
+        """Properly close environment resources"""
+        try:
+            # Attempt to close the underlying environment
+            if hasattr(self.env, "close"):
+                self.env.close()
+
+            # Clear buffers to free memory
+            self.raw_observation_buffer = []
+            self.action_buffer = []
+
+            # Log closure
+            logger.info("EnhancedKungFuMasterEnv closed successfully")
+        except Exception as e:
+            logger.error(f"Error closing EnhancedKungFuMasterEnv: {e}")
+
+        # Unregister from the environment manager
+        try:
+            RetroEnvManager.get_instance().unregister_env(self)
+        except Exception as e:
+            logger.error(f"Error unregistering from RetroEnvManager: {e}")
 
 
 # a wrapper add proj info (or anything) to obs (network)
@@ -698,6 +1017,20 @@ class ProjectileAwareWrapper(gym.Wrapper):
                     shape=(1,),
                     dtype=np.float32,
                 ),
+                # NEW: Information about agent progression for better decision making
+                "progress_info": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(3,),  # [stage, x_position, stage_progress]
+                    dtype=np.float32,
+                ),
+                # NEW: Defensive vs offensive state tracking
+                "action_balance": spaces.Box(
+                    low=0,
+                    high=100,
+                    shape=(2,),  # [consecutive_defenses, offensive_success_rate]
+                    dtype=np.float32,
+                ),
             }
         )
 
@@ -705,6 +1038,14 @@ class ProjectileAwareWrapper(gym.Wrapper):
         self.frames_since_last_threat = 100  # Initialize high
         self.last_recommended_action = 0
         self.projectile_threat_active = False
+        self.stage_progress = 0.0  # Track progress through current stage
+
+        # Register with environment manager
+        RetroEnvManager.get_instance().register_env(self)
+
+        logger.info(
+            f"ProjectileAwareWrapper initialized with max_projectiles={max_projectiles}"
+        )
 
     def reset(self, **kwargs):
         """Reset the environment and return enhanced observation with projectile data"""
@@ -720,7 +1061,7 @@ class ProjectileAwareWrapper(gym.Wrapper):
                 obs = obs_result
                 info = {}
         except Exception as e:
-            print(f"Error in reset: {e}")
+            logger.error(f"Error in reset: {e}")
             # Create a dummy observation and info
             obs = np.zeros((224, 240, 3), dtype=np.uint8)
             info = {}
@@ -729,6 +1070,7 @@ class ProjectileAwareWrapper(gym.Wrapper):
         self.frames_since_last_threat = 100
         self.last_recommended_action = 0
         self.projectile_threat_active = False
+        self.stage_progress = 0.0
 
         # Create empty projectile vector data
         projectile_data = np.zeros(
@@ -741,6 +1083,35 @@ class ProjectileAwareWrapper(gym.Wrapper):
             [self.frames_since_last_threat], dtype=np.float32
         )
 
+        # Get stage and position info
+        current_stage = 0
+        x_position = 0
+
+        if hasattr(self.env, "get_stage") and callable(self.env.get_stage):
+            current_stage = self.env.get_stage()
+
+        if hasattr(self.env, "get_player_position") and callable(
+            self.env.get_player_position
+        ):
+            player_pos = self.env.get_player_position()
+            if isinstance(player_pos, tuple) and len(player_pos) == 2:
+                x_position = player_pos[0]
+
+        # Initialize progress info
+        progress_info = np.array(
+            [float(current_stage), float(x_position), 0.0],  # Initial progress is 0
+            dtype=np.float32,
+        )
+
+        # Initialize action balance
+        action_balance = np.array(
+            [
+                0.0,  # consecutive_defenses
+                50.0,  # start with neutral offensive success rate
+            ],
+            dtype=np.float32,
+        )
+
         # Create enhanced observation
         enhanced_obs = {
             "image": obs,
@@ -749,6 +1120,8 @@ class ProjectileAwareWrapper(gym.Wrapper):
             "recommended_action": recommended_action,
             "projectile_threat": projectile_threat,
             "time_since_last_threat": time_since_last_threat,
+            "progress_info": progress_info,
+            "action_balance": action_balance,
         }
 
         # Return based on what we received
@@ -777,7 +1150,7 @@ class ProjectileAwareWrapper(gym.Wrapper):
                     f"Unexpected step result format with {len(step_result)} values"
                 )
         except Exception as e:
-            print(f"Error during environment step: {e}")
+            logger.error(f"Error during environment step: {e}")
             # Return default values as fallback
             obs = np.zeros((224, 240, 3), dtype=np.uint8)
             reward = -1.0
@@ -802,6 +1175,39 @@ class ProjectileAwareWrapper(gym.Wrapper):
         )
         projectile_mask = np.zeros(self.max_projectiles, dtype=np.int8)
         recommended_action = np.zeros(1, dtype=np.int32)
+
+        # Get stage and progress information
+        current_stage = info.get("current_stage", 0)
+        if hasattr(self.env, "get_stage") and callable(self.env.get_stage):
+            current_stage = self.env.get_stage()
+
+        x_position = (
+            player_position[0]
+            if isinstance(player_position, tuple) and len(player_position) == 2
+            else 0
+        )
+
+        # Calculate stage progress (0-100%)
+        # Assuming right stages (1,3) progress from 0 to 255, left stages from 255 to 0
+        if current_stage in [1, 3]:  # Right-moving stages
+            self.stage_progress = min(100.0, (x_position / 255.0) * 100.0)
+        else:  # Left-moving stages
+            self.stage_progress = min(100.0, ((255.0 - x_position) / 255.0) * 100.0)
+
+        # Create progress info array
+        progress_info = np.array(
+            [float(current_stage), float(x_position), self.stage_progress],
+            dtype=np.float32,
+        )
+
+        # Get action balance information
+        consecutive_defenses = info.get("consecutive_defenses", 0)
+        offensive_success_rate = info.get("offensive_success_rate", 50.0)
+
+        action_balance = np.array(
+            [float(consecutive_defenses), float(offensive_success_rate)],
+            dtype=np.float32,
+        )
 
         # If we have projectile detector, use it
         projectile_threat_detected = False
@@ -920,12 +1326,12 @@ class ProjectileAwareWrapper(gym.Wrapper):
                         projectile_mask[i] = 1  # Mark this projectile as valid
 
                     except Exception as e:
-                        print(f"Error processing projectile {i}: {e}")
+                        logger.error(f"Error processing projectile {i}: {e}")
                         # Skip this projectile
                         continue
 
             except Exception as e:
-                print(f"Error in projectile detection: {e}")
+                logger.error(f"Error in projectile detection: {e}")
 
         # Create enhanced observation with threat information
         projectile_threat = np.array(
@@ -942,9 +1348,24 @@ class ProjectileAwareWrapper(gym.Wrapper):
             "recommended_action": recommended_action,
             "projectile_threat": projectile_threat,
             "time_since_last_threat": time_since_last_threat,
+            "progress_info": progress_info,
+            "action_balance": action_balance,
         }
 
         return enhanced_obs, reward, terminated, truncated, info
+
+    def close(self):
+        """Properly close the environment"""
+        try:
+            # Close the wrapped environment
+            if hasattr(self.env, "close"):
+                self.env.close()
+
+            # Unregister from environment manager
+            RetroEnvManager.get_instance().unregister_env(self)
+            logger.info("ProjectileAwareWrapper closed successfully")
+        except Exception as e:
+            logger.error(f"Error closing ProjectileAwareWrapper: {e}")
 
 
 # CNN for projectile detection with enhanced feature importance
@@ -986,11 +1407,25 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
             else:
                 self.time_dim = 0
 
-            print(
+            # NEW: Add dimensions for progress and action balance features
+            if "progress_info" in observation_space.keys():
+                self.progress_dim = observation_space["progress_info"].shape[0]
+            else:
+                self.progress_dim = 0
+
+            if "action_balance" in observation_space.keys():
+                self.balance_dim = observation_space["action_balance"].shape[0]
+            else:
+                self.balance_dim = 0
+
+            logger.info(
                 f"Image space: {image_space.shape}, Projectile space: {projectile_space.shape}"
             )
-            print(
+            logger.info(
                 f"Projectile dim: {self.projectile_dim}, Threat dim: {self.threat_dim}, Time dim: {self.time_dim}"
+            )
+            logger.info(
+                f"Progress dim: {self.progress_dim}, Balance dim: {self.balance_dim}"
             )
         else:
             # Fallback for standard observation spaces
@@ -1002,7 +1437,9 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
             self.projectile_dim = 0
             self.threat_dim = 0
             self.time_dim = 0
-            print(f"Standard observation space: {observation_space.shape}")
+            self.progress_dim = 0
+            self.balance_dim = 0
+            logger.info(f"Standard observation space: {observation_space.shape}")
 
         # CNN for processing game frames
         self.cnn = nn.Sequential(
@@ -1023,26 +1460,30 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                     1, n_input_channels, image_height, image_width
                 )
                 n_flatten = self.cnn(test_tensor).shape[1]
-                print(
+                logger.info(
                     f"CNN output shape determined with dimensions {image_height}x{image_width}"
                 )
             except RuntimeError:
                 try:
                     # If that fails, try with transposed dimensions
-                    print(
+                    logger.info(
                         f"Trying transposed dimensions for CNN input: {image_width}x{image_height}"
                     )
                     test_tensor = torch.zeros(
                         1, n_input_channels, image_width, image_height
                     )
                     n_flatten = self.cnn(test_tensor).shape[1]
-                    print(f"CNN output shape determined with transposed dimensions")
+                    logger.info(
+                        f"CNN output shape determined with transposed dimensions"
+                    )
                 except RuntimeError:
                     # If both fail, use a hardcoded value that's likely to work
-                    print("Could not determine CNN output shape, using estimated value")
+                    logger.warning(
+                        "Could not determine CNN output shape, using estimated value"
+                    )
                     n_flatten = 39936  # Common value for frame stacked observations
 
-        print(f"CNN output features: {n_flatten}")
+        logger.info(f"CNN output features: {n_flatten}")
 
         # Create separate networks for processing different feature types
 
@@ -1065,14 +1506,42 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
             else None
         )
 
+        # 3. NEW: Network for processing progress information
+        self.progress_network = (
+            nn.Sequential(
+                nn.Linear(self.progress_dim, 32),
+                nn.ReLU(),
+                nn.Linear(32, 16),
+                nn.ReLU(),
+            )
+            if self.progress_dim > 0
+            else None
+        )
+
+        # 4. NEW: Network for processing action balance
+        self.balance_network = (
+            nn.Sequential(
+                nn.Linear(self.balance_dim, 16),
+                nn.ReLU(),
+                nn.Linear(16, 8),
+                nn.ReLU(),
+            )
+            if self.balance_dim > 0
+            else None
+        )
+
         # Calculate the total input size for final linear layer
         total_features = n_flatten
         if self.projectile_network is not None:
             total_features += 64  # Output from projectile network
         if self.threat_network is not None:
             total_features += 16  # Output from threat network
+        if self.progress_network is not None:
+            total_features += 16  # Output from progress network
+        if self.balance_network is not None:
+            total_features += 8  # Output from balance network
 
-        print(f"Total input features to linear layer: {total_features}")
+        logger.info(f"Total input features to linear layer: {total_features}")
 
         # Final linear layer to combine all features
         self.linear = nn.Sequential(
@@ -1086,13 +1555,29 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
         self.image_width = image_width
         self.n_flatten = n_flatten
 
+        # Initialize training steps counter for feature weight adjustment
+        self.training_steps = 0
+
+        # Register device for consistency
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"ProjectileAwareCNN using device: {self.device}")
+
     def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Process image and projectile observations with enhanced weight on projectile features.
+        Process image and projectile observations with dynamic weight adjustment.
 
-        :param observations: Dict containing 'image' and 'projectiles' tensors
+        :param observations: Dict containing 'image' and other feature tensors
         :return: Tensor of extracted features
         """
+        # Increment training steps counter
+        self.training_steps += 1
+
+        # Dynamic weight factors based on training progress
+        # As training progresses, we reduce emphasis on defensive features
+        projectile_weight = max(1.0, 1.3 - (self.training_steps / 2000000 * 0.3))
+        threat_weight = max(1.0, 1.5 - (self.training_steps / 2000000 * 0.5))
+        progress_weight = min(1.5, 1.0 + (self.training_steps / 2000000 * 0.5))
+
         # Check if observations is a dict or a tensor
         try:
             if isinstance(observations, dict):
@@ -1129,8 +1614,8 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                     image_features = self.cnn(image_tensor.unsqueeze(0) / 255.0)
                 else:
                     # Unexpected shape
-                    print(
-                        f"Warning: Unexpected image tensor shape: {image_tensor.shape}"
+                    logger.warning(
+                        f"Unexpected image tensor shape: {image_tensor.shape}"
                     )
                     # Create placeholder features
                     image_features = torch.zeros(
@@ -1138,8 +1623,8 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                     )
 
             except Exception as e:
-                print(f"Error processing image: {e}")
-                # Create placeholder features
+                logger.error(f"Error processing image: {e}")
+                # Fall back to just image features
                 image_features = torch.zeros(
                     (batch_size, self.n_flatten), device=image_tensor.device
                 )
@@ -1190,14 +1675,14 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                         )  # Add batch dimension
 
                     # Process through projectile network
-                    # Give 30% more weight to projectile features
+                    # MODIFIED: Dynamic weight based on training progress
                     projectile_output = (
-                        self.projectile_network(projectile_features) * 1.3
+                        self.projectile_network(projectile_features) * projectile_weight
                     )
                     combined_features.append(projectile_output)
 
                 except Exception as e:
-                    print(f"Error processing projectile features: {e}")
+                    logger.error(f"Error processing projectile features: {e}")
                     # Create placeholder features
                     placeholder = torch.zeros(
                         (batch_size, 64), device=image_tensor.device
@@ -1235,9 +1720,10 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                         # Combine threat feature tensors
                         threat_tensor = torch.cat(threat_inputs, dim=1)
 
-                        # Process through threat network
-                        # Give 50% more weight to threat information
-                        threat_output = self.threat_network(threat_tensor) * 1.5
+                        # Process through threat network with dynamic weight
+                        threat_output = (
+                            self.threat_network(threat_tensor) * threat_weight
+                        )
                         combined_features.append(threat_output)
                     else:
                         # If no threat inputs, create a placeholder
@@ -1247,9 +1733,61 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
                         combined_features.append(placeholder)
 
                 except Exception as e:
-                    print(f"Error processing threat features: {e}")
+                    logger.error(f"Error processing threat features: {e}")
                     placeholder = torch.zeros(
                         (batch_size, 16), device=image_tensor.device
+                    )
+                    combined_features.append(placeholder)
+
+            # NEW: Process progress information if available
+            if (
+                self.progress_network is not None
+                and isinstance(observations, dict)
+                and "progress_info" in observations
+                and observations["progress_info"] is not None
+            ):
+                try:
+                    progress_features = observations["progress_info"]
+
+                    # Ensure proper shape
+                    if len(progress_features.shape) == 1:
+                        progress_features = progress_features.unsqueeze(0)
+
+                    # Process through progress network with increasing weight over time
+                    progress_output = (
+                        self.progress_network(progress_features) * progress_weight
+                    )
+                    combined_features.append(progress_output)
+                except Exception as e:
+                    logger.error(f"Error processing progress features: {e}")
+                    placeholder = torch.zeros(
+                        (batch_size, 16), device=image_tensor.device
+                    )
+                    combined_features.append(placeholder)
+
+            # NEW: Process action balance information if available
+            if (
+                self.balance_network is not None
+                and isinstance(observations, dict)
+                and "action_balance" in observations
+                and observations["action_balance"] is not None
+            ):
+                try:
+                    balance_features = observations["action_balance"]
+
+                    # Ensure proper shape
+                    if len(balance_features.shape) == 1:
+                        balance_features = balance_features.unsqueeze(0)
+
+                    # Process through balance network - weight increases with training
+                    balance_output = (
+                        self.balance_network(balance_features) * progress_weight
+                    )
+                    combined_features.append(balance_output)
+                except Exception as e:
+                    logger.error(f"Error processing action balance features: {e}")
+                    placeholder = torch.zeros(
+                        (batch_size, 8), device=image_tensor.device
                     )
                     combined_features.append(placeholder)
 
@@ -1257,7 +1795,7 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
             try:
                 final_combined = torch.cat(combined_features, dim=1)
             except Exception as e:
-                print(f"Error combining features: {e}")
+                logger.error(f"Error combining features: {e}")
                 # Fall back to just image features
                 final_combined = image_features
 
@@ -1265,7 +1803,7 @@ class ProjectileAwareCNN(BaseFeaturesExtractor):
             return self.linear(final_combined)
 
         except Exception as e:
-            print(f"Critical error in feature extraction: {e}")
+            logger.error(f"Critical error in feature extraction: {e}")
             # Return a zero tensor as fallback
             return torch.zeros((1, self.features_dim), device=self.device)
 
@@ -1307,22 +1845,25 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
 
     # Resume from existing model if requested
     if resume and os.path.exists(model_path):
-        print(f"Loading existing projectile-aware model from {model_path}")
+        logger.info(f"Loading existing projectile-aware model from {model_path}")
         try:
             model = PPO.load(model_path, env=env, policy=ProjectileAwarePolicy)
-            print("Model loaded successfully")
+            logger.info("Model loaded successfully")
             return model
         except Exception as e:
-            print(f"Error loading model: {e}")
-            print("Creating new model instead")
+            logger.error(f"Error loading model: {str(e)}")
+            logger.info("Creating new model instead")
 
     # Create new model with custom policy
-    print("Creating new projectile-aware model")
+    logger.info("Creating new projectile-aware model")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
 
     # Enhanced parameters for better learning
     try:
+        # Create model directory if it doesn't exist
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
         model = PPO(
             policy=ProjectileAwarePolicy,
             env=env,
@@ -1333,7 +1874,7 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.01,  # Encourage exploration
+            ent_coef=0.05,  # INCREASED from 0.01 to 0.05 to encourage exploration
             vf_coef=0.5,
             max_grad_norm=0.5,
             tensorboard_log="./logs/tensorboard/",
@@ -1346,7 +1887,7 @@ def create_enhanced_kungfu_model(env, resume=False, model_path=None):
             ),
         )
     except TypeError as e:
-        print(f"Error with initial PPO parameters: {e}")
+        logger.error(f"Error with initial PPO parameters: {e}")
         # Try with fewer parameters as a fallback
         model = PPO(
             policy=ProjectileAwarePolicy,
@@ -1363,65 +1904,79 @@ def make_enhanced_kungfu_env(
     is_play_mode=False, frame_stack=4, use_projectile_features=True
 ):
     """Create a Kung Fu Master environment with enhanced projectile detection for Stable Retro"""
+    # Get environment manager instance for tracking
+    env_manager = RetroEnvManager.get_instance()
+
+    # Environment creation attempts limiter
+    max_attempts = 3
 
     # Create base environment
     env = None
-    try:
-        import retro
-
-        print("Using Stable Retro library")
-
-        # First ensure we have the render mode set correctly
-        render_mode = "human" if is_play_mode else None
-        print(
-            f"Attempting to create Stable Retro environment with render_mode={render_mode}"
-        )
-
-        # Try with full error handling
+    for attempt in range(max_attempts):
         try:
-            # Try with explicit render mode first
+            import retro
+
+            # Force garbage collection before creating new environment
+            gc.collect()
+
+            logger.info(
+                f"Attempt {attempt+1}/{max_attempts}: Creating Stable Retro environment"
+            )
+
+            # First ensure we have the render mode set correctly
+            render_mode = "human" if is_play_mode else None
+            logger.info(
+                f"Attempting to create Stable Retro environment with render_mode={render_mode}"
+            )
+
+            # Create the environment
             if render_mode:
-                env = retro.make(game="KungFu-Nes", render_mode=render_mode)
+                env = retro.make(
+                    game="KungFu-Nes",
+                    render_mode=render_mode,
+                    inttype=retro.data.Integrations.STABLE,
+                )
             else:
                 # Try without render mode if not in play mode
-                env = retro.make(game="KungFu-Nes")
-            print("Successfully created KungFu-Nes environment")
-        except Exception as e1:
-            print(f"Failed to create KungFu-Nes environment: {e1}")
-            try:
-                # Try alternate game name
-                if render_mode:
-                    env = retro.make(game="KungFuMaster-Nes", render_mode=render_mode)
-                else:
-                    env = retro.make(game="KungFuMaster-Nes")
-                print("Successfully created KungFuMaster-Nes environment")
-            except Exception as e2:
-                print(f"Failed to create KungFuMaster-Nes environment: {e2}")
+                env = retro.make(
+                    game="KungFu-Nes", inttype=retro.data.Integrations.STABLE
+                )
 
-                # Last resort - try with minimal parameters
+            # If we reach here, environment creation was successful
+            logger.info("Successfully created KungFu-Nes environment")
+
+            # Make sure we register the environment for cleanup
+            env_manager.register_env(env)
+
+            # Explicitly reset the environment once before wrapping to test it
+            logger.info("Performing initial reset of base environment")
+            env.reset()
+            logger.info("Initial reset successful")
+
+            # Break out of the loop since we created the environment successfully
+            break
+
+        except Exception as e:
+            logger.error(f"Error creating environment (attempt {attempt+1}): {e}")
+
+            # Try to clean up
+            if env is not None:
                 try:
-                    # No render mode specified
-                    env = retro.make("KungFu-Nes")
-                    if is_play_mode and hasattr(env, "render"):
-                        print("Using manual rendering mode")
-                        env.render()
-                    print("Created environment with basic parameters")
-                except Exception as e3:
-                    print(f"All environment creation attempts failed: {e1}, {e2}, {e3}")
-                    raise RuntimeError("Could not initialize Stable Retro environment")
+                    env.close()
+                except:
+                    pass
+                env = None
 
-        # Explicitly reset the environment once before wrapping to test it
-        if env is not None:
-            print("Performing initial reset of base environment")
-            try:
-                env.reset()
-                print("Initial reset successful")
-            except Exception as e:
-                print(f"Warning: Initial reset failed but continuing: {e}")
+            # Force garbage collection
+            gc.collect()
 
-    except Exception as e:
-        print(f"Fatal error creating environment: {e}")
-        raise
+            # Wait before retry
+            time.sleep(1)
+
+            # If last attempt, raise the error
+            if attempt == max_attempts - 1:
+                logger.error("All environment creation attempts failed")
+                raise RuntimeError("Could not initialize Stable Retro environment")
 
     # Check if we have a valid environment
     if env is None:
@@ -1429,82 +1984,82 @@ def make_enhanced_kungfu_env(
 
     # Print environment info for debugging
     try:
-        print(f"Environment type: {type(env)}")
-        print(f"Observation space: {env.observation_space}")
-        print(f"Action space: {env.action_space}")
+        logger.info(f"Environment type: {type(env)}")
+        logger.info(f"Observation space: {env.observation_space}")
+        logger.info(f"Action space: {env.action_space}")
     except Exception as e:
-        print(f"Warning: Could not print environment info: {e}")
+        logger.warning(f"Could not print environment info: {e}")
 
     # Apply our enhanced wrapper with extra error handling
-    print("Applying EnhancedKungFuMasterEnv wrapper")
+    logger.info("Applying EnhancedKungFuMasterEnv wrapper")
     try:
         env = EnhancedKungFuMasterEnv(env)
     except Exception as e:
-        print(f"Error applying EnhancedKungFuMasterEnv: {e}")
+        logger.error(f"Error applying EnhancedKungFuMasterEnv: {e}")
         raise
 
     # Set up monitoring with our resilient monitor
     try:
         os.makedirs("logs", exist_ok=True)
         monitor_path = os.path.join("logs", "kungfu")
-        print(f"Setting up monitoring at {monitor_path}")
+        logger.info(f"Setting up monitoring at {monitor_path}")
         env = ResilientMonitor(env, monitor_path)
     except Exception as e:
-        print(f"Warning: Could not set up monitoring: {e}")
+        logger.warning(f"Could not set up monitoring: {e}")
 
     # Wrap in DummyVecEnv for compatibility with stable-baselines3
     try:
-        print("Wrapping with DummyVecEnv")
+        logger.info("Wrapping with DummyVecEnv")
         env = DummyVecEnv([lambda: env])
         # Test the wrapped environment
-        print("Testing DummyVecEnv wrapper")
+        logger.info("Testing DummyVecEnv wrapper")
         test_obs = env.reset()
-        print(
+        logger.info(
             f"DummyVecEnv reset successful, observation shape: {test_obs.shape if hasattr(test_obs, 'shape') else 'N/A'}"
         )
     except Exception as e:
-        print(f"Error wrapping with DummyVecEnv: {e}")
+        logger.error(f"Error wrapping with DummyVecEnv: {e}")
         raise
 
     # Apply frame stacking - we need more frames for better projectile detection
     try:
-        print(
+        logger.info(
             f"Using enhanced frame stacking with n_stack={frame_stack} for improved projectile detection"
         )
         env = VecFrameStack(env, n_stack=frame_stack)
 
         # Test the frame-stacked environment
-        print("Testing VecFrameStack wrapper")
+        logger.info("Testing VecFrameStack wrapper")
         test_obs = env.reset()
-        print(
+        logger.info(
             f"VecFrameStack reset successful, observation shape: {test_obs.shape if hasattr(test_obs, 'shape') else 'N/A'}"
         )
     except Exception as e:
-        print(f"Error applying frame stacking: {e}")
+        logger.error(f"Error applying frame stacking: {e}")
         raise
 
     # Always add projectile features wrapper
     if use_projectile_features:
         try:
-            print(
+            logger.info(
                 "Adding projectile feature wrapper for explicit projectile information"
             )
             env = wrap_projectile_aware(env, max_projectiles=5)
 
             # Test the projectile-aware environment
-            print("Testing ProjectileAwareWrapper")
+            logger.info("Testing ProjectileAwareWrapper")
             test_obs = env.reset()
             if isinstance(test_obs, dict):
-                print(
+                logger.info(
                     f"ProjectileAwareWrapper reset successful, observation keys: {test_obs.keys()}"
                 )
             else:
-                print(
+                logger.info(
                     f"ProjectileAwareWrapper reset returned unexpected type: {type(test_obs)}"
                 )
         except Exception as e:
-            print(f"Warning: Could not add projectile features wrapper: {e}")
-            print("Continuing without projectile features")
+            logger.warning(f"Could not add projectile features wrapper: {e}")
+            logger.info("Continuing without projectile features")
 
     return env
 
@@ -1518,15 +2073,15 @@ def wrap_projectile_aware(env, max_projectiles=5):
         base_env = env.envs[0]
 
         # Apply our wrapper to the unwrapped base environment
-        print(f"Wrapping base environment of type {type(base_env)}")
+        logger.info(f"Wrapping base environment of type {type(base_env)}")
         wrapped_env = ProjectileAwareWrapper(base_env, max_projectiles=max_projectiles)
 
         # Create a new VecEnv with our wrapped environment
-        print("Creating new DummyVecEnv with the ProjectileAwareWrapper")
+        logger.info("Creating new DummyVecEnv with the ProjectileAwareWrapper")
         new_env = DummyVecEnv([lambda: wrapped_env])
 
         return new_env
     else:
         # Apply wrapper directly
-        print(f"Directly wrapping environment of type {type(env)}")
+        logger.info(f"Directly wrapping environment of type {type(env)}")
         return ProjectileAwareWrapper(env, max_projectiles=max_projectiles)
