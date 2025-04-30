@@ -372,11 +372,9 @@ class TrainingCallback(BaseCallback):
                         ep_info.get("current_stage", 0) for ep_info in valid_episodes
                     ]
 
-                    mean_score = np.mean([sum(s) for s in scores]) if scores else 0
-                    mean_damage = np.mean([sum(d) for d in damages]) if damages else 0
-                    mean_progress = (
-                        np.mean([sum(p) for p in progress]) if progress else 0
-                    )
+                    mean_score = np.mean(scores) if scores else 0
+                    mean_damage = np.mean(damages) if damages else 0
+                    mean_progress = np.mean(progress) if progress else 0
                     max_stage = np.max(stages) if stages else 0
 
             logger.info(
