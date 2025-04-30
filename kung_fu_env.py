@@ -360,12 +360,13 @@ class DFPKungFuWrapper(gym.Wrapper):
     ):
         # basically, we need to extend the kung fu env
         super().__init__(env)
+        # frame stack, meature dim, prediction range, max predict
         self.frame_stack = frame_stack
         self.measurement_dims = measurement_dims
         self.prediction_horizons = prediction_horizons
         self.max_horizon = max(prediction_horizons)
 
-        # Image buffer for frame stacking
+        # frame stack
         self.image_buffer = deque(maxlen=frame_stack)
 
         # Get base image shape

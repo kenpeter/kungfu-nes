@@ -7,20 +7,7 @@ python eval_subprocess.py --episodes 10 --render
 
 
 
-python train.py --render --resume --timesteps 1000 --model-path model/kungfu_with_projectile_features_10000.zip
-
-
-
-python train.py --render --resume --timesteps 1000 --model-path model/kungfu_with_projectile_features_best_reward.zip
-
-
-
-python train.py --render --resume --timesteps 1000 --model-path model/kungfu_with_projectile_features_latest.zip
-
-
-
-python train.py --render --resume --timesteps 1000 --model-path model/kungfu_with_projectile_features.zip
-
+python eval.py --model model/kungfu_step_500000.zip --episodes 10 --render --analyze
 
 
 
