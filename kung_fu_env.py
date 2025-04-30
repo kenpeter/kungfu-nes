@@ -11,6 +11,9 @@ import gc
 import atexit
 from collections import deque
 import retro
+from gymnasium import spaces
+
+logger = logging.getLogger("kungfu_env")
 
 # Configure logging
 logging.basicConfig(
@@ -344,30 +347,33 @@ class KungFuMasterEnv(gym.Wrapper):
         RetroEnvManager.get_instance().unregister_env(self)
 
 
-# Environment wrapper for Direct Future Prediction (DFP)
 class DFPKungFuWrapper(gym.Wrapper):
+    """
+    Enhanced Direct Future Prediction wrapper for Kung Fu Master.
+    Designed to improve the agent's ability to predict and avoid projectiles.
+    """
+
     def __init__(
-        # self
         self,
-        # env
         env,
-        # 4 stack
         frame_stack=4,
-        # 3D: score, hp, progress
         measurement_dims=3,
-        # predict 1 step, 3 step, etc
         prediction_horizons=[1, 3, 5, 10, 20],
+        # Adding time_scale to better predict events at different time horizons
+        time_scale=[1, 3, 6, 10, 20],
     ):
-        # basically, we need to extend the kung fu env
         super().__init__(env)
-        # frame stack, meature dim, prediction range, max predict
         self.frame_stack = frame_stack
         self.measurement_dims = measurement_dims
         self.prediction_horizons = prediction_horizons
+        self.time_scale = time_scale
         self.max_horizon = max(prediction_horizons)
 
-        # frame stack
+        # Frame buffer
         self.image_buffer = deque(maxlen=frame_stack)
+
+        # Extended measurement buffer to store longer history
+        self.measurement_buffer = deque(maxlen=self.max_horizon + 30)
 
         # Get base image shape
         if isinstance(env.observation_space, gym.spaces.Box):
@@ -381,8 +387,10 @@ class DFPKungFuWrapper(gym.Wrapper):
             low=0, high=255, shape=stacked_shape, dtype=np.uint8
         )
 
-        # Goals
-        self.goals = np.array([1.0, -1.0, 1.0], dtype=np.float32)
+        # Modify goal vector to include projectile avoidance priority
+        # [score increase, damage avoidance, progress]
+        # Higher weight on damage avoidance helps avoid projectiles
+        self.goals = np.array([1.0, -1.5, 1.0], dtype=np.float32)
 
         # Observation space
         self.observation_space = spaces.Dict(
@@ -395,23 +403,55 @@ class DFPKungFuWrapper(gym.Wrapper):
                     dtype=np.float32,
                 ),
                 "goals": spaces.Box(
-                    low=-1.0, high=1.0, shape=(measurement_dims,), dtype=np.float32
+                    low=-2.0, high=2.0, shape=(measurement_dims,), dtype=np.float32
                 ),
             }
         )
 
-        self.measurement_buffer = []
-        RetroEnvManager.get_instance().register_env(self)
-        logger.info(f"DFPKungFuWrapper initialized with frame_stack={frame_stack}")
+        # Adaptive measurement normalization
+        self.score_max = 1000.0
+        self.damage_max = 100.0
+        self.progress_max = 100.0
+
+        # Recent metrics for adaptive weighting
+        self.recent_damages = deque(maxlen=20)  # Track recent damage events
+
+        logger.info(
+            f"Enhanced DFPKungFuWrapper initialized with frame_stack={frame_stack}"
+        )
 
     def _get_measurements(self, info):
+        # Standard measurement calculation
         measurements = np.zeros(self.measurement_dims, dtype=np.float32)
-        measurements[0] = min(info.get("score_increase", 0), 1000) / 1000.0
-        measurements[1] = min(info.get("damage_taken", 0), 100) / 100.0
-        measurements[2] = min(info.get("progress_made", 0), 100) / 100.0
+
+        # Get scores with normalization
+        score_increase = min(info.get("score_increase", 0), self.score_max)
+        measurements[0] = score_increase / self.score_max
+
+        # Get damage with adaptive normalization
+        damage_taken = min(info.get("damage_taken", 0), self.damage_max)
+        measurements[1] = damage_taken / self.damage_max
+
+        # Track damage for adaptive weighting
+        if damage_taken > 0:
+            self.recent_damages.append(damage_taken)
+
+        # Get progress with adaptive normalization
+        progress_made = min(info.get("progress_made", 0), self.progress_max)
+        measurements[2] = progress_made / self.progress_max
+
+        # Adapt to repeated damage patterns
+        if len(self.recent_damages) > 5 and np.mean(self.recent_damages) > 10:
+            # If taking a lot of damage recently, increase weight of damage avoidance
+            self.goals[1] = min(-2.0, self.goals[1] * 1.1)  # Increase up to -2.0
+        else:
+            # Gradually return to normal if not taking much damage
+            self.goals[1] = max(-1.5, self.goals[1] * 0.99)  # Return toward -1.5
+
         return measurements
 
     def _get_stacked_image(self):
+        # Fill buffer if not full
         while len(self.image_buffer) < self.frame_stack:
             self.image_buffer.append(
                 self.image_buffer[-1]
@@ -422,59 +462,97 @@ class DFPKungFuWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         obs_result = self.env.reset(**kwargs)
+
+        # Handle different reset return formats
         if isinstance(obs_result, tuple) and len(obs_result) == 2:
             obs, info = obs_result
         else:
             obs = obs_result
             info = {}
 
+        # Clear buffers
         self.image_buffer.clear()
         for _ in range(self.frame_stack):
             self.image_buffer.append(obs)
 
-        self.measurement_buffer = [
-            np.zeros(self.measurement_dims, dtype=np.float32)
-            for _ in range(self.max_horizon + 1)
-        ]
+        # Reset measurement buffer with zeros
+        self.measurement_buffer.clear()
+        for _ in range(self.max_horizon + 1):
+            self.measurement_buffer.append(
+                np.zeros(self.measurement_dims, dtype=np.float32)
+            )
+
+        # Reset adaptive values
+        self.recent_damages.clear()
+        # Initial goal weights - slightly higher emphasis on damage avoidance
+        self.goals = np.array([1.0, -1.5, 1.0], dtype=np.float32)
+
+        # Get initial measurements
         measurements = self._get_measurements(info)
+
+        # Create observation
         dfp_obs = {
             "image": self._get_stacked_image(),
             "measurements": measurements,
             "goals": self.goals,
         }
 
-        return dfp_obs, info if isinstance(obs_result, tuple) else dfp_obs
+        if isinstance(obs_result, tuple) and len(obs_result) == 2:
+            return dfp_obs, info
+        else:
+            return dfp_obs
 
     def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
+        # Handle older gym interface (4 return values) or newer (5 return values)
+        step_result = self.env.step(action)
+
+        if len(step_result) == 5:
+            obs, reward, terminated, truncated, info = step_result
+        elif len(step_result) == 4:
+            obs, reward, done, info = step_result
+            terminated, truncated = done, False
+        else:
+            raise ValueError(
+                f"Unexpected step result format with {len(step_result)} values"
+            )
+
+        # Add current observation to image buffer
         self.image_buffer.append(obs)
         stacked_image = self._get_stacked_image()
 
+        # Calculate measurements and add to buffer
         measurements = self._get_measurements(info)
         self.measurement_buffer.append(measurements)
-        if len(self.measurement_buffer) > self.max_horizon + 1:
-            self.measurement_buffer.pop(0)
 
+        # Create observation dict
         dfp_obs = {
             "image": stacked_image,
             "measurements": measurements,
-            "goals": self.goals,
+            "goals": self.goals,  # Using adaptive goals
         }
 
-        if len(self.measurement_buffer) > 1:
+        # Prepare future measurements for training with different temporal scales
+        if len(self.measurement_buffer) > max(self.time_scale):
             future_measurements = {}
             for i, horizon in enumerate(self.prediction_horizons):
-                if horizon < len(self.measurement_buffer):
-                    future_measurements[f"future_{horizon}"] = self.measurement_buffer[
-                        -horizon
-                    ]
+                # Use time_scale for more diverse temporal predictions
+                time_idx = min(self.time_scale[i], len(self.measurement_buffer) - 1)
+                future_measurements[f"future_{horizon}"] = self.measurement_buffer[
+                    -time_idx
+                ]
             info["future_measurements"] = future_measurements
 
-        return dfp_obs, reward, terminated, truncated, info
+        # Return proper format based on input
+        if len(step_result) == 5:
+            return dfp_obs, reward, terminated, truncated, info
+        else:
+            done = terminated or truncated
+            return dfp_obs, reward, done, info
 
-    def close(self):
-        super().close()
-        RetroEnvManager.get_instance().unregister_env(self)
+    # Add methods to help with understanding game dynamics during training
+    def get_goals(self):
+        """Return the current goal weights (helpful for monitoring)"""
+        return self.goals.copy()
 
 
 def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):

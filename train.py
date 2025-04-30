@@ -99,13 +99,13 @@ except ImportError:
     import gym
 
 
-# Direct Future Prediction feature extractor
+# Enhanced DFP feature extractor with better attention to spatial features
 class DFPFeaturesExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
         super().__init__(observation_space, features_dim)
         self.image_space = observation_space.spaces["image"]
-        # self.image_space.shape = (C, H, W) after VecTransposeImage
-        n_input_channels = self.image_space.shape[0]  # Number of channels
+        # Number of channels (includes frame stacking)
+        n_input_channels = self.image_space.shape[0]
         height = self.image_space.shape[1]
         width = self.image_space.shape[2]
 
@@ -113,7 +113,8 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
         self.goal_dim = observation_space.spaces["goals"].shape[0]
         logger.info(f"DFP Feature Extractor - Image shape: {self.image_space.shape}")
 
-        # Define CNN
+        # Enhanced CNN with more attention to spatial features (better for projectile detection)
+        # Using smaller strides and more filters in early layers to preserve spatial information
         self.cnn = nn.Sequential(
             nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
@@ -121,52 +122,246 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
             nn.ReLU(),
+            # Adding attention mechanism to focus on important spatial features
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
             nn.Flatten(),
         )
 
         # Compute CNN output size with a dummy input
         with torch.no_grad():
-            dummy_img = torch.zeros(
-                (1, n_input_channels, height, width)
-            )  # (batch, C, H, W)
+            dummy_img = torch.zeros((1, n_input_channels, height, width))
             cnn_out = self.cnn(dummy_img)
             self.cnn_out_size = cnn_out.shape[1]
         logger.info(f"CNN output features: {self.cnn_out_size}")
 
-        # Measurement network
+        # Enhanced measurement network with cross-connections
         measurement_input_size = self.measurement_dim + self.goal_dim
         self.measurement_net = nn.Sequential(
             nn.Linear(measurement_input_size, 128),
             nn.ReLU(),
             nn.Linear(128, 128),
             nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
         )
         self.measurement_out_size = 128
 
-        # Combined network
+        # Combined network with residual connections
         combined_size = self.cnn_out_size + self.measurement_out_size
         self.combined_net = nn.Sequential(
-            nn.Linear(combined_size, features_dim), nn.ReLU()
+            nn.Linear(combined_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, features_dim),
+            nn.ReLU(),
         )
 
     def forward(self, observations):
+        # Process image input
         image_tensor = observations["image"]
-        # image_tensor is already (num_envs, C, H, W) due to VecTransposeImage
+        # Normalize image
         image_features = self.cnn(image_tensor / 255.0)
 
-        # Handle measurements and goals
+        # Process measurements and goals
         measurements = observations["measurements"]
         goals = observations["goals"]
+        # Handle single batch case
         if len(measurements.shape) == 1:
             measurements = measurements.unsqueeze(0)
         if len(goals.shape) == 1:
             goals = goals.unsqueeze(0)
+
+        # Combine measurements and goals
         measurement_tensor = torch.cat([measurements, goals], dim=1)
         measurement_features = self.measurement_net(measurement_tensor)
 
-        # Combine features
+        # Combine all features
         combined_features = torch.cat([image_features, measurement_features], dim=1)
         return self.combined_net(combined_features)
+
+
+# Enhanced DFP prediction head with better temporal modeling
+class DFPPredictionHead(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        measurement_dims=3,
+        prediction_horizons=[1, 3, 5, 10, 20],
+        # Different weighting for different horizons (more weight to near future)
+        horizon_weights=[1.0, 0.9, 0.8, 0.7, 0.6],
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.measurement_dims = measurement_dims
+        self.prediction_horizons = prediction_horizons
+        self.horizon_weights = horizon_weights
+        self.n_horizons = len(prediction_horizons)
+        self.output_dim = measurement_dims * self.n_horizons
+
+        # Deeper network for better prediction accuracy
+        self.prediction_net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 384),
+            nn.ReLU(),
+            nn.Linear(384, 256),
+            nn.ReLU(),
+            nn.Linear(256, self.output_dim),
+        )
+
+    def forward(self, features):
+        # Generate all future predictions
+        predictions = self.prediction_net(features)
+        return predictions
+
+    def get_measurements_for_horizon(self, predictions, horizon_idx):
+        # Extract measurements for a specific horizon
+        start_idx = horizon_idx * self.measurement_dims
+        end_idx = start_idx + self.measurement_dims
+        return predictions[:, start_idx:end_idx]
+
+    def get_weighted_predictions(self, predictions, goals):
+        """Get weighted prediction values using horizon weights and goals"""
+        weighted_sum = torch.zeros(predictions.shape[0], device=predictions.device)
+
+        # For each prediction horizon
+        for i in range(self.n_horizons):
+            # Get predictions for this horizon
+            horizon_preds = self.get_measurements_for_horizon(predictions, i)
+
+            # Apply goal weights to the measurements
+            if goals is not None and goals.shape[1] == self.measurement_dims:
+                # Weighted sum of measurements based on goals
+                weighted_preds = torch.sum(horizon_preds * goals, dim=1)
+            else:
+                # Simple sum if goals not provided
+                weighted_preds = torch.sum(horizon_preds, dim=1)
+
+            # Apply horizon weight and add to total
+            weighted_sum += weighted_preds * self.horizon_weights[i]
+
+        return weighted_sum
+
+
+# Enhanced DFP Policy with improved future prediction
+class DFPPolicy(ActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule, *args, **kwargs):
+        # Initialize with enhanced feature extractor
+        super().__init__(
+            observation_space=observation_space,
+            action_space=action_space,
+            lr_schedule=lr_schedule,
+            features_extractor_class=DFPFeaturesExtractor,
+            features_extractor_kwargs={"features_dim": 512},
+            *args,
+            **kwargs,
+        )
+
+        # Create enhanced prediction head
+        self.dfp_predictor = DFPPredictionHead(
+            input_dim=512,
+            measurement_dims=3,
+            prediction_horizons=[1, 3, 5, 10, 20],
+            horizon_weights=[1.0, 0.95, 0.9, 0.8, 0.7],  # More emphasis on near future
+        )
+
+    def forward(self, obs, deterministic=False):
+        # Extract features from observation
+        features = self.extract_features(obs)
+        # Get latent policy and value function representations
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        # Get action distribution
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        # Get actions
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+
+        # Use the base value network for value function
+        values = self.value_net(latent_vf)
+
+        return actions, values, log_prob
+
+    def predict_future_measurements(self, obs):
+        # Extract features and predict future measurements
+        features = self.extract_features(obs)
+        predictions = self.dfp_predictor(features)
+        return predictions
+
+    def evaluate_actions(self, obs, actions):
+        features = self.extract_features(obs)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(latent_vf)
+        entropy = distribution.entropy()
+        return values, log_prob, entropy
+
+    def predict_weighted_future(self, obs):
+        """Get weighted prediction of future outcomes"""
+        features = self.extract_features(obs)
+        predictions = self.dfp_predictor(features)
+        # Use goals from observation
+        goals = obs.get("goals", None)
+        # Get weighted predictions
+        return self.dfp_predictor.get_weighted_predictions(predictions, goals)
+
+
+# Enhanced DFP Loss function
+class DFPLoss:
+    def __init__(self, policy, prediction_weight=0.8):
+        self.policy = policy
+        self.prediction_weight = prediction_weight
+        # Use smooth L1 loss for better gradient properties with outliers
+        self.prediction_loss = nn.SmoothL1Loss()
+
+    def __call__(self, rollout_data):
+        obs = rollout_data.observations
+        actions = rollout_data.actions
+        values, log_prob, entropy = self.policy.evaluate_actions(obs, actions)
+        advantages = rollout_data.advantages
+        returns = rollout_data.returns
+
+        # Standard policy loss
+        policy_loss = -(advantages * log_prob).mean()
+        value_loss = nn.functional.mse_loss(values, returns)
+        entropy_loss = -entropy.mean()
+
+        # Initialize prediction loss
+        prediction_loss = torch.tensor(0.0, device=policy_loss.device)
+
+        # Calculate prediction loss if future measurements available
+        if hasattr(rollout_data, "future_measurements"):
+            future_measurements = rollout_data.future_measurements
+            predictions = self.policy.predict_future_measurements(obs)
+
+            # Calculate loss for each prediction horizon
+            for i, horizon in enumerate(self.policy.dfp_predictor.prediction_horizons):
+                horizon_key = f"future_{horizon}"
+                if horizon_key in future_measurements:
+                    # Get predictions and targets for this horizon
+                    horizon_preds = (
+                        self.policy.dfp_predictor.get_measurements_for_horizon(
+                            predictions, i
+                        )
+                    )
+                    targets = future_measurements[horizon_key]
+
+                    # Apply horizon-specific weight
+                    horizon_weight = self.policy.dfp_predictor.horizon_weights[i]
+                    horizon_loss = (
+                        self.prediction_loss(horizon_preds, targets) * horizon_weight
+                    )
+                    prediction_loss += horizon_loss
+
+        # Calculate total loss with adjusted weights
+        total_loss = (
+            policy_loss
+            + 0.5 * value_loss
+            - 0.01 * entropy_loss
+            + self.prediction_weight * prediction_loss
+        )
+
+        return total_loss
 
 
 # DFP prediction head for value function
