@@ -104,14 +104,16 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
         super().__init__(observation_space, features_dim)
         self.image_space = observation_space.spaces["image"]
-        n_input_channels = self.image_space.shape[
-            2
-        ]  # e.g., 12 for 4 frames * 3 channels
+        # self.image_space.shape = (C, H, W) after VecTransposeImage
+        n_input_channels = self.image_space.shape[0]  # Number of channels
+        height = self.image_space.shape[1]
+        width = self.image_space.shape[2]
 
         self.measurement_dim = observation_space.spaces["measurements"].shape[0]
         self.goal_dim = observation_space.spaces["goals"].shape[0]
         logger.info(f"DFP Feature Extractor - Image shape: {self.image_space.shape}")
 
+        # Define CNN
         self.cnn = nn.Sequential(
             nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
@@ -122,19 +124,16 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
             nn.Flatten(),
         )
 
+        # Compute CNN output size with a dummy input
         with torch.no_grad():
             dummy_img = torch.zeros(
-                (
-                    1,
-                    n_input_channels,
-                    self.image_space.shape[0],
-                    self.image_space.shape[1],
-                )
-            )
+                (1, n_input_channels, height, width)
+            )  # (batch, C, H, W)
             cnn_out = self.cnn(dummy_img)
             self.cnn_out_size = cnn_out.shape[1]
         logger.info(f"CNN output features: {self.cnn_out_size}")
 
+        # Measurement network
         measurement_input_size = self.measurement_dim + self.goal_dim
         self.measurement_net = nn.Sequential(
             nn.Linear(measurement_input_size, 128),
@@ -144,6 +143,7 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
         )
         self.measurement_out_size = 128
 
+        # Combined network
         combined_size = self.cnn_out_size + self.measurement_out_size
         self.combined_net = nn.Sequential(
             nn.Linear(combined_size, features_dim), nn.ReLU()
@@ -151,25 +151,20 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations):
         image_tensor = observations["image"]
-        if len(image_tensor.shape) == 3:
-            image_tensor = image_tensor.unsqueeze(0)
-        image_tensor = image_tensor.permute(
-            0, 3, 1, 2
-        )  # (batch, H, W, C) to (batch, C, H, W)
+        # image_tensor is already (num_envs, C, H, W) due to VecTransposeImage
         image_features = self.cnn(image_tensor / 255.0)
 
-        measurement_input = []
-        if len(observations["measurements"].shape) == 1:
-            measurement_input.append(observations["measurements"].unsqueeze(0))
-        else:
-            measurement_input.append(observations["measurements"])
-        if len(observations["goals"].shape) == 1:
-            measurement_input.append(observations["goals"].unsqueeze(0))
-        else:
-            measurement_input.append(observations["goals"])
-        measurement_tensor = torch.cat(measurement_input, dim=1)
+        # Handle measurements and goals
+        measurements = observations["measurements"]
+        goals = observations["goals"]
+        if len(measurements.shape) == 1:
+            measurements = measurements.unsqueeze(0)
+        if len(goals.shape) == 1:
+            goals = goals.unsqueeze(0)
+        measurement_tensor = torch.cat([measurements, goals], dim=1)
         measurement_features = self.measurement_net(measurement_tensor)
 
+        # Combine features
         combined_features = torch.cat([image_features, measurement_features], dim=1)
         return self.combined_net(combined_features)
 
@@ -206,19 +201,17 @@ class DFPPredictionHead(nn.Module):
 # Custom DFP policy for PPO
 class DFPPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, *args, **kwargs):
-        self.features_extractor_class = DFPFeaturesExtractor
-        self.features_extractor_kwargs = {"features_dim": 512}
-        super().__init__(observation_space, action_space, lr_schedule, *args, **kwargs)
+        super().__init__(
+            observation_space=observation_space,
+            action_space=action_space,
+            lr_schedule=lr_schedule,
+            features_extractor_class=DFPFeaturesExtractor,
+            features_extractor_kwargs={"features_dim": 512},
+            *args,
+            **kwargs,
+        )
         self.dfp_predictor = DFPPredictionHead(
             input_dim=512, measurement_dims=3, prediction_horizons=[1, 3, 5, 10, 20]
-        )
-
-    def _build_mlp_extractor(self):
-        super()._build_mlp_extractor()
-        self.dfp_predictor = DFPPredictionHead(
-            input_dim=self.features_dim,
-            measurement_dims=3,
-            prediction_horizons=[1, 3, 5, 10, 20],
         )
 
     def forward(self, obs, deterministic=False):
@@ -319,7 +312,7 @@ def create_dfp_model(env, resume=False, model_path=MODEL_PATH):
         verbose=1,
         device=device,
         policy_kwargs=dict(
-            net_arch=[dict(pi=[256, 256], vf=[256, 256])],
+            net_arch=dict(pi=[256, 256], vf=[256, 256]),  # Updated to avoid warning
             optimizer_class=torch.optim.Adam,
             optimizer_kwargs=dict(eps=1e-5),
         ),
@@ -492,10 +485,11 @@ def train_model(model, timesteps):
 
 
 def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
+    logger.info(f"Evaluating model from {model_path}")
+    env = make_kungfu_env(is_play_mode=render, frame_stack=4, use_dfp=True)
+    active_environments.add(env)
     try:
-        logger.info(f"Evaluating model from {model_path}")
-        env = make_kungfu_env(is_play_mode=render, frame_stack=4, use_dfp=True)
-        active_environments.add(env)
+        logger.info(f"Loading model from {model_path}")
         model = PPO.load(model_path, env=env, policy=DFPPolicy)
         episode_rewards = []
         episode_scores = []
@@ -504,7 +498,7 @@ def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
         max_stage_reached = 0
 
         for episode in range(num_episodes):
-            obs = env.reset()
+            obs, info = env.reset()
             done = False
             episode_reward = 0
             episode_score = 0
@@ -547,9 +541,6 @@ def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
         logger.info(f"Average progress: {avg_progress:.1f}")
         logger.info(f"Max stage reached: {max_stage_reached}")
 
-        env.close()
-        active_environments.discard(env)
-
         return {
             "avg_reward": avg_reward,
             "avg_score": avg_score,
@@ -561,6 +552,10 @@ def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
         logger.error(f"Error during evaluation: {e}")
         logger.error(traceback.format_exc())
         return None
+    finally:
+        logger.info("Closing evaluation environment")
+        env.close()
+        active_environments.discard(env)
 
 
 def main():
@@ -603,13 +598,13 @@ def main():
         logger.info("Creating DFP model...")
         model = create_dfp_model(env, resume=args.resume, model_path=MODEL_PATH)
         train_model(model, args.timesteps)
+        logger.info("Closing training environment")
+        env.close()
+        active_environments.discard(env)
         if args.plot_metrics:
             plot_training_metrics()
         logger.info("Evaluating trained model...")
         evaluate_model(MODEL_PATH, num_episodes=5, render=True)
-        logger.info("Closing training environment")
-        env.close()
-        active_environments.discard(env)
         logger.info("Training completed")
     except Exception as e:
         logger.error(f"Unhandled exception in main: {e}")

@@ -515,6 +515,15 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
     logger.info("Applying KungFuMasterEnv wrapper")
     env = KungFuMasterEnv(env)
 
+    if use_dfp:
+        logger.info("Adding Direct Future Prediction wrapper with frame stacking")
+        env = DFPKungFuWrapper(
+            env,
+            frame_stack=frame_stack,
+            measurement_dims=3,
+            prediction_horizons=[1, 3, 5, 10, 20],
+        )
+
     try:
         os.makedirs("logs", exist_ok=True)
         monitor_path = os.path.join("logs", "kungfu")
@@ -526,15 +535,5 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
     logger.info("Wrapping with DummyVecEnv")
     env = DummyVecEnv([lambda: env])
 
-    if use_dfp:
-        logger.info("Adding Direct Future Prediction wrapper with frame stacking")
-        base_env = env.envs[0].env
-        dfp_env = DFPKungFuWrapper(
-            base_env,
-            frame_stack=frame_stack,
-            measurement_dims=3,
-            prediction_horizons=[1, 3, 5, 10, 20],
-        )
-        env.envs[0].env = dfp_env
-
+    logger.info(f"Final observation space: {env.observation_space}")
     return env
