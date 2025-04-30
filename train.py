@@ -99,10 +99,13 @@ except ImportError:
     import gym
 
 
-# Enhanced DFP feature extractor with better attention to spatial features
+# so the dfp is is with space attention
 class DFPFeaturesExtractor(BaseFeaturesExtractor):
+    # init with obs and feature dim (512)
     def __init__(self, observation_space, features_dim=512):
+        # obs, feature dim
         super().__init__(observation_space, features_dim)
+        # obs -> image -> (channel, height, width)
         self.image_space = observation_space.spaces["image"]
         # Number of channels (includes frame stacking)
         n_input_channels = self.image_space.shape[0]

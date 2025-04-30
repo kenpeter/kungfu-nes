@@ -613,7 +613,17 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
         os.makedirs("logs", exist_ok=True)
         monitor_path = os.path.join("logs", "kungfu")
         logger.info(f"Setting up monitoring at {monitor_path}")
-        env = Monitor(env, monitor_path)
+        # Add info_keywords to include your custom metrics
+        env = Monitor(
+            env,
+            monitor_path,
+            info_keywords=(
+                "score_increase",
+                "damage_taken",
+                "progress_made",
+                "current_stage",
+            ),
+        )
     except Exception as e:
         logger.warning(f"Could not set up monitoring: {e}")
 
