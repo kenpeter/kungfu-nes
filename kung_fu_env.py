@@ -347,12 +347,18 @@ class KungFuMasterEnv(gym.Wrapper):
 # Environment wrapper for Direct Future Prediction (DFP)
 class DFPKungFuWrapper(gym.Wrapper):
     def __init__(
+        # self
         self,
+        # env
         env,
+        # 4 stack
         frame_stack=4,
+        # 3D: score, hp, progress
         measurement_dims=3,
+        # predict 1 step, 3 step, etc
         prediction_horizons=[1, 3, 5, 10, 20],
     ):
+        # basically, we need to extend the kung fu env
         super().__init__(env)
         self.frame_stack = frame_stack
         self.measurement_dims = measurement_dims

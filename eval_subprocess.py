@@ -7,25 +7,25 @@ import gc
 import traceback
 import sys
 
-# Configure logging
+# Configure logging to both console and file for persistent records
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("kungfu_eval.log", mode="a"),
+    ],
 )
 logger = logging.getLogger("kungfu_eval")
 
 # Import custom environment
 try:
-    from kung_fu_env import (
-        make_kungfu_env,
-        MODEL_PATH,
-        RetroEnvManager,
-    )
+    from kung_fu_env import make_kungfu_env, MODEL_PATH, RetroEnvManager
 except ImportError as e:
     logger.error(f"Failed to import kung_fu_env: {e}")
     raise
 
-# Import other needed modules
+# Import training modules
 try:
     from stable_baselines3 import PPO
     from train import DFPPolicy
@@ -35,7 +35,7 @@ except ImportError as e:
 
 
 def cleanup_env(env):
-    """Clean up a single environment"""
+    """Clean up the environment and release resources."""
     if env is not None:
         try:
             env.close()
@@ -43,119 +43,175 @@ def cleanup_env(env):
         except Exception as e:
             logger.error(f"Error closing environment: {e}")
 
-    # Force garbage collection
+    # Force garbage collection to prevent memory leaks
     gc.collect()
 
     # Final cleanup with environment manager
     try:
         RetroEnvManager.get_instance().cleanup_all_envs()
-    except:
-        pass
+        logger.info("RetroEnvManager cleanup completed")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup RetroEnvManager: {e}")
 
 
-def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True, analyze=False):
-    """Evaluate the trained model"""
+def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=False, analyze=False):
+    """
+    Evaluate the trained DFP model and identify potential issues.
+
+    Args:
+        model_path (str): Path to the trained model file.
+        num_episodes (int): Number of episodes to run.
+        render (bool): Whether to render the environment.
+        analyze (bool): Whether to perform detailed analysis.
+
+    Returns:
+        bool: True if evaluation completed successfully, False otherwise.
+    """
     env = None
 
     try:
-        # Create environment for evaluation
-        logger.info("Creating environment for evaluation")
+        # Create environment
+        logger.info("Creating evaluation environment")
         env = make_kungfu_env(is_play_mode=render, frame_stack=4, use_dfp=True)
+        logger.info(f"Environment observation space: {env.observation_space}")
 
         # Load model
         logger.info(f"Loading model from {model_path}")
         model = PPO.load(model_path, env=env, policy=DFPPolicy)
         logger.info("Model loaded successfully")
+        logger.info(f"Model policy observation space: {model.policy.observation_space}")
+
+        # Verify observation space compatibility
+        if model.policy.observation_space != env.observation_space:
+            logger.warning(
+                "Observation space mismatch between model and environment. This may cause prediction errors."
+            )
 
         # Initialize metrics
-        episode_rewards = []
-        episode_scores = []
-        episode_damages = []
-        episode_progress = []
-        max_stages = []
-        episode_durations = []
+        metrics = {
+            "rewards": [],
+            "scores": [],
+            "damages": [],
+            "progress": [],
+            "max_stages": [],
+            "durations": [],
+            "steps": [],
+            "actions": [],  # Track actions for analysis
+        }
 
         # Run evaluation episodes
         for episode in range(num_episodes):
             start_time = time.time()
             logger.info(f"Starting episode {episode+1}/{num_episodes}")
 
+            # Handle vectorized environment reset
             obs = env.reset()
+            if isinstance(obs, list) or isinstance(obs, np.ndarray):
+                obs = obs[0]  # Extract single observation if vectorized
             done = False
-            episode_reward = 0
-            episode_score = 0
-            episode_damage = 0
-            episode_prog = 0
-            current_stage = 0
-            step_count = 0
+            episode_metrics = {
+                "reward": 0,
+                "score": 0,
+                "damage": 0,
+                "progress": 0,
+                "max_stage": 0,
+                "steps": 0,
+                "actions": [],
+            }
 
             try:
-                # Run episode
                 while not done:
-                    # Get action
+                    # Predict action
                     action, _ = model.predict(obs, deterministic=True)
+                    episode_metrics["actions"].append(action)
 
-                    # Take step
-                    obs, reward, terminated, truncated, info = env.step(action)
+                    # Take step in environment
+                    step_result = env.step(action)
+                    obs, reward, terminated, truncated, info = step_result
                     done = terminated or truncated
-                    step_count += 1
+                    episode_metrics["steps"] += 1
 
-                    # Accumulate metrics
-                    episode_reward += reward
-
-                    # If info is a list, get the first element
-                    if isinstance(info, list) and len(info) > 0:
+                    # Handle vectorized outputs
+                    if isinstance(obs, list) or isinstance(obs, np.ndarray):
+                        obs = obs[0]
+                    if isinstance(reward, list) or isinstance(reward, np.ndarray):
+                        reward = reward[0]
+                    if isinstance(info, list):
                         info = info[0]
 
-                    # Extract measurements
-                    if isinstance(info, dict):
-                        episode_score += info.get("score_increase", 0)
-                        episode_damage += info.get("damage_taken", 0)
-                        episode_prog += info.get("progress_made", 0)
-                        current_stage = max(current_stage, info.get("current_stage", 0))
+                    # Validate info format
+                    if not isinstance(info, dict):
+                        logger.warning(
+                            f"Episode {episode+1}: info is not a dict: {info}"
+                        )
+                        info = {}
+
+                    # Accumulate metrics
+                    episode_metrics["reward"] += float(reward)
+                    episode_metrics["score"] += info.get("score_increase", 0)
+                    episode_metrics["damage"] += info.get("damage_taken", 0)
+                    episode_metrics["progress"] += info.get("progress_made", 0)
+                    episode_metrics["max_stage"] = max(
+                        episode_metrics["max_stage"], info.get("current_stage", 0)
+                    )
+
+                    if render:
+                        env.render()
 
                 # Record episode results
                 duration = time.time() - start_time
-                episode_rewards.append(episode_reward)
-                episode_scores.append(episode_score)
-                episode_damages.append(episode_damage)
-                episode_progress.append(episode_prog)
-                max_stages.append(current_stage)
-                episode_durations.append(duration)
+                for key in episode_metrics:
+                    if (
+                        key != "max_stage" or episode_metrics[key] > 0
+                    ):  # Only append non-zero max stages
+                        metrics[key + "s"].append(episode_metrics[key])
+                metrics["durations"].append(duration)
 
                 logger.info(f"Episode {episode+1} completed")
-                logger.info(f"  Reward: {episode_reward:.2f}")
-                logger.info(f"  Score: {episode_score:.1f}")
-                logger.info(f"  Damage: {episode_damage:.1f}")
-                logger.info(f"  Progress: {episode_prog:.1f}")
-                logger.info(f"  Stage: {current_stage}")
-                logger.info(f"  Steps: {step_count}")
+                logger.info(f"  Reward: {episode_metrics['reward']:.2f}")
+                logger.info(f"  Score: {episode_metrics['score']:.1f}")
+                logger.info(f"  Damage: {episode_metrics['damage']:.1f}")
+                logger.info(f"  Progress: {episode_metrics['progress']:.1f}")
+                logger.info(f"  Max Stage: {episode_metrics['max_stage']}")
+                logger.info(f"  Steps: {episode_metrics['steps']}")
                 logger.info(f"  Duration: {duration:.2f}s")
 
             except Exception as e:
                 logger.error(f"Error during episode {episode+1}: {e}")
                 logger.error(traceback.format_exc())
-                # Try to continue with next episode
                 continue
 
-        # Calculate averages
-        if episode_rewards:
-            avg_reward = np.mean(episode_rewards)
-            avg_score = np.mean(episode_scores)
-            avg_damage = np.mean(episode_damages)
-            avg_progress = np.mean(episode_progress)
-            avg_stage = np.mean(max_stages)
-            max_stage = np.max(max_stages)
+        # Calculate and log averages
+        if metrics["rewards"]:
+            averages = {
+                key: np.mean(values) for key, values in metrics.items() if values
+            }
+            logger.info("\nEvaluation Results:")
+            logger.info(f"  Average Reward: {averages.get('rewards', 0):.2f}")
+            logger.info(f"  Average Score: {averages.get('scores', 0):.1f}")
+            logger.info(f"  Average Damage: {averages.get('damages', 0):.1f}")
+            logger.info(f"  Average Progress: {averages.get('progress', 0):.1f}")
+            logger.info(f"  Average Max Stage: {averages.get('max_stages', 0):.1f}")
+            logger.info(
+                f"  Max Stage Reached: {np.max(metrics['max_stages']) if metrics['max_stages'] else 0}"
+            )
+            logger.info(f"  Average Steps: {averages.get('steps', 0):.1f}")
+            logger.info(f"  Average Duration: {averages.get('durations', 0):.2f}s")
 
-            logger.info("\nEvaluation results:")
-            logger.info(f"  Average reward: {avg_reward:.2f}")
-            logger.info(f"  Average score: {avg_score:.1f}")
-            logger.info(f"  Average damage: {avg_damage:.1f}")
-            logger.info(f"  Average progress: {avg_progress:.1f}")
-            logger.info(f"  Average stage: {avg_stage:.1f}")
-            logger.info(f"  Max stage reached: {max_stage}")
+            # Detailed analysis if requested
+            if analyze:
+                logger.info("\nDetailed Analysis:")
+                logger.info(
+                    f"  Action Distribution: {np.unique(metrics['actions'], return_counts=True)}"
+                )
+                if np.std(metrics["rewards"]) > averages.get("rewards", 0) * 0.5:
+                    logger.warning(
+                        "High variance in rewards; model may be inconsistent."
+                    )
+                if averages.get("max_stages", 0) < 2:
+                    logger.warning("Model struggles to progress beyond early stages.")
         else:
-            logger.warning("No episodes were successfully completed")
+            logger.warning("No episodes completed successfully")
 
         return True
 
@@ -165,7 +221,6 @@ def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True, analyze=
         return False
 
     finally:
-        # Clean up the environment
         cleanup_env(env)
 
 
@@ -183,10 +238,10 @@ def main():
     parser.add_argument("--analyze", action="store_true", help="Run detailed analysis")
     args = parser.parse_args()
 
-    # Check if model file exists
+    # Validate model file
     if not os.path.exists(args.model):
         logger.error(f"Model file {args.model} not found")
-        return 1
+        sys.exit(1)
 
     # Run evaluation
     try:
@@ -196,12 +251,11 @@ def main():
             render=args.render,
             analyze=args.analyze,
         )
-        return 0 if success else 1
-
+        sys.exit(0 if success else 1)
     except Exception as e:
         logger.error(f"Unhandled exception in evaluation: {e}")
         logger.error(traceback.format_exc())
-        return 1
+        sys.exit(1)
 
 
 if __name__ == "__main__":
