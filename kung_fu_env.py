@@ -173,7 +173,7 @@ class KungFuMasterEnv(gym.Wrapper):
         self.time_since_last_attack = 0
         self.enemies_in_range_count = 0
         self.last_engagement_reward = 0
-        self.target_enemy = None  # Track the current target enemy
+        self.priority_enemy = None  # Track the current priority enemy
 
         # Track for DFP measurements - initialize all as proper types
         self.total_steps = 0
@@ -251,14 +251,17 @@ class KungFuMasterEnv(gym.Wrapper):
         enemies = []
         try:
             player_x = self.get_ram_value(MEMORY["player_x"])
-            enemy_y_positions = [80, 120, 160, 200]
+            enemy_y_positions = [80, 120, 160, 200]  # Approximated y-positions
+
             for i in range(1, 5):
                 x = self.get_ram_value(MEMORY[f"enemy{i}_x"])
                 action = self.get_ram_value(MEMORY[f"enemy{i}_action"])
                 timer = self.get_ram_value(MEMORY[f"enemy{i}_timer"])
-                if x > 0:
+
+                # Only consider active enemies (timer > 0 and valid position)
+                if timer > 0 and 0 < x < 240:  # Valid position range
                     y = enemy_y_positions[min(i - 1, len(enemy_y_positions) - 1)]
-                    relative_x = x - player_x
+                    distance = abs(x - player_x)
                     enemies.append(
                         {
                             "id": i,
@@ -266,13 +269,20 @@ class KungFuMasterEnv(gym.Wrapper):
                             "y": y,
                             "action": action,
                             "timer": timer,
-                            "relative_x": relative_x,
+                            "distance": distance,
+                            "relative_x": x - player_x,
                         }
                     )
-            return enemies
+
+            # Sort enemies by distance (nearest first)
+            return sorted(enemies, key=lambda e: e["distance"])
         except Exception as e:
             logger.error(f"Error getting enemy positions: {e}")
             return []
+
+    def get_priority_enemy(self):
+        enemies = self.get_enemy_positions()
+        return enemies[0] if enemies else None
 
     def get_boss_info(self):
         try:
@@ -290,58 +300,6 @@ class KungFuMasterEnv(gym.Wrapper):
         except Exception as e:
             logger.error(f"Error getting boss info: {e}")
             return None
-
-    def calculate_nearest_enemy_distance(self, enemies, player_x, player_y):
-        if not enemies:
-            return 999, None
-        distances = []
-        for enemy in enemies:
-            dx = abs(enemy["x"] - player_x)
-            dy = abs(enemy["y"] - player_y)
-            distance = (dx**2 + dy**2) ** 0.5
-            distances.append((distance, enemy))
-
-        # Use a key function to explicitly sort by the distance value only
-        # This prevents Python from trying to compare the enemy dictionaries
-        distances.sort(key=lambda x: x[0])
-
-        return distances[0] if distances else (999, None)
-
-    def find_enemy_in_progress_direction(
-        self, enemies, player_x, player_y, current_stage
-    ):
-        """Find enemies in the direction of progress based on the current stage"""
-        if not enemies:
-            return None
-
-        # Determine direction of progress based on stage
-        # For even stages, progress is right to left (enemies on left are priority)
-        # For odd stages, progress is left to right (enemies on right are priority)
-        progressing_right = current_stage in [1, 3, 5]  # Odd stages progress right
-
-        # Filter enemies by direction
-        directional_enemies = []
-        for enemy in enemies:
-            if progressing_right and enemy["x"] > player_x:
-                # In odd stages, target enemies to the right
-                dx = enemy["x"] - player_x
-                dy = abs(enemy["y"] - player_y)
-                distance = (dx**2 + dy**2) ** 0.5
-                if distance < ENV_CONFIG["enemy_detection_range"]:
-                    directional_enemies.append((distance, enemy))
-            elif not progressing_right and enemy["x"] < player_x:
-                # In even stages, target enemies to the left
-                dx = player_x - enemy["x"]
-                dy = abs(enemy["y"] - player_y)
-                distance = (dx**2 + dy**2) ** 0.5
-                if distance < ENV_CONFIG["enemy_detection_range"]:
-                    directional_enemies.append((distance, enemy))
-
-        if directional_enemies:
-            # Sort by distance and return the closest enemy in progress direction
-            directional_enemies.sort(key=lambda x: x[0])
-            return directional_enemies[0][1]
-        return None
 
     def calculate_engagement_status(self, enemies, player_x, player_y):
         close_enemies = 0
@@ -381,7 +339,7 @@ class KungFuMasterEnv(gym.Wrapper):
         self.standing_still_count = 0
         self.no_progress_count = 0
         self.time_since_last_attack = 0
-        self.target_enemy = None
+        self.priority_enemy = None
 
         # Check if enemy_distance_history is a deque, recreate if not
         if not isinstance(self.enemy_distance_history, deque):
@@ -531,31 +489,15 @@ class KungFuMasterEnv(gym.Wrapper):
             engagement = self.calculate_engagement_status(
                 current_enemies, current_x_pos, current_y_pos
             )
-            nearest_enemy_data = self.calculate_nearest_enemy_distance(
-                current_enemies, current_x_pos, current_y_pos
-            )
-            nearest_enemy_distance = (
-                nearest_enemy_data[0] if isinstance(nearest_enemy_data, tuple) else 999
-            )
-            nearest_enemy = (
-                nearest_enemy_data[1] if isinstance(nearest_enemy_data, tuple) else None
-            )
 
-            # Find enemies in the progress direction
-            directional_enemy = self.find_enemy_in_progress_direction(
-                current_enemies, current_x_pos, current_y_pos, current_stage
+            # Get priority enemy (the closest one)
+            self.priority_enemy = self.get_priority_enemy()
+
+            # Update enemy distance history
+            closest_distance = (
+                self.priority_enemy["distance"] if self.priority_enemy else 999
             )
-
-            # Update target enemy if we found one in the progress direction
-            if directional_enemy:
-                self.target_enemy = directional_enemy
-            elif nearest_enemy and nearest_enemy_distance < 80:
-                # Fallback to nearest enemy if it's close
-                self.target_enemy = nearest_enemy
-            else:
-                self.target_enemy = None
-
-            self.enemy_distance_history.append(nearest_enemy_distance)
+            self.enemy_distance_history.append(closest_distance)
 
             try:
                 score_diff = int(current_score - self.prev_score)
@@ -613,52 +555,59 @@ class KungFuMasterEnv(gym.Wrapper):
             if attack_attempt:
                 self.time_since_last_attack = 0
 
-            # ENHANCED: Improved combat engagement reward calculation
+            # SIMPLIFIED: Improved combat engagement reward calculation
             combat_engagement_reward = 0
 
-            # Reward for attacking when enemies are close
-            if attack_attempt and engagement["close_enemies"] > 0:
-                combat_engagement_reward += (
-                    0.7
-                    * engagement["close_enemies"]
-                    * ENV_CONFIG["combat_engagement_weight"]
-                )
+            # Base engagement reward for having enemies
+            if current_enemies:
+                combat_engagement_reward += 0.3 * ENV_CONFIG["combat_engagement_weight"]
 
-            # Reward for moving toward the target enemy (proactive combat)
-            if self.target_enemy:
+            # Get priority enemy combat rewards
+            if self.priority_enemy:
+                enemy_distance = self.priority_enemy["distance"]
+
+                # Reward attacking when enemies are close
+                if attack_attempt:
+                    if enemy_distance < 40:  # Close combat bonus
+                        combat_engagement_reward += (
+                            0.8 * ENV_CONFIG["combat_engagement_weight"]
+                        )
+                    elif enemy_distance < 100:  # Medium distance bonus
+                        combat_engagement_reward += (
+                            0.3 * ENV_CONFIG["combat_engagement_weight"]
+                        )
+
+                # Direction-based movement rewards
                 move_right = action in [5, 8, 10]  # RIGHT actions
                 move_left = action in [4, 11]  # LEFT actions
+                enemy_dir = "right" if self.priority_enemy["relative_x"] > 0 else "left"
 
-                # Check if the action is appropriate for approaching the target
-                approaching_target = (
-                    move_right and self.target_enemy["x"] > current_x_pos
-                ) or (move_left and self.target_enemy["x"] < current_x_pos)
+                # Reward moving toward priority enemy
+                if (move_right and enemy_dir == "right") or (
+                    move_left and enemy_dir == "left"
+                ):
+                    combat_engagement_reward += (
+                        0.4 * ENV_CONFIG["combat_engagement_weight"]
+                    )
 
-                # Add bonus for moving toward target enemy
-                if approaching_target:
-                    combat_engagement_reward += ENV_CONFIG["proactive_combat_bonus"]
-
-                # Extra bonus for attacking in direction of target enemy
+                # Reward attacking in the correct direction
                 if attack_attempt:
                     attack_right = action in [10]  # Punch+RIGHT
                     attack_left = action in [11]  # LEFT+Kick
 
-                    # Check if attack direction matches enemy direction
-                    correct_attack_direction = (
-                        attack_right and self.target_enemy["x"] > current_x_pos
-                    ) or (attack_left and self.target_enemy["x"] < current_x_pos)
-
-                    if correct_attack_direction:
+                    if (attack_right and enemy_dir == "right") or (
+                        attack_left and enemy_dir == "left"
+                    ):
                         combat_engagement_reward += (
                             0.5 * ENV_CONFIG["combat_engagement_weight"]
                         )
 
             # Additional reward for getting closer to enemies over time
-            if nearest_enemy and len(self.enemy_distance_history) > 3:
+            if len(self.enemy_distance_history) > 3:
                 avg_prev_distance = sum(list(self.enemy_distance_history)[:-1]) / (
                     len(self.enemy_distance_history) - 1
                 )
-                if nearest_enemy_distance < avg_prev_distance:
+                if closest_distance < avg_prev_distance:
                     combat_engagement_reward += (
                         0.4 * ENV_CONFIG["combat_engagement_weight"]
                     )
@@ -696,35 +645,29 @@ class KungFuMasterEnv(gym.Wrapper):
 
             # Stage progression bonus
             if current_stage > self.prev_stage:
-                stage_bonus = (
-                    20.0 * ENV_CONFIG["progression_weight"]
-                )  # Increased from 15.0
+                stage_bonus = 20.0 * ENV_CONFIG["progression_weight"]
                 reward += stage_bonus
 
             # Progress reward - adjusted based on stage direction
             if progress > 0:
-                progress_reward = (
-                    progress * 0.07 * ENV_CONFIG["progression_weight"]
-                )  # Increased from 0.05
+                progress_reward = progress * 0.07 * ENV_CONFIG["progression_weight"]
                 reward += progress_reward
 
             # Damage penalty
             if damage_taken > 0:
-                reward -= (
-                    damage_taken * 0.1
-                )  # Increased from 0.05 for stronger punishment
+                reward -= damage_taken * 0.1
 
             # Vertical positioning reward - optimal fighting position
             optimal_y = 160
             y_distance = abs(current_y_pos - optimal_y)
             if y_distance < 30:
-                reward += 0.05  # Increased from 0.02 for better position incentive
+                reward += 0.05
 
             # Penalties for standing still or making no progress
-            if self.standing_still_count > 15:  # Reduced from 20 for quicker response
+            if self.standing_still_count > 15:
                 reward -= 0.08 * (self.standing_still_count - 15)
-            if self.no_progress_count > 25:  # Reduced from 30 for quicker response
-                reward -= 0.15 * (self.no_progress_count - 25)  # Increased from 0.1
+            if self.no_progress_count > 25:
+                reward -= 0.15 * (self.no_progress_count - 25)
 
             # Add combat engagement reward
             reward += combat_engagement_reward
@@ -770,11 +713,9 @@ class KungFuMasterEnv(gym.Wrapper):
                         "enemies_distance": int(engagement["distance_enemies"]),
                         "combat_engagement_reward": float(combat_engagement_reward),
                         "nearest_enemy_distance": float(
-                            nearest_enemy_distance
-                            if nearest_enemy_distance != 999
-                            else 0
+                            closest_distance if closest_distance != 999 else 0
                         ),
-                        "has_target_enemy": int(self.target_enemy is not None),
+                        "has_priority_enemy": int(self.priority_enemy is not None),
                     }
                 )
             except Exception as e:

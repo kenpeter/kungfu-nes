@@ -325,7 +325,7 @@ class DFPPredictionHead(nn.Module):
         self.measurement_dims = measurement_dims
         self.prediction_horizons = prediction_horizons
         # ENHANCED: Updated horizon weights to focus more on medium-term outcomes
-        self.horizon_weights = [1.0, 1.1, 1.2, 0.9, 0.7]  # Emphasize 3-5 step horizons
+        self.horizon_weights = [1.0, 1.2, 1.3, 0.9, 0.6]  # Emphasize 3-5 step horizons
         self.n_horizons = len(prediction_horizons)
         self.output_dim = measurement_dims * self.n_horizons
 
@@ -399,7 +399,7 @@ class DFPPolicy(ActorCriticPolicy):
             input_dim=512,
             measurement_dims=measurement_dims,
             prediction_horizons=[1, 3, 5, 10, 20],
-            horizon_weights=[1.0, 1.1, 1.2, 0.9, 0.7],  # Updated weights
+            horizon_weights=[1.0, 1.2, 1.3, 0.9, 0.6],  # Updated weights
         )
 
     def forward(self, obs, deterministic=False):
@@ -630,8 +630,8 @@ def main():
     parser.add_argument(
         "--combat-weight",
         type=float,
-        default=1.2,
-        help="Weight for combat engagement rewards (default: 1.2)",
+        default=1.8,
+        help="Weight for combat engagement rewards (default: 1.8)",
     )
     parser.add_argument(
         "--progression-weight",
