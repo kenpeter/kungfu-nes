@@ -146,13 +146,18 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
             f"DFP Feature Extractor - Image shape: {self.image_space.shape}, Measurements: {self.measurement_dim}"
         )
 
-        # CNN for image processing
+        # ENHANCED: Improved CNN architecture for better perception
+        # CNN for image processing with deeper layers
         self.cnn = nn.Sequential(
             nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(
+                64, 32, kernel_size=3, stride=1, padding=0
+            ),  # Additional layer for better feature extraction
             nn.ReLU(),
             nn.Flatten(),
         )
@@ -172,6 +177,10 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
                 nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
                 nn.ReLU(),
                 nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+                nn.ReLU(),
+                nn.Conv2d(
+                    64, 32, kernel_size=3, stride=1, padding=0
+                ),  # Additional layer
                 nn.ReLU(),
                 nn.Flatten(),
             )
@@ -193,6 +202,10 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
                 nn.ReLU(),
                 nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
                 nn.ReLU(),
+                nn.Conv2d(
+                    64, 32, kernel_size=3, stride=1, padding=0
+                ),  # Additional layer
+                nn.ReLU(),
                 nn.Flatten(),
             )
             # Test with dummy input
@@ -205,12 +218,15 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
             f"CNN output features: {self.cnn_out_size}, Channel last: {self.channel_last}"
         )
 
-        # Simple measurement network
+        # ENHANCED: Improved measurement network
+        # Simple measurement network with more capacity
         measurement_input_size = self.measurement_dim + self.goal_dim
         self.measurement_net = nn.Sequential(
             nn.Linear(measurement_input_size, 128),
             nn.ReLU(),
             nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),  # Additional layer for better processing
             nn.ReLU(),
         )
         self.measurement_out_size = 128
@@ -219,6 +235,8 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
         combined_size = self.cnn_out_size + self.measurement_out_size
         self.combined_net = nn.Sequential(
             nn.Linear(combined_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),  # Additional layer for better integration
             nn.ReLU(),
             nn.Linear(512, features_dim),
             nn.ReLU(),
@@ -306,15 +324,18 @@ class DFPPredictionHead(nn.Module):
         self.input_dim = input_dim
         self.measurement_dims = measurement_dims
         self.prediction_horizons = prediction_horizons
-        self.horizon_weights = horizon_weights
+        # ENHANCED: Updated horizon weights to focus more on medium-term outcomes
+        self.horizon_weights = [1.0, 1.1, 1.2, 0.9, 0.7]  # Emphasize 3-5 step horizons
         self.n_horizons = len(prediction_horizons)
         self.output_dim = measurement_dims * self.n_horizons
 
-        # Prediction network
+        # ENHANCED: Improved prediction network
         self.prediction_net = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),  # Additional layer for better future prediction
             nn.ReLU(),
             nn.Linear(256, self.output_dim),
         )
@@ -378,7 +399,7 @@ class DFPPolicy(ActorCriticPolicy):
             input_dim=512,
             measurement_dims=measurement_dims,
             prediction_horizons=[1, 3, 5, 10, 20],
-            horizon_weights=[1.0, 0.9, 0.8, 0.7, 0.6],
+            horizon_weights=[1.0, 1.1, 1.2, 0.9, 0.7],  # Updated weights
         )
 
     def forward(self, obs, deterministic=False):
