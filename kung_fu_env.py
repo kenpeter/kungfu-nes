@@ -40,6 +40,8 @@ KUNGFU_ACTIONS = [
     [1, 0, 0, 0, 0, 0, 0, 0, 1],  # B + A (Punch + Kick)
     [0, 0, 0, 0, 1, 0, 0, 1, 0],  # UP + RIGHT (Jump + Right)
     [0, 0, 0, 0, 0, 1, 0, 0, 1],  # DOWN + A (Crouch Kick)
+    [1, 0, 0, 0, 0, 0, 0, 1, 0],  # B + RIGHT (Punch + Right)
+    [0, 0, 0, 0, 0, 0, 1, 0, 1],  # LEFT + A (Left + Kick)
 ]
 
 # Action names
@@ -54,24 +56,66 @@ KUNGFU_ACTION_NAMES = [
     "Punch + Kick",
     "Jump + Right",
     "Crouch Kick",
+    "Punch + Right",  # Added for aggressive forward progress
+    "Left + Kick",  # Added for aggressive back attack
 ]
 
-# Critical memory addresses
+# Critical memory addresses for NES Kung Fu Master
 MEMORY = {
     "current_stage": 0x0058,  # Current Stage
     "player_hp": 0x04A6,  # Hero HP
     "player_x": 0x0094,  # Hero Screen Pos X
-    "player_y": 0x00B6,  # Hero Screen Pos Y
+    "player_y": 0x00B6,  # Hero Pos Y
     "game_mode": 0x0051,  # Game Mode
     "boss_hp": 0x04A5,  # Boss HP
+    "boss_x": 0x0093,  # Boss Pos X
+    "boss_action": 0x004E,  # Boss Action
+    "player_action": 0x0069,  # Hero Action
+    "player_action_timer": 0x0021,  # Hero Action Timer
+    "player_air_mode": 0x036A,  # Hero Air Mode
     "score": [0x0531, 0x0532, 0x0533, 0x0534, 0x0535],  # Score digits
+    "frame_counter": 0x0049,  # Frame Counter
+    "screen_scroll1": 0x00E5,  # Screen Scroll 1
+    "screen_scroll2": 0x00D4,  # Screen Scroll 2
+    "game_submode": 0x0008,  # Game Submode
+    "enemy1_x": 0x008E,  # Enemy 1 Pos X
+    "enemy2_x": 0x008F,  # Enemy 2 Pos X
+    "enemy3_x": 0x0090,  # Enemy 3 Pos X
+    "enemy4_x": 0x0091,  # Enemy 4 Pos X
+    "enemy1_action": 0x0080,  # Enemy 1 Action
+    "enemy2_action": 0x0081,  # Enemy 2 Action
+    "enemy3_action": 0x0082,  # Enemy 3 Action
+    "enemy4_action": 0x0083,  # Enemy 4 Action
+    "enemy1_timer": 0x002B,  # Enemy 1 Action Timer
+    "enemy2_timer": 0x002C,  # Enemy 2 Action Timer
+    "enemy3_timer": 0x002D,  # Enemy 3 Action Timer
+    "enemy4_timer": 0x002E,  # Enemy 4 Action Timer
+    "grab_counter": 0x0374,  # Grab Counter
+    "shrug_counter": 0x0378,  # Shrug Counter
 }
+
+# Enemy action types that might indicate projectile throwing
+PROJECTILE_ACTIONS = [
+    0x04,
+    0x05,
+    0x08,
+]  # Actions like throwing knives, boomerangs, etc.
 
 # Maximum episode duration
 MAX_EPISODE_STEPS = 3600  # 2 minutes
 
 # Set default model path
 MODEL_PATH = "model/kungfu_dfp.zip"
+
+# Global config for environment behavior
+ENV_CONFIG = {
+    "detect_projectiles": False,  # Enable projectile detection
+    "aggressive_progress": True,  # Enable aggressive progression
+    "aggressive_combat": True,  # Enable aggressive combat engagement
+    "projectile_avoidance_weight": 1.5,  # Weight for projectile avoidance reward
+    "combat_engagement_weight": 1.2,  # Weight for combat engagement reward
+    "progression_weight": 1.5,  # Weight for progression reward
+}
 
 
 # Singleton for retro environment management
@@ -123,17 +167,31 @@ class KungFuMasterEnv(gym.Wrapper):
         self.prev_y_pos = 0
         self.prev_stage = 0
         self.episode_steps = 0
+        self.standing_still_count = 0
+        self.no_progress_count = 0
+        self.enemy_distance_history = deque(maxlen=10)
+
+        # Enemy and projectile tracking
+        self.prev_enemy_positions = {}
+        self.last_detected_projectiles = []
+        self.projectile_avoided = False
+        self.time_since_last_attack = 0
+        self.enemies_in_range_count = 0
+        self.last_engagement_reward = 0
 
         # Track for DFP measurements
         self.total_steps = 0
         self.scores_by_step = []
         self.damage_by_step = []
         self.progress_by_step = []
+        self.projectile_avoidance_by_step = []
+        self.combat_engagement_by_step = []
 
         # Flag to track whether reset has been called
         self.reset_called = False
 
-        logger.info("KungFuMasterEnv initialized with simplified action space")
+        logger.info("KungFuMasterEnv initialized with enhanced action space")
+        logger.info(f"Environment configuration: {ENV_CONFIG}")
 
     def get_ram(self):
         try:
@@ -194,6 +252,144 @@ class KungFuMasterEnv(gym.Wrapper):
     def get_boss_hp(self):
         return self.get_ram_value(MEMORY["boss_hp"])
 
+    def get_enemy_positions(self):
+        """Get positions and actions of all enemies on screen"""
+        enemies = []
+        try:
+            player_x = self.get_ram_value(MEMORY["player_x"])
+
+            # Get fixed y positions based on game mechanics
+            # In Kung Fu, enemies typically appear at certain fixed Y heights
+            enemy_y_positions = [80, 120, 160, 200]
+
+            for i in range(1, 5):  # Check 4 potential enemies
+                x = self.get_ram_value(MEMORY[f"enemy{i}_x"])
+                action = self.get_ram_value(MEMORY[f"enemy{i}_action"])
+                timer = self.get_ram_value(MEMORY[f"enemy{i}_timer"])
+
+                # Only consider active enemies (x > 0)
+                if x > 0:
+                    # Use an approximated y position based on index
+                    # This is a simplification since the actual y positions aren't in memory map
+                    y = enemy_y_positions[min(i - 1, len(enemy_y_positions) - 1)]
+
+                    # Calculate relative position to player (negative = left of player)
+                    relative_x = x - player_x
+
+                    enemies.append(
+                        {
+                            "id": i,
+                            "x": x,
+                            "y": y,
+                            "action": action,
+                            "timer": timer,
+                            "relative_x": relative_x,
+                            "can_throw": action in PROJECTILE_ACTIONS,
+                        }
+                    )
+            return enemies
+        except Exception as e:
+            logger.error(f"Error getting enemy positions: {e}")
+            return []
+
+    def detect_projectiles_from_enemies(self, enemies):
+        """Detect potential projectiles based on enemy actions rather than explicit projectile tracking"""
+        projectiles = []
+        player_x = self.get_ram_value(MEMORY["player_x"])
+
+        try:
+            for enemy in enemies:
+                # If enemy is in a throwing action and at distance
+                if enemy["can_throw"] and abs(enemy["relative_x"]) > 30:
+                    # Create an inferred projectile object at estimated position between enemy and player
+                    inferred_x = enemy["x"] - (
+                        enemy["relative_x"] * 0.3
+                    )  # 30% of the way from enemy to player
+                    projectiles.append(
+                        {
+                            "id": enemy["id"],
+                            "x": inferred_x,
+                            "y": enemy["y"],
+                            "from_enemy_id": enemy["id"],
+                        }
+                    )
+            return projectiles
+        except Exception as e:
+            logger.error(f"Error detecting projectiles from enemies: {e}")
+            return []
+
+    def get_boss_info(self):
+        """Get boss information if present"""
+        try:
+            boss_x = self.get_ram_value(MEMORY["boss_x"])
+            boss_hp = self.get_ram_value(MEMORY["boss_hp"])
+            boss_action = self.get_ram_value(MEMORY["boss_action"])
+
+            # If boss is active
+            if boss_hp > 0 and boss_x > 0:
+                return {
+                    "x": boss_x,
+                    "hp": boss_hp,
+                    "action": boss_action,
+                    # Approximate y position for the boss (mid-screen)
+                    "y": 160,
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting boss info: {e}")
+            return None
+
+    def detect_projectile_threat(self, projectiles, player_x, player_y):
+        """Determine if any projectile poses a threat to the player"""
+        for proj in projectiles:
+            dx = abs(proj["x"] - player_x)
+            dy = abs(proj["y"] - player_y)
+
+            # Threat zone: projectile is within 40 pixels horizontally and 20 vertically
+            if dx < 40 and dy < 20:
+                return True, proj
+        return False, None
+
+    def calculate_nearest_enemy_distance(self, enemies, player_x, player_y):
+        """Calculate distance to nearest enemy"""
+        if not enemies:
+            return 999, None  # No enemies found
+
+        distances = []
+        for enemy in enemies:
+            dx = abs(enemy["x"] - player_x)
+            dy = abs(enemy["y"] - player_y)
+            distance = (dx**2 + dy**2) ** 0.5  # Euclidean distance
+            distances.append((distance, enemy))
+
+        distances.sort()  # Sort by distance
+        return distances[0] if distances else (999, None)
+
+    def calculate_engagement_status(self, enemies, player_x, player_y):
+        """Calculate engagement metrics with enemies"""
+        close_enemies = 0
+        distance_enemies = 0
+        threats = 0
+
+        for enemy in enemies:
+            dx = abs(enemy["x"] - player_x)
+            dy = abs(enemy["y"] - player_y)
+
+            # Close combat range
+            if dx < 30 and dy < 20:
+                close_enemies += 1
+            # Distance enemy (potential projectile thrower)
+            elif dx < 100:
+                distance_enemies += 1
+                if enemy["can_throw"]:
+                    threats += 1
+
+        return {
+            "close_enemies": close_enemies,
+            "distance_enemies": distance_enemies,
+            "threats": threats,
+        }
+
     def reset(self, **kwargs):
         self.reset_called = True
         try:
@@ -212,10 +408,25 @@ class KungFuMasterEnv(gym.Wrapper):
         self.scores_by_step = []
         self.damage_by_step = []
         self.progress_by_step = []
+        self.projectile_avoidance_by_step = []
+        self.combat_engagement_by_step = []
+        self.standing_still_count = 0
+        self.no_progress_count = 0
+        self.time_since_last_attack = 0
+        self.enemy_distance_history.clear()
+        self.prev_enemy_positions = {}
+        self.last_detected_projectiles = []
+        self.projectile_avoided = False
+
         self.prev_hp = self.get_hp()
         self.prev_x_pos, self.prev_y_pos = self.get_player_position()
         self.prev_stage = self.get_stage()
         self.prev_score = self.get_score()
+
+        # Initialize enemy tracking
+        enemies = self.get_enemy_positions()
+        for enemy in enemies:
+            self.prev_enemy_positions[enemy["id"]] = (enemy["x"], enemy["y"])
 
         logger.info(
             f"Reset - Stage: {self.prev_stage}, HP: {self.prev_hp}, "
@@ -236,6 +447,7 @@ class KungFuMasterEnv(gym.Wrapper):
 
         self.total_steps += 1
         self.episode_steps += 1
+        self.time_since_last_attack += 1
 
         try:
             converted_action = self.KUNGFU_ACTIONS[action]
@@ -273,80 +485,212 @@ class KungFuMasterEnv(gym.Wrapper):
             truncated = True
 
         try:
+            # Get basic game state
             current_hp = self.get_hp()
             current_x_pos, current_y_pos = self.get_player_position()
             current_stage = self.get_stage()
             current_score = self.get_score()
 
+            # Track enemies and projectiles
+            current_enemies = self.get_enemy_positions()
+            current_projectiles = (
+                self.get_projectiles() if ENV_CONFIG["detect_projectiles"] else []
+            )
+
+            # Calculate engagement metrics
+            engagement = self.calculate_engagement_status(
+                current_enemies, current_x_pos, current_y_pos
+            )
+            nearest_enemy_data = self.calculate_nearest_enemy_distance(
+                current_enemies, current_x_pos, current_y_pos
+            )
+            nearest_enemy_distance = (
+                nearest_enemy_data[0] if isinstance(nearest_enemy_data, tuple) else 999
+            )
+            nearest_enemy = (
+                nearest_enemy_data[1] if isinstance(nearest_enemy_data, tuple) else None
+            )
+
+            # Track if we're making progress
+            self.enemy_distance_history.append(nearest_enemy_distance)
+
+            # Detect projectile threats
+            projectile_threat = False
+            projectile_avoidance_reward = 0
+            if ENV_CONFIG["detect_projectiles"] and current_projectiles:
+                projectile_threat, threat_projectile = self.detect_projectile_threat(
+                    current_projectiles, current_x_pos, current_y_pos
+                )
+
+                # Check if we successfully avoided a previously detected projectile
+                if self.last_detected_projectiles and not projectile_threat:
+                    for prev_proj in self.last_detected_projectiles:
+                        # If we had a projectile previously that's not a threat now, we avoided it
+                        if not any(
+                            p["id"] == prev_proj["id"] for p in current_projectiles
+                        ):
+                            projectile_avoidance_reward = (
+                                2.0 * ENV_CONFIG["projectile_avoidance_weight"]
+                            )
+                            self.projectile_avoided = True
+
+                # Update detected projectiles
+                self.last_detected_projectiles = (
+                    current_projectiles if projectile_threat else []
+                )
+
+            # Calculate base metrics
             score_diff = current_score - self.prev_score
             self.scores_by_step.append(score_diff)
 
             damage_taken = self.prev_hp - current_hp
-            if damage_taken < 0:
+            if damage_taken < 0:  # Health restored
                 damage_taken = 0
             self.damage_by_step.append(damage_taken)
 
-            if current_stage in [1, 3]:
+            # Calculate progress differently based on stage (odd stages move right, even move left)
+            if current_stage in [1, 3, 5]:
                 progress = current_x_pos - self.prev_x_pos
                 if current_stage > self.prev_stage:
-                    progress += 100
+                    progress += 100  # Big bonus for stage transition
             else:
-                progress = self.prev_x_pos - current_x_pos
+                progress = self.prev_x_pos - current_x_pos  # Moving left in even stages
                 if current_stage > self.prev_stage:
-                    progress += 100
+                    progress += 100  # Big bonus for stage transition
 
-            if progress < 0:
-                progress = 0
-            self.progress_by_step.append(progress)
+            # Detect if player is stuck without making progress
+            if abs(progress) < 2:
+                self.no_progress_count += 1
+            else:
+                self.no_progress_count = 0
+
+            # Standing still too long gets negative reward (encourage movement)
+            if (
+                abs(current_x_pos - self.prev_x_pos) < 2
+                and abs(current_y_pos - self.prev_y_pos) < 2
+            ):
+                self.standing_still_count += 1
+            else:
+                self.standing_still_count = 0
+
+            # Ensure progress is non-negative for the progress tracker
+            recorded_progress = max(0, progress)
+            self.progress_by_step.append(recorded_progress)
+
+            # Track combat engagement
+            attack_attempt = action in [
+                1,
+                6,
+                7,
+                9,
+                10,
+                11,
+            ]  # Action indices for attack moves
+            if attack_attempt:
+                self.time_since_last_attack = 0
+
+            # Calculate combat engagement reward
+            combat_engagement_reward = 0
+
+            if ENV_CONFIG["aggressive_combat"]:
+                # Reward for attacking when enemies are close
+                if attack_attempt and engagement["close_enemies"] > 0:
+                    combat_engagement_reward += (
+                        0.5
+                        * engagement["close_enemies"]
+                        * ENV_CONFIG["combat_engagement_weight"]
+                    )
+
+                # Reward for moving toward distant enemies (closing the distance)
+                if nearest_enemy and len(self.enemy_distance_history) > 3:
+                    avg_prev_distance = sum(list(self.enemy_distance_history)[:-1]) / (
+                        len(self.enemy_distance_history) - 1
+                    )
+                    if nearest_enemy_distance < avg_prev_distance:
+                        combat_engagement_reward += (
+                            0.3 * ENV_CONFIG["combat_engagement_weight"]
+                        )
+
+                # Extra reward for dealing with projectile throwers
+                if (
+                    nearest_enemy
+                    and nearest_enemy.get("can_throw", False)
+                    and attack_attempt
+                ):
+                    combat_engagement_reward += (
+                        0.5 * ENV_CONFIG["combat_engagement_weight"]
+                    )
+
+            self.combat_engagement_by_step.append(combat_engagement_reward)
+            self.projectile_avoidance_by_step.append(projectile_avoidance_reward)
 
             if self.episode_steps % 100 == 0:
                 time_left = (MAX_EPISODE_STEPS - self.episode_steps) / 30
                 logger.info(
                     f"Stage: {current_stage}, Position: ({current_x_pos}, {current_y_pos}), "
-                    f"HP: {current_hp}, Score: {current_score}, Time left: {time_left:.1f}s"
+                    f"HP: {current_hp}, Score: {current_score}, Time left: {time_left:.1f}s, "
+                    f"Enemies: {len(current_enemies)}, Projectiles: {len(current_projectiles)}"
                 )
 
-            # Enhanced reward structure to encourage engagement
+            # Enhanced reward structure
 
-            # Score-based rewards (increased from 0.1 to 0.3 to make it more significant)
-            # Since score increases when defeating enemies, this rewards combat
+            # Score-based rewards - kept from original
             reward = score_diff * 0.3
 
-            # Stage progression rewards
+            # Stage progression rewards - increased for aggressive progression
             if current_stage > self.prev_stage:
-                reward += 15.0  # Increased from 10.0
+                stage_bonus = 15.0
+                if ENV_CONFIG["aggressive_progress"]:
+                    stage_bonus *= ENV_CONFIG["progression_weight"]
+                reward += stage_bonus
 
-            # Forward progress rewards
+            # Forward progress rewards - enhanced for aggressive movement
             if progress > 0:
-                # Reward for moving forward (strategic positioning)
-                reward += progress * 0.05
+                progress_reward = progress * 0.05
+                if ENV_CONFIG["aggressive_progress"]:
+                    progress_reward *= ENV_CONFIG["progression_weight"]
+                reward += progress_reward
 
-            # Damage penalties - reduced to avoid excessive risk aversion
+            # Damage penalties - adjusted based on configuration
             if damage_taken > 0:
-                # Reduce penalty by half (from 0.1 to 0.05)
                 reward -= damage_taken * 0.05
 
-            # Position-based rewards (strategic positioning)
-            # Reward for staying in mid-level Y position (optimal for many attacks)
-            optimal_y = 160  # Approximate mid-level Y position
+            # Position-based rewards for strategic positioning
+            optimal_y = 160
             y_distance = abs(current_y_pos - optimal_y)
-            if y_distance < 30:  # If player is in a strategic height
+            if y_distance < 30:
                 reward += 0.02
 
-            # Small constant reward for staying alive
+            # Penalties for non-movement to avoid getting stuck
+            if self.standing_still_count > 20:
+                reward -= 0.05 * (self.standing_still_count - 20)
+
+            if self.no_progress_count > 30:
+                reward -= 0.1 * (self.no_progress_count - 30)
+
+            # Add combat engagement reward
+            reward += combat_engagement_reward
+
+            # Add projectile avoidance reward
+            reward += projectile_avoidance_reward
+
+            # Penalty for being hit by a projectile
+            if (
+                ENV_CONFIG["detect_projectiles"]
+                and projectile_threat
+                and damage_taken > 0
+            ):
+                reward -= 1.0 * ENV_CONFIG["projectile_avoidance_weight"]
+
+            # Reward for staying alive
             reward += 0.01
 
             # Track enemy defeats based on score increases
-            # In Kung Fu Master, score typically increases when defeating enemies
             enemies_defeated = 0
             if score_diff >= 100:
-                enemies_defeated = (
-                    score_diff // 100
-                )  # Rough estimate based on game mechanics
+                enemies_defeated = score_diff // 100
 
-            # Track attack attempts (can be estimated from player actions)
-            attack_attempt = action in [1, 6, 7, 9]  # Action indices for attack moves
-
+            # Update info dictionary with enhanced metrics
             info.update(
                 {
                     "current_stage": current_stage,
@@ -356,23 +700,35 @@ class KungFuMasterEnv(gym.Wrapper):
                     "player_y": current_y_pos,
                     "score_increase": score_diff,
                     "damage_taken": damage_taken,
-                    "progress_made": progress,
+                    "progress_made": recorded_progress,
                     "time_remaining": (MAX_EPISODE_STEPS - self.episode_steps) / 30,
                     "enemies_defeated": enemies_defeated,
-                    "attack_attempt": int(
-                        attack_attempt
-                    ),  # 1 if player attempted attack, 0 otherwise
-                    "strategic_position": int(
-                        abs(current_y_pos - 160) < 30
-                    ),  # 1 if in strategic height
+                    "attack_attempt": int(attack_attempt),
+                    "strategic_position": int(abs(current_y_pos - 160) < 30),
+                    "enemies_close": engagement["close_enemies"],
+                    "enemies_distance": engagement["distance_enemies"],
+                    "projectile_threats": int(projectile_threat),
+                    "projectile_avoided": int(self.projectile_avoided),
+                    "combat_engagement_reward": combat_engagement_reward,
+                    "projectile_avoidance_reward": projectile_avoidance_reward,
+                    "nearest_enemy_distance": (
+                        nearest_enemy_distance if nearest_enemy_distance != 999 else 0
+                    ),
                 }
             )
 
+            # Update previous state
             self.prev_hp = current_hp
             self.prev_x_pos = current_x_pos
             self.prev_y_pos = current_y_pos
             self.prev_stage = current_stage
             self.prev_score = current_score
+
+            # Update enemy tracking
+            self.prev_enemy_positions = {
+                enemy["id"]: (enemy["x"], enemy["y"]) for enemy in current_enemies
+            }
+            self.projectile_avoided = False  # Reset for next step
 
         except Exception as e:
             logger.error(f"Error in measurement calculation: {e}")
@@ -387,370 +743,3 @@ class KungFuMasterEnv(gym.Wrapper):
         except Exception as e:
             logger.error(f"Error closing KungFuMasterEnv: {e}")
         RetroEnvManager.get_instance().unregister_env(self)
-
-
-# but why we have (H, W, C) in the first place, coming from open cv?
-class TransposeObservation(gym.ObservationWrapper):
-    """
-    Transpose image observation from HWC format (Height, Width, Channel)
-    to CHW format (Channel, Height, Width) for PyTorch's CNNs.
-    """
-
-    def __init__(self, env):
-        super().__init__(env)
-
-        # If we're wrapping a Dict observation space
-        if isinstance(env.observation_space, spaces.Dict):
-            # Extract image space from the Dict
-            image_space = env.observation_space.spaces["image"]
-            # Get original dimensions
-            h, w, c = image_space.shape
-
-            # Update the image space shape - transpose dimensions
-            transposed_image_space = spaces.Box(
-                low=0, high=255, shape=(c, h, w), dtype=np.uint8  # CHW format
-            )
-
-            # Create new Dict space with updated image space
-            spaces_dict = dict(env.observation_space.spaces)
-            spaces_dict["image"] = transposed_image_space
-            self.observation_space = spaces.Dict(spaces_dict)
-        else:
-            # If it's just a Box space (simple image)
-            h, w, c = env.observation_space.shape
-
-            # Create new transposed observation space
-            self.observation_space = spaces.Box(
-                low=0, high=255, shape=(c, h, w), dtype=np.uint8  # CHW format
-            )
-
-        logger.info(
-            f"TransposeObservation initialized. New obs shape: {self.observation_space}"
-        )
-
-    def observation(self, observation):
-        """
-        Transpose observation to CHW format
-        """
-        # For Dict observation space
-        if isinstance(observation, dict) and "image" in observation:
-            # Transpose only the image part
-            observation["image"] = np.transpose(observation["image"], (2, 0, 1))
-            return observation
-        else:
-            # For simple image observation
-            return np.transpose(observation, (2, 0, 1))
-
-
-class DFPKungFuWrapper(gym.Wrapper):
-    """
-    Enhanced Direct Future Prediction wrapper for Kung Fu Master.
-    Designed to improve the agent's ability to predict and avoid projectiles.
-    """
-
-    def __init__(
-        self,
-        env,
-        frame_stack=4,
-        measurement_dims=3,
-        prediction_horizons=[1, 3, 5, 10, 20],
-        # Adding time_scale to better predict events at different time horizons
-        time_scale=[1, 3, 6, 10, 20],
-    ):
-        super().__init__(env)
-        self.frame_stack = frame_stack
-        self.measurement_dims = measurement_dims
-        self.prediction_horizons = prediction_horizons
-        self.time_scale = time_scale
-        self.max_horizon = max(prediction_horizons)
-
-        # Frame buffer
-        self.image_buffer = deque(maxlen=frame_stack)
-
-        # Extended measurement buffer to store longer history
-        self.measurement_buffer = deque(maxlen=self.max_horizon + 30)
-
-        # Get base image shape
-        if isinstance(env.observation_space, gym.spaces.Box):
-            self.image_shape = env.observation_space.shape
-        else:
-            raise ValueError("Expected Box observation space for base env")
-
-        # Define stacked image space - now using CHW format
-        if len(self.image_shape) == 3 and self.image_shape[0] in [
-            1,
-            3,
-            4,
-        ]:  # Already in CHW format
-            channels, height, width = self.image_shape
-            stacked_shape = (channels * frame_stack, height, width)
-        else:
-            # Default to assuming HWC format that needs conversion
-            stacked_shape = (self.image_shape[-1] * frame_stack,) + self.image_shape[
-                :-1
-            ]
-
-        self.stacked_image_space = gym.spaces.Box(
-            low=0, high=255, shape=stacked_shape, dtype=np.uint8
-        )
-
-        # Modify goal vector with more balanced weights to avoid excessive risk aversion
-        # [score increase, damage avoidance, progress]
-        # Reduced weight on damage avoidance to balance with other goals
-        self.goals = np.array([1.0, -1.0, 1.0], dtype=np.float32)
-
-        # Observation space
-        self.observation_space = spaces.Dict(
-            {
-                "image": self.stacked_image_space,
-                "measurements": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(measurement_dims,),
-                    dtype=np.float32,
-                ),
-                "goals": spaces.Box(
-                    low=-2.0, high=2.0, shape=(measurement_dims,), dtype=np.float32
-                ),
-            }
-        )
-
-        # Adaptive measurement normalization
-        self.score_max = 1000.0
-        self.damage_max = 100.0
-        self.progress_max = 100.0
-
-        # Recent metrics for adaptive weighting
-        self.recent_damages = deque(maxlen=20)  # Track recent damage events
-
-        logger.info(
-            f"Enhanced DFPKungFuWrapper initialized with frame_stack={frame_stack}"
-        )
-
-    def _get_measurements(self, info):
-        # Enhanced measurement calculation with engagement metrics
-        measurements = np.zeros(self.measurement_dims, dtype=np.float32)
-
-        # Get scores with normalization (indicates enemy defeats)
-        score_increase = min(info.get("score_increase", 0), self.score_max)
-        measurements[0] = score_increase / self.score_max
-
-        # Get damage with adaptive normalization
-        damage_taken = min(info.get("damage_taken", 0), self.damage_max)
-        measurements[1] = damage_taken / self.damage_max
-
-        # Track damage for adaptive weighting
-        if damage_taken > 0:
-            self.recent_damages.append(damage_taken)
-
-        # Get progress with adaptive normalization
-        progress_made = min(info.get("progress_made", 0), self.progress_max)
-        measurements[2] = progress_made / self.progress_max
-
-        # More balanced goal adaptation
-        if len(self.recent_damages) > 5 and np.mean(self.recent_damages) > 10:
-            # If taking a lot of damage recently, increase weight of damage avoidance
-            # But not as extremely as before (-1.5 max instead of -2.0)
-            self.goals[1] = min(-1.5, self.goals[1] * 1.05)
-        else:
-            # Return to normal more quickly if not taking much damage
-            self.goals[1] = max(-1.0, self.goals[1] * 0.95)  # Return toward -1.0
-
-        return measurements
-
-    def _get_stacked_image(self):
-        # Fill buffer if not full
-        while len(self.image_buffer) < self.frame_stack:
-            self.image_buffer.append(
-                self.image_buffer[-1]
-                if self.image_buffer
-                else np.zeros(self.image_shape, dtype=np.uint8)
-            )
-
-        # Stack images in the CHW format (stacking along channel dimension)
-        if len(self.image_shape) == 3 and self.image_shape[0] in [
-            1,
-            3,
-            4,
-        ]:  # Already in CHW format
-            return np.concatenate(self.image_buffer, axis=0)
-        else:
-            # Default behavior for older code structure
-            return np.concatenate(self.image_buffer, axis=-1)
-
-    def reset(self, **kwargs):
-        obs_result = self.env.reset(**kwargs)
-
-        # Handle different reset return formats
-        if isinstance(obs_result, tuple) and len(obs_result) == 2:
-            obs, info = obs_result
-        else:
-            obs = obs_result
-            info = {}
-
-        # Clear buffers
-        self.image_buffer.clear()
-        for _ in range(self.frame_stack):
-            self.image_buffer.append(obs)
-
-        # Reset measurement buffer with zeros
-        self.measurement_buffer.clear()
-        for _ in range(self.max_horizon + 1):
-            self.measurement_buffer.append(
-                np.zeros(self.measurement_dims, dtype=np.float32)
-            )
-
-        # Reset adaptive values
-        self.recent_damages.clear()
-        # Initial goal weights - slightly higher emphasis on damage avoidance
-        self.goals = np.array([1.0, -1.5, 1.0], dtype=np.float32)
-
-        # Get initial measurements
-        measurements = self._get_measurements(info)
-
-        # Create observation
-        dfp_obs = {
-            "image": self._get_stacked_image(),
-            "measurements": measurements,
-            "goals": self.goals,
-        }
-
-        if isinstance(obs_result, tuple) and len(obs_result) == 2:
-            return dfp_obs, info
-        else:
-            return dfp_obs
-
-    def step(self, action):
-        # Handle older gym interface (4 return values) or newer (5 return values)
-        step_result = self.env.step(action)
-
-        if len(step_result) == 5:
-            obs, reward, terminated, truncated, info = step_result
-        elif len(step_result) == 4:
-            obs, reward, done, info = step_result
-            terminated, truncated = done, False
-        else:
-            raise ValueError(
-                f"Unexpected step result format with {len(step_result)} values"
-            )
-
-        # Add current observation to image buffer
-        self.image_buffer.append(obs)
-        stacked_image = self._get_stacked_image()
-
-        # Calculate measurements and add to buffer
-        measurements = self._get_measurements(info)
-        self.measurement_buffer.append(measurements)
-
-        # Create observation dict
-        dfp_obs = {
-            "image": stacked_image,
-            "measurements": measurements,
-            "goals": self.goals,  # Using adaptive goals
-        }
-
-        # Prepare future measurements for training with different temporal scales
-        if len(self.measurement_buffer) > max(self.time_scale):
-            future_measurements = {}
-            for i, horizon in enumerate(self.prediction_horizons):
-                # Use time_scale for more diverse temporal predictions
-                time_idx = min(self.time_scale[i], len(self.measurement_buffer) - 1)
-                future_measurements[f"future_{horizon}"] = self.measurement_buffer[
-                    -time_idx
-                ]
-            info["future_measurements"] = future_measurements
-
-        # Return proper format based on input
-        if len(step_result) == 5:
-            return dfp_obs, reward, terminated, truncated, info
-        else:
-            done = terminated or truncated
-            return dfp_obs, reward, done, info
-
-    # Add methods to help with understanding game dynamics during training
-    def get_goals(self):
-        """Return the current goal weights (helpful for monitoring)"""
-        return self.goals.copy()
-
-
-def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
-    env_manager = RetroEnvManager.get_instance()
-    max_attempts = 3
-
-    env = None
-    for attempt in range(max_attempts):
-        try:
-            gc.collect()
-            logger.info(
-                f"Attempt {attempt+1}/{max_attempts}: Creating Stable Retro environment"
-            )
-            render_mode = "human" if is_play_mode else None
-            logger.info(
-                f"Attempting to create Stable Retro environment with render_mode={render_mode}"
-            )
-            env = retro.make(
-                game="KungFu-Nes",
-                render_mode=render_mode,
-                inttype=retro.data.Integrations.STABLE,
-            )
-            logger.info("Successfully created KungFu-Nes environment")
-            env_manager.register_env(env)
-            env.reset()
-            logger.info("Initial reset successful")
-            break
-        except Exception as e:
-            logger.error(f"Error creating environment (attempt {attempt+1}): {e}")
-            if env is not None:
-                try:
-                    env.close()
-                except:
-                    pass
-                env = None
-            gc.collect()
-            time.sleep(1)
-            if attempt == max_attempts - 1:
-                logger.error("All environment creation attempts failed")
-                raise RuntimeError("Could not initialize Stable Retro environment")
-
-    if env is None:
-        raise RuntimeError("Failed to create base environment")
-
-    logger.info("Applying KungFuMasterEnv wrapper")
-    env = KungFuMasterEnv(env)
-
-    # Add the TransposeObservation wrapper before the DFP wrapper
-    logger.info("Applying TransposeObservation wrapper")
-    env = TransposeObservation(env)
-
-    if use_dfp:
-        logger.info("Adding Direct Future Prediction wrapper with frame stacking")
-        env = DFPKungFuWrapper(
-            env,
-            frame_stack=frame_stack,
-            measurement_dims=3,
-            prediction_horizons=[1, 3, 5, 10, 20],
-        )
-
-    try:
-        os.makedirs("logs", exist_ok=True)
-        monitor_path = os.path.join("logs", "kungfu")
-        logger.info(f"Setting up monitoring at {monitor_path}")
-        # Add info_keywords to include your custom metrics
-        env = Monitor(
-            env,
-            monitor_path,
-            info_keywords=(
-                "score_increase",
-                "damage_taken",
-                "progress_made",
-                "current_stage",
-            ),
-        )
-    except Exception as e:
-        logger.warning(f"Could not set up monitoring: {e}")
-
-    logger.info("Wrapping with DummyVecEnv")
-    env = DummyVecEnv([lambda: env])
-
-    logger.info(f"Final observation space: {env.observation_space}")
-    return env

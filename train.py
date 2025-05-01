@@ -40,6 +40,7 @@ try:
         make_kungfu_env,
         MODEL_PATH,
         RetroEnvManager,
+        ENV_CONFIG,
     )
 except ImportError as e:
     logger.error(f"Failed to import kung_fu_env: {e}")
@@ -99,22 +100,36 @@ except ImportError:
     import gym
 
 
-# so the dfp is is with space attention
+# Enhanced DFP feature extractor with projectile awareness
 class DFPFeaturesExtractor(BaseFeaturesExtractor):
-    # init with obs and feature dim (512)
     def __init__(self, observation_space, features_dim=512):
-        # obs, feature dim
         super().__init__(observation_space, features_dim)
-        # obs -> image -> (channel, height, width)
+
+        # Get image space from observation space
         self.image_space = observation_space.spaces["image"]
+
         # Number of channels (includes frame stacking)
         n_input_channels = self.image_space.shape[0]
         height = self.image_space.shape[1]
         width = self.image_space.shape[2]
 
+        # Get measurement and goal dimensions
         self.measurement_dim = observation_space.spaces["measurements"].shape[0]
         self.goal_dim = observation_space.spaces["goals"].shape[0]
-        logger.info(f"DFP Feature Extractor - Image shape: {self.image_space.shape}")
+
+        # Check for projectile features
+        self.has_projectile_features = "projectile_features" in observation_space.spaces
+        if self.has_projectile_features:
+            self.projectile_dim = observation_space.spaces["projectile_features"].shape[
+                0
+            ]
+            logger.info(
+                f"DFP Feature Extractor with projectile features (dim={self.projectile_dim})"
+            )
+
+        logger.info(
+            f"DFP Feature Extractor - Image shape: {self.image_space.shape}, Measurements: {self.measurement_dim}"
+        )
 
         # Enhanced CNN with more attention to spatial features (better for projectile detection)
         # Using smaller strides and more filters in early layers to preserve spatial information
@@ -150,8 +165,22 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
         )
         self.measurement_out_size = 128
 
+        # Projectile network (if projectile features are present)
+        if self.has_projectile_features:
+            self.projectile_net = nn.Sequential(
+                nn.Linear(self.projectile_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 64),
+                nn.ReLU(),
+            )
+            self.projectile_out_size = 64
+        else:
+            self.projectile_out_size = 0
+
         # Combined network with residual connections
-        combined_size = self.cnn_out_size + self.measurement_out_size
+        combined_size = (
+            self.cnn_out_size + self.measurement_out_size + self.projectile_out_size
+        )
         self.combined_net = nn.Sequential(
             nn.Linear(combined_size, 512),
             nn.ReLU(),
@@ -178,8 +207,20 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
         measurement_tensor = torch.cat([measurements, goals], dim=1)
         measurement_features = self.measurement_net(measurement_tensor)
 
-        # Combine all features
-        combined_features = torch.cat([image_features, measurement_features], dim=1)
+        # Process projectile features if present
+        if self.has_projectile_features:
+            projectile_features = observations["projectile_features"]
+            if len(projectile_features.shape) == 1:
+                projectile_features = projectile_features.unsqueeze(0)
+            projectile_features = self.projectile_net(projectile_features)
+            # Combine all features
+            combined_features = torch.cat(
+                [image_features, measurement_features, projectile_features], dim=1
+            )
+        else:
+            # Combine image and measurement features
+            combined_features = torch.cat([image_features, measurement_features], dim=1)
+
         return self.combined_net(combined_features)
 
 
@@ -260,10 +301,13 @@ class DFPPolicy(ActorCriticPolicy):
             **kwargs,
         )
 
+        # Get measurement dimensions from observation space
+        measurement_dims = observation_space.spaces["measurements"].shape[0]
+
         # Create enhanced prediction head
         self.dfp_predictor = DFPPredictionHead(
             input_dim=512,
-            measurement_dims=3,
+            measurement_dims=measurement_dims,
             prediction_horizons=[1, 3, 5, 10, 20],
             horizon_weights=[1.0, 0.95, 0.9, 0.8, 0.7],  # More emphasis on near future
         )
@@ -367,115 +411,6 @@ class DFPLoss:
         return total_loss
 
 
-# DFP prediction head for value function
-class DFPPredictionHead(nn.Module):
-    def __init__(
-        self, input_dim, measurement_dims=3, prediction_horizons=[1, 3, 5, 10, 20]
-    ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.measurement_dims = measurement_dims
-        self.prediction_horizons = prediction_horizons
-        self.n_horizons = len(prediction_horizons)
-        self.output_dim = measurement_dims * self.n_horizons
-        self.prediction_net = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, self.output_dim),
-        )
-
-    def forward(self, features):
-        predictions = self.prediction_net(features)
-        return predictions
-
-    def get_measurements_for_horizon(self, predictions, horizon_idx):
-        start_idx = horizon_idx * self.measurement_dims
-        end_idx = start_idx + self.measurement_dims
-        return predictions[:, start_idx:end_idx]
-
-
-# Custom DFP policy for PPO
-class DFPPolicy(ActorCriticPolicy):
-    def __init__(self, observation_space, action_space, lr_schedule, *args, **kwargs):
-        super().__init__(
-            observation_space=observation_space,
-            action_space=action_space,
-            lr_schedule=lr_schedule,
-            features_extractor_class=DFPFeaturesExtractor,
-            features_extractor_kwargs={"features_dim": 512},
-            *args,
-            **kwargs,
-        )
-        self.dfp_predictor = DFPPredictionHead(
-            input_dim=512, measurement_dims=3, prediction_horizons=[1, 3, 5, 10, 20]
-        )
-
-    def forward(self, obs, deterministic=False):
-        features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
-        distribution = self._get_action_dist_from_latent(latent_pi)
-        actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.log_prob(actions)
-        values = self.value_net(latent_vf)
-        return actions, values, log_prob
-
-    def predict_future_measurements(self, obs):
-        features = self.extract_features(obs)
-        predictions = self.dfp_predictor(features)
-        return predictions
-
-    def evaluate_actions(self, obs, actions):
-        features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
-        distribution = self._get_action_dist_from_latent(latent_pi)
-        log_prob = distribution.log_prob(actions)
-        values = self.value_net(latent_vf)
-        entropy = distribution.entropy()
-        return values, log_prob, entropy
-
-
-# Custom DFP loss function for PPO
-class DFPLoss:
-    def __init__(self, policy, prediction_weight=0.5):
-        self.policy = policy
-        self.prediction_weight = prediction_weight
-        self.prediction_loss = nn.MSELoss()
-
-    def __call__(self, rollout_data):
-        obs = rollout_data.observations
-        actions = rollout_data.actions
-        values, log_prob, entropy = self.policy.evaluate_actions(obs, actions)
-        advantages = rollout_data.advantages
-        returns = rollout_data.returns
-        policy_loss = -(advantages * log_prob).mean()
-        value_loss = nn.functional.mse_loss(values, returns)
-        entropy_loss = -entropy.mean()
-        prediction_loss = torch.tensor(0.0)
-        if hasattr(rollout_data, "future_measurements"):
-            future_measurements = rollout_data.future_measurements
-            predictions = self.policy.predict_future_measurements(obs)
-            for i, horizon in enumerate(self.policy.dfp_predictor.prediction_horizons):
-                horizon_key = f"future_{horizon}"
-                if horizon_key in future_measurements:
-                    horizon_preds = (
-                        self.policy.dfp_predictor.get_measurements_for_horizon(
-                            predictions, i
-                        )
-                    )
-                    targets = future_measurements[horizon_key]
-                    horizon_loss = self.prediction_loss(horizon_preds, targets)
-                    prediction_loss += horizon_loss
-        total_loss = (
-            policy_loss
-            + 0.5 * value_loss
-            - 0.01 * entropy_loss
-            + self.prediction_weight * prediction_loss
-        )
-        return total_loss
-
-
 def create_dfp_model(env, resume=False, model_path=MODEL_PATH):
     if resume and os.path.exists(model_path):
         logger.info(f"Loading existing DFP model from {model_path}")
@@ -491,6 +426,7 @@ def create_dfp_model(env, resume=False, model_path=MODEL_PATH):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
+    # Create model directory if needed
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
 
     model = PPO(
@@ -519,7 +455,7 @@ def create_dfp_model(env, resume=False, model_path=MODEL_PATH):
     return model
 
 
-# Simplified training callback with logging
+# Enhanced training callback with additional metrics
 class TrainingCallback(BaseCallback):
     def __init__(
         self, log_freq=1000, log_dir="logs", model_path=MODEL_PATH, save_freq=50000
@@ -535,13 +471,24 @@ class TrainingCallback(BaseCallback):
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs(os.path.join(log_dir, "checkpoints"), exist_ok=True)
 
+        # Determine metrics to track based on environment configuration
+        self.track_projectiles = ENV_CONFIG["detect_projectiles"]
+        self.track_combat = ENV_CONFIG["aggressive_combat"]
+
+        # Create appropriate metrics header
+        metrics_header = (
+            "timestamp,steps,mean_reward,mean_score,mean_damage,mean_progress,max_stage"
+        )
+        if self.track_projectiles:
+            metrics_header += ",projectile_threats,projectile_avoidance"
+        if self.track_combat:
+            metrics_header += ",combat_engagement"
+
         self.metrics_file = os.path.join(log_dir, "training_metrics.csv")
 
         if not os.path.exists(self.metrics_file):
             with open(self.metrics_file, "w") as f:
-                f.write(
-                    "timestamp,steps,mean_reward,mean_score,mean_damage,mean_progress,max_stage\n"
-                )
+                f.write(metrics_header + "\n")
 
     def _on_step(self):
         if self.n_calls % self.log_freq == 0:
@@ -551,6 +498,9 @@ class TrainingCallback(BaseCallback):
             mean_damage = 0
             mean_progress = 0
             max_stage = 0
+            projectile_threats = 0
+            projectile_avoidance = 0
+            combat_engagement = 0
 
             if hasattr(self.model, "ep_info_buffer") and self.model.ep_info_buffer:
                 valid_episodes = [
@@ -570,24 +520,70 @@ class TrainingCallback(BaseCallback):
                         ep_info.get("current_stage", 0) for ep_info in valid_episodes
                     ]
 
+                    # Track projectile metrics if enabled
+                    if self.track_projectiles:
+                        proj_threats = [
+                            ep_info.get("projectile_threats", 0)
+                            for ep_info in valid_episodes
+                        ]
+                        proj_avoidance = [
+                            ep_info.get("projectile_avoided", 0)
+                            for ep_info in valid_episodes
+                        ]
+                        projectile_threats = (
+                            np.mean(proj_threats) if proj_threats else 0
+                        )
+                        projectile_avoidance = (
+                            np.mean(proj_avoidance) if proj_avoidance else 0
+                        )
+
+                    # Track combat metrics if enabled
+                    if self.track_combat:
+                        combat_rewards = [
+                            ep_info.get("combat_engagement_reward", 0)
+                            for ep_info in valid_episodes
+                        ]
+                        combat_engagement = (
+                            np.mean(combat_rewards) if combat_rewards else 0
+                        )
+
                     mean_score = np.mean(scores) if scores else 0
                     mean_damage = np.mean(damages) if damages else 0
                     mean_progress = np.mean(progress) if progress else 0
                     max_stage = np.max(stages) if stages else 0
 
-            logger.info(
+            # Build log message
+            log_msg = (
                 f"Step: {self.n_calls}, Mean reward: {mean_reward:.2f}, "
                 f"Mean score: {mean_score:.1f}, Mean damage: {mean_damage:.1f}, "
                 f"Mean progress: {mean_progress:.1f}, Max stage: {max_stage}"
             )
 
+            # Add projectile metrics to log if enabled
+            if self.track_projectiles:
+                log_msg += f", Projectile threats: {projectile_threats:.2f}, Avoidance: {projectile_avoidance:.2f}"
+
+            # Add combat metrics to log if enabled
+            if self.track_combat:
+                log_msg += f", Combat engagement: {combat_engagement:.2f}"
+
+            logger.info(log_msg)
+
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
+                # Build metrics data string
+                metrics = f"{timestamp},{self.n_calls},{mean_reward:.2f},{mean_score:.1f},{mean_damage:.1f},{mean_progress:.1f},{max_stage}"
+
+                # Add projectile metrics if enabled
+                if self.track_projectiles:
+                    metrics += f",{projectile_threats:.2f},{projectile_avoidance:.2f}"
+
+                # Add combat metrics if enabled
+                if self.track_combat:
+                    metrics += f",{combat_engagement:.2f}"
+
                 with open(self.metrics_file, "a") as f:
-                    f.write(
-                        f"{timestamp},{self.n_calls},{mean_reward:.2f},{mean_score:.1f},"
-                        f"{mean_damage:.1f},{mean_progress:.1f},{max_stage}\n"
-                    )
+                    f.write(metrics + "\n")
             except Exception as e:
                 logger.error(f"Error writing to metrics file: {e}")
 
@@ -618,31 +614,79 @@ def plot_training_metrics(metrics_file="logs/training_metrics.csv"):
     if os.path.exists(metrics_file):
         try:
             metrics = pd.read_csv(metrics_file)
-            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
-            axes[0, 0].plot(metrics["steps"], metrics["mean_reward"])
-            axes[0, 0].set_title("Mean Reward vs. Training Steps")
-            axes[0, 0].set_xlabel("Steps")
-            axes[0, 0].set_ylabel("Mean Reward")
-            axes[0, 0].grid(True)
+            # Determine how many plots to create based on available columns
+            plot_projectiles = "projectile_threats" in metrics.columns
+            plot_combat = "combat_engagement" in metrics.columns
 
-            axes[0, 1].plot(metrics["steps"], metrics["mean_score"])
-            axes[0, 1].set_title("Mean Score vs. Training Steps")
-            axes[0, 1].set_xlabel("Steps")
-            axes[0, 1].set_ylabel("Score")
-            axes[0, 1].grid(True)
+            # Calculate grid size based on available metrics
+            base_plots = 4  # Reward, Score, Damage, Progress
+            total_plots = base_plots
+            if plot_projectiles:
+                total_plots += 1
+            if plot_combat:
+                total_plots += 1
 
-            axes[1, 0].plot(metrics["steps"], metrics["mean_damage"])
-            axes[1, 0].set_title("Mean Damage vs. Training Steps")
-            axes[1, 0].set_xlabel("Steps")
-            axes[1, 0].set_ylabel("Damage")
-            axes[1, 0].grid(True)
+            # Calculate rows and columns for subplot grid
+            rows = (total_plots + 1) // 2  # Ceiling division
+            cols = 2
 
-            axes[1, 1].plot(metrics["steps"], metrics["mean_progress"])
-            axes[1, 1].set_title("Mean Progress vs. Training Steps")
-            axes[1, 1].set_xlabel("Steps")
-            axes[1, 1].set_ylabel("Progress")
-            axes[1, 1].grid(True)
+            fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows))
+
+            # Flatten axes for easier indexing
+            if rows > 1:
+                axes = axes.flatten()
+
+            # Core metrics
+            axes[0].plot(metrics["steps"], metrics["mean_reward"])
+            axes[0].set_title("Mean Reward vs. Training Steps")
+            axes[0].set_xlabel("Steps")
+            axes[0].set_ylabel("Mean Reward")
+            axes[0].grid(True)
+
+            axes[1].plot(metrics["steps"], metrics["mean_score"])
+            axes[1].set_title("Mean Score vs. Training Steps")
+            axes[1].set_xlabel("Steps")
+            axes[1].set_ylabel("Score")
+            axes[1].grid(True)
+
+            axes[2].plot(metrics["steps"], metrics["mean_damage"])
+            axes[2].set_title("Mean Damage vs. Training Steps")
+            axes[2].set_xlabel("Steps")
+            axes[2].set_ylabel("Damage")
+            axes[2].grid(True)
+
+            axes[3].plot(metrics["steps"], metrics["mean_progress"])
+            axes[3].set_title("Mean Progress vs. Training Steps")
+            axes[3].set_xlabel("Steps")
+            axes[3].set_ylabel("Progress")
+            axes[3].grid(True)
+
+            # Plot projectile metrics if available
+            if plot_projectiles:
+                axes[4].plot(
+                    metrics["steps"], metrics["projectile_threats"], label="Threats"
+                )
+                if "projectile_avoidance" in metrics.columns:
+                    axes[4].plot(
+                        metrics["steps"],
+                        metrics["projectile_avoidance"],
+                        label="Avoidance",
+                    )
+                axes[4].set_title("Projectile Metrics vs. Training Steps")
+                axes[4].set_xlabel("Steps")
+                axes[4].set_ylabel("Value")
+                axes[4].legend()
+                axes[4].grid(True)
+
+            # Plot combat metrics if available
+            if plot_combat:
+                idx = 5 if plot_projectiles else 4
+                axes[idx].plot(metrics["steps"], metrics["combat_engagement"])
+                axes[idx].set_title("Combat Engagement vs. Training Steps")
+                axes[idx].set_xlabel("Steps")
+                axes[idx].set_ylabel("Value")
+                axes[idx].grid(True)
 
             plt.tight_layout()
             plt.savefig(os.path.join(plots_dir, "training_metrics.png"))
@@ -682,7 +726,14 @@ def train_model(model, timesteps):
 
 def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
     logger.info(f"Evaluating model from {model_path}")
-    env = make_kungfu_env(is_play_mode=render, frame_stack=4, use_dfp=True)
+    env = make_kungfu_env(
+        is_play_mode=render,
+        frame_stack=4,
+        use_dfp=True,
+        detect_projectiles=ENV_CONFIG["detect_projectiles"],
+        aggressive_progress=ENV_CONFIG["aggressive_progress"],
+        aggressive_combat=ENV_CONFIG["aggressive_combat"],
+    )
     active_environments.add(env)
     try:
         logger.info(f"Loading model from {model_path}")
@@ -693,6 +744,10 @@ def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
         episode_progress = []
         max_stage_reached = 0
 
+        # Track specialized metrics if enabled
+        projectile_metrics = []
+        combat_metrics = []
+
         for episode in range(num_episodes):
             obs, info = env.reset()
             done = False
@@ -701,17 +756,27 @@ def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
             episode_damage = 0
             episode_prog = 0
             current_stage = 0
+            projectile_metric = 0
+            combat_metric = 0
 
             while not done:
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 episode_reward += reward
+
+                # Extract info from step
                 if isinstance(info, dict):
                     episode_score += info.get("score_increase", 0)
                     episode_damage += info.get("damage_taken", 0)
                     episode_prog += info.get("progress_made", 0)
                     current_stage = max(current_stage, info.get("current_stage", 0))
+
+                    # Track specialized metrics
+                    if ENV_CONFIG["detect_projectiles"]:
+                        projectile_metric += info.get("projectile_avoidance_reward", 0)
+                    if ENV_CONFIG["aggressive_combat"]:
+                        combat_metric += info.get("combat_engagement_reward", 0)
 
             episode_rewards.append(episode_reward)
             episode_scores.append(episode_score)
@@ -719,17 +784,37 @@ def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
             episode_progress.append(episode_prog)
             max_stage_reached = max(max_stage_reached, current_stage)
 
-            logger.info(
+            # Record specialized metrics
+            if ENV_CONFIG["detect_projectiles"]:
+                projectile_metrics.append(projectile_metric)
+            if ENV_CONFIG["aggressive_combat"]:
+                combat_metrics.append(combat_metric)
+
+            # Build evaluation log message
+            eval_msg = (
                 f"Episode {episode+1}/{num_episodes}: Reward={episode_reward:.2f}, "
                 f"Score={episode_score:.1f}, Damage={episode_damage:.1f}, "
                 f"Progress={episode_prog:.1f}, Stage={current_stage}"
             )
+
+            # Add specialized metrics to log
+            if ENV_CONFIG["detect_projectiles"]:
+                eval_msg += f", Projectile={projectile_metric:.2f}"
+            if ENV_CONFIG["aggressive_combat"]:
+                eval_msg += f", Combat={combat_metric:.2f}"
+
+            logger.info(eval_msg)
 
         avg_reward = np.mean(episode_rewards)
         avg_score = np.mean(episode_scores)
         avg_damage = np.mean(episode_damages)
         avg_progress = np.mean(episode_progress)
 
+        # Calculate specialized averages
+        avg_projectile = np.mean(projectile_metrics) if projectile_metrics else 0
+        avg_combat = np.mean(combat_metrics) if combat_metrics else 0
+
+        # Log results summary
         logger.info(f"Evaluation results over {num_episodes} episodes:")
         logger.info(f"Average reward: {avg_reward:.2f}")
         logger.info(f"Average score: {avg_score:.1f}")
@@ -737,13 +822,28 @@ def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
         logger.info(f"Average progress: {avg_progress:.1f}")
         logger.info(f"Max stage reached: {max_stage_reached}")
 
-        return {
+        # Log specialized results
+        if ENV_CONFIG["detect_projectiles"]:
+            logger.info(f"Average projectile avoidance metric: {avg_projectile:.2f}")
+        if ENV_CONFIG["aggressive_combat"]:
+            logger.info(f"Average combat engagement: {avg_combat:.2f}")
+
+        # Build and return results dictionary
+        results = {
             "avg_reward": avg_reward,
             "avg_score": avg_score,
             "avg_damage": avg_damage,
             "avg_progress": avg_progress,
             "max_stage": max_stage_reached,
         }
+
+        # Add specialized metrics to results
+        if ENV_CONFIG["detect_projectiles"]:
+            results["avg_projectile"] = avg_projectile
+        if ENV_CONFIG["aggressive_combat"]:
+            results["avg_combat"] = avg_combat
+
+        return results
     except Exception as e:
         logger.error(f"Error during evaluation: {e}")
         logger.error(traceback.format_exc())
@@ -756,7 +856,7 @@ def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train a Direct Future Prediction agent for Kung Fu Master"
+        description="Train a Direct Future Prediction agent for Kung Fu Master with enhanced combat and projectile handling"
     )
     parser.add_argument(
         "--timesteps", type=int, default=1000000, help="Number of timesteps to train"
@@ -775,7 +875,70 @@ def main():
         action="store_true",
         help="Plot training metrics after training",
     )
+    # Add new arguments for enhanced features
+    parser.add_argument(
+        "--projectiles",
+        action="store_true",
+        help="Enable projectile detection and avoidance",
+    )
+    parser.add_argument(
+        "--no-aggressive-progress",
+        action="store_true",
+        help="Disable aggressive progression through levels",
+    )
+    parser.add_argument(
+        "--no-aggressive-combat",
+        action="store_true",
+        help="Disable aggressive combat engagement",
+    )
+    parser.add_argument(
+        "--projectile-weight",
+        type=float,
+        default=1.5,
+        help="Weight for projectile avoidance rewards (default: 1.5)",
+    )
+    parser.add_argument(
+        "--combat-weight",
+        type=float,
+        default=1.2,
+        help="Weight for combat engagement rewards (default: 1.2)",
+    )
+    parser.add_argument(
+        "--progression-weight",
+        type=float,
+        default=1.5,
+        help="Weight for progression rewards (default: 1.5)",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=MODEL_PATH,
+        help=f"Path to save or load model (default: {MODEL_PATH})",
+    )
+
     args = parser.parse_args()
+
+    # Override model path if provided
+    if args.model_path != MODEL_PATH:
+        global MODEL_PATH
+        MODEL_PATH = args.model_path
+        logger.info(f"Using custom model path: {MODEL_PATH}")
+
+    # Set environment configuration from arguments
+    ENV_CONFIG["detect_projectiles"] = args.projectiles
+    ENV_CONFIG["aggressive_progress"] = not args.no_aggressive_progress
+    ENV_CONFIG["aggressive_combat"] = not args.no_aggressive_combat
+    ENV_CONFIG["projectile_avoidance_weight"] = args.projectile_weight
+    ENV_CONFIG["combat_engagement_weight"] = args.combat_weight
+    ENV_CONFIG["progression_weight"] = args.progression_weight
+
+    logger.info("Environment configuration:")
+    logger.info(f"  detect_projectiles: {ENV_CONFIG['detect_projectiles']}")
+    logger.info(f"  aggressive_progress: {ENV_CONFIG['aggressive_progress']}")
+    logger.info(f"  aggressive_combat: {ENV_CONFIG['aggressive_combat']}")
+    logger.info(f"  projectile_weight: {ENV_CONFIG['projectile_avoidance_weight']}")
+    logger.info(f"  combat_weight: {ENV_CONFIG['combat_engagement_weight']}")
+    logger.info(f"  progression_weight: {ENV_CONFIG['progression_weight']}")
 
     if args.eval_only:
         if not os.path.exists(MODEL_PATH):
@@ -786,21 +949,37 @@ def main():
         return
 
     try:
-        logger.info("Creating Kung Fu Master environment with DFP...")
+        logger.info("Creating Kung Fu Master environment with enhanced capabilities...")
         gc.collect()
         time.sleep(1)
-        env = make_kungfu_env(is_play_mode=args.render, frame_stack=4, use_dfp=True)
+        env = make_kungfu_env(
+            is_play_mode=args.render,
+            frame_stack=4,
+            use_dfp=True,
+            detect_projectiles=ENV_CONFIG["detect_projectiles"],
+            aggressive_progress=ENV_CONFIG["aggressive_progress"],
+            aggressive_combat=ENV_CONFIG["aggressive_combat"],
+            projectile_weight=ENV_CONFIG["projectile_avoidance_weight"],
+            combat_weight=ENV_CONFIG["combat_engagement_weight"],
+            progression_weight=ENV_CONFIG["progression_weight"],
+        )
         active_environments.add(env)
+
         logger.info("Creating DFP model...")
         model = create_dfp_model(env, resume=args.resume, model_path=MODEL_PATH)
+
         train_model(model, args.timesteps)
+
         logger.info("Closing training environment")
         env.close()
         active_environments.discard(env)
+
         if args.plot_metrics:
             plot_training_metrics()
+
         logger.info("Evaluating trained model...")
         evaluate_model(MODEL_PATH, num_episodes=5, render=True)
+
         logger.info("Training completed")
     except Exception as e:
         logger.error(f"Unhandled exception in main: {e}")
