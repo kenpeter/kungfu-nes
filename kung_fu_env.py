@@ -306,11 +306,46 @@ class KungFuMasterEnv(gym.Wrapper):
                     f"HP: {current_hp}, Score: {current_score}, Time left: {time_left:.1f}s"
                 )
 
-            reward = score_diff * 0.1
+            # Enhanced reward structure to encourage engagement
+
+            # Score-based rewards (increased from 0.1 to 0.3 to make it more significant)
+            # Since score increases when defeating enemies, this rewards combat
+            reward = score_diff * 0.3
+
+            # Stage progression rewards
             if current_stage > self.prev_stage:
-                reward += 10.0
+                reward += 15.0  # Increased from 10.0
+
+            # Forward progress rewards
+            if progress > 0:
+                # Reward for moving forward (strategic positioning)
+                reward += progress * 0.05
+
+            # Damage penalties - reduced to avoid excessive risk aversion
             if damage_taken > 0:
-                reward -= damage_taken * 0.1
+                # Reduce penalty by half (from 0.1 to 0.05)
+                reward -= damage_taken * 0.05
+
+            # Position-based rewards (strategic positioning)
+            # Reward for staying in mid-level Y position (optimal for many attacks)
+            optimal_y = 160  # Approximate mid-level Y position
+            y_distance = abs(current_y_pos - optimal_y)
+            if y_distance < 30:  # If player is in a strategic height
+                reward += 0.02
+
+            # Small constant reward for staying alive
+            reward += 0.01
+
+            # Track enemy defeats based on score increases
+            # In Kung Fu Master, score typically increases when defeating enemies
+            enemies_defeated = 0
+            if score_diff >= 100:
+                enemies_defeated = (
+                    score_diff // 100
+                )  # Rough estimate based on game mechanics
+
+            # Track attack attempts (can be estimated from player actions)
+            attack_attempt = action in [1, 6, 7, 9]  # Action indices for attack moves
 
             info.update(
                 {
@@ -323,6 +358,13 @@ class KungFuMasterEnv(gym.Wrapper):
                     "damage_taken": damage_taken,
                     "progress_made": progress,
                     "time_remaining": (MAX_EPISODE_STEPS - self.episode_steps) / 30,
+                    "enemies_defeated": enemies_defeated,
+                    "attack_attempt": int(
+                        attack_attempt
+                    ),  # 1 if player attempted attack, 0 otherwise
+                    "strategic_position": int(
+                        abs(current_y_pos - 160) < 30
+                    ),  # 1 if in strategic height
                 }
             )
 
@@ -345,6 +387,59 @@ class KungFuMasterEnv(gym.Wrapper):
         except Exception as e:
             logger.error(f"Error closing KungFuMasterEnv: {e}")
         RetroEnvManager.get_instance().unregister_env(self)
+
+
+# but why we have (H, W, C) in the first place, coming from open cv?
+class TransposeObservation(gym.ObservationWrapper):
+    """
+    Transpose image observation from HWC format (Height, Width, Channel)
+    to CHW format (Channel, Height, Width) for PyTorch's CNNs.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+
+        # If we're wrapping a Dict observation space
+        if isinstance(env.observation_space, spaces.Dict):
+            # Extract image space from the Dict
+            image_space = env.observation_space.spaces["image"]
+            # Get original dimensions
+            h, w, c = image_space.shape
+
+            # Update the image space shape - transpose dimensions
+            transposed_image_space = spaces.Box(
+                low=0, high=255, shape=(c, h, w), dtype=np.uint8  # CHW format
+            )
+
+            # Create new Dict space with updated image space
+            spaces_dict = dict(env.observation_space.spaces)
+            spaces_dict["image"] = transposed_image_space
+            self.observation_space = spaces.Dict(spaces_dict)
+        else:
+            # If it's just a Box space (simple image)
+            h, w, c = env.observation_space.shape
+
+            # Create new transposed observation space
+            self.observation_space = spaces.Box(
+                low=0, high=255, shape=(c, h, w), dtype=np.uint8  # CHW format
+            )
+
+        logger.info(
+            f"TransposeObservation initialized. New obs shape: {self.observation_space}"
+        )
+
+    def observation(self, observation):
+        """
+        Transpose observation to CHW format
+        """
+        # For Dict observation space
+        if isinstance(observation, dict) and "image" in observation:
+            # Transpose only the image part
+            observation["image"] = np.transpose(observation["image"], (2, 0, 1))
+            return observation
+        else:
+            # For simple image observation
+            return np.transpose(observation, (2, 0, 1))
 
 
 class DFPKungFuWrapper(gym.Wrapper):
@@ -381,16 +476,28 @@ class DFPKungFuWrapper(gym.Wrapper):
         else:
             raise ValueError("Expected Box observation space for base env")
 
-        # Define stacked image space
-        stacked_shape = self.image_shape[:-1] + (self.image_shape[-1] * frame_stack,)
+        # Define stacked image space - now using CHW format
+        if len(self.image_shape) == 3 and self.image_shape[0] in [
+            1,
+            3,
+            4,
+        ]:  # Already in CHW format
+            channels, height, width = self.image_shape
+            stacked_shape = (channels * frame_stack, height, width)
+        else:
+            # Default to assuming HWC format that needs conversion
+            stacked_shape = (self.image_shape[-1] * frame_stack,) + self.image_shape[
+                :-1
+            ]
+
         self.stacked_image_space = gym.spaces.Box(
             low=0, high=255, shape=stacked_shape, dtype=np.uint8
         )
 
-        # Modify goal vector to include projectile avoidance priority
+        # Modify goal vector with more balanced weights to avoid excessive risk aversion
         # [score increase, damage avoidance, progress]
-        # Higher weight on damage avoidance helps avoid projectiles
-        self.goals = np.array([1.0, -1.5, 1.0], dtype=np.float32)
+        # Reduced weight on damage avoidance to balance with other goals
+        self.goals = np.array([1.0, -1.0, 1.0], dtype=np.float32)
 
         # Observation space
         self.observation_space = spaces.Dict(
@@ -421,10 +528,10 @@ class DFPKungFuWrapper(gym.Wrapper):
         )
 
     def _get_measurements(self, info):
-        # Standard measurement calculation
+        # Enhanced measurement calculation with engagement metrics
         measurements = np.zeros(self.measurement_dims, dtype=np.float32)
 
-        # Get scores with normalization
+        # Get scores with normalization (indicates enemy defeats)
         score_increase = min(info.get("score_increase", 0), self.score_max)
         measurements[0] = score_increase / self.score_max
 
@@ -440,13 +547,14 @@ class DFPKungFuWrapper(gym.Wrapper):
         progress_made = min(info.get("progress_made", 0), self.progress_max)
         measurements[2] = progress_made / self.progress_max
 
-        # Adapt to repeated damage patterns
+        # More balanced goal adaptation
         if len(self.recent_damages) > 5 and np.mean(self.recent_damages) > 10:
             # If taking a lot of damage recently, increase weight of damage avoidance
-            self.goals[1] = min(-2.0, self.goals[1] * 1.1)  # Increase up to -2.0
+            # But not as extremely as before (-1.5 max instead of -2.0)
+            self.goals[1] = min(-1.5, self.goals[1] * 1.05)
         else:
-            # Gradually return to normal if not taking much damage
-            self.goals[1] = max(-1.5, self.goals[1] * 0.99)  # Return toward -1.5
+            # Return to normal more quickly if not taking much damage
+            self.goals[1] = max(-1.0, self.goals[1] * 0.95)  # Return toward -1.0
 
         return measurements
 
@@ -458,7 +566,17 @@ class DFPKungFuWrapper(gym.Wrapper):
                 if self.image_buffer
                 else np.zeros(self.image_shape, dtype=np.uint8)
             )
-        return np.concatenate(self.image_buffer, axis=-1)
+
+        # Stack images in the CHW format (stacking along channel dimension)
+        if len(self.image_shape) == 3 and self.image_shape[0] in [
+            1,
+            3,
+            4,
+        ]:  # Already in CHW format
+            return np.concatenate(self.image_buffer, axis=0)
+        else:
+            # Default behavior for older code structure
+            return np.concatenate(self.image_buffer, axis=-1)
 
     def reset(self, **kwargs):
         obs_result = self.env.reset(**kwargs)
@@ -599,6 +717,10 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
 
     logger.info("Applying KungFuMasterEnv wrapper")
     env = KungFuMasterEnv(env)
+
+    # Add the TransposeObservation wrapper before the DFP wrapper
+    logger.info("Applying TransposeObservation wrapper")
+    env = TransposeObservation(env)
 
     if use_dfp:
         logger.info("Adding Direct Future Prediction wrapper with frame stacking")
