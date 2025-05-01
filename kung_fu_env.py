@@ -297,7 +297,11 @@ class KungFuMasterEnv(gym.Wrapper):
             dy = abs(enemy["y"] - player_y)
             distance = (dx**2 + dy**2) ** 0.5
             distances.append((distance, enemy))
-        distances.sort()
+
+        # Use a key function to explicitly sort by the distance value only
+        # This prevents Python from trying to compare the enemy dictionaries
+        distances.sort(key=lambda x: x[0])
+
         return distances[0] if distances else (999, None)
 
     def calculate_engagement_status(self, enemies, player_x, player_y):
