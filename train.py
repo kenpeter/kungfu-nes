@@ -10,7 +10,6 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.policies import ActorCriticPolicy
-import matplotlib.pyplot as plt
 import logging
 import signal
 import atexit
@@ -26,14 +25,6 @@ logging.basicConfig(
     filename="kungfu_training.log",
 )
 logger = logging.getLogger("kungfu_train")
-
-
-goals_config = {
-    "balanced": [0.3, -0.2, 0.5],  # Balance score, damage avoidance, and progress
-    "aggressive": [0.5, -0.1, 0.4],  # Higher emphasis on score (combat)
-    "cautious": [0.2, -0.4, 0.4],  # Higher emphasis on damage avoidance
-    "speedrun": [0.1, -0.1, 0.8],  # Very high emphasis on progress
-}
 
 # Setup console handler for important messages
 console = logging.StreamHandler()
@@ -108,7 +99,7 @@ except ImportError:
     import gym
 
 
-# Enhanced DFP feature extractor
+# Simplified DFP feature extractor focused on aggressive combat and progression
 class DFPFeaturesExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=512):
         super().__init__(observation_space, features_dim)
@@ -116,10 +107,36 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
         # Get image space from observation space
         self.image_space = observation_space.spaces["image"]
 
+        # Initialize counter for logging
+        self.n_calls = 0
+
+        # Set frame stack size (based on the shape of the observation space)
+        # For channel-first observations, frame_stack is the first dimension
+        # For channel-last observations with LazyFrames, we need to determine the frame stack in forward()
+        if len(self.image_space.shape) >= 3:
+            if self.image_space.shape[0] == 4:  # Channel-first with 4 frames
+                self.frame_stack = 4
+            else:
+                self.frame_stack = 4  # Default to 4 frames
+        else:
+            self.frame_stack = 4  # Default
+
         # Number of channels (includes frame stacking)
-        n_input_channels = self.image_space.shape[0]
-        height = self.image_space.shape[1]
-        width = self.image_space.shape[2]
+        # Handle different image formats (channels first or channels last)
+        if len(self.image_space.shape) == 3 and self.image_space.shape[-1] == 1:
+            # Channel last format: (H, W, C)
+            n_input_channels = self.image_space.shape[-1] * 4  # 4-frame stack
+            height = self.image_space.shape[0]
+            width = self.image_space.shape[1]
+        else:
+            # Channel first format: (C, H, W)
+            n_input_channels = self.image_space.shape[0]
+            height = self.image_space.shape[1]
+            width = self.image_space.shape[2]
+
+        logger.info(
+            f"Image shape: {self.image_space.shape}, Using channels: {n_input_channels}, height: {height}, width: {width}"
+        )
 
         # Get measurement and goal dimensions
         self.measurement_dim = observation_space.spaces["measurements"].shape[0]
@@ -129,8 +146,7 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
             f"DFP Feature Extractor - Image shape: {self.image_space.shape}, Measurements: {self.measurement_dim}"
         )
 
-        # Enhanced CNN with more attention to spatial features
-        # Using smaller strides and more filters in early layers to preserve spatial information
+        # CNN for image processing
         self.cnn = nn.Sequential(
             nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
@@ -138,32 +154,68 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
             nn.ReLU(),
-            # Adding attention mechanism to focus on important spatial features
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
             nn.Flatten(),
         )
 
-        # Compute CNN output size with a dummy input
-        with torch.no_grad():
-            dummy_img = torch.zeros((1, n_input_channels, height, width))
-            cnn_out = self.cnn(dummy_img)
-            self.cnn_out_size = cnn_out.shape[1]
-        logger.info(f"CNN output features: {self.cnn_out_size}")
+        # Determine if we're dealing with stacked frames as channels or as separate dim
+        self.channel_last = (
+            len(self.image_space.shape) == 3 and self.image_space.shape[-1] == 1
+        )
 
-        # Enhanced measurement network with cross-connections
+        # Create CNN based on image shape
+        if self.channel_last:
+            # For LazyGym style: frames are stacked as separate dim, not channels
+            # Shape is (frames, height, width, channels)
+            self.cnn = nn.Sequential(
+                nn.Conv2d(self.frame_stack, 32, kernel_size=8, stride=4, padding=0),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            # Test with dummy input in correct format
+            with torch.no_grad():
+                # For frame stack with channel last format (B, F, H, W, C)
+                dummy_img = torch.zeros((1, self.frame_stack, height, width, 1))
+                # Reshape to (B, F, H, W)
+                dummy_img = dummy_img.squeeze(-1)
+                cnn_out = self.cnn(dummy_img)
+                self.cnn_out_size = cnn_out.shape[1]
+        else:
+            # Traditional format: frames stacked as channels
+            # Shape is (channels, height, width)
+            self.cnn = nn.Sequential(
+                nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            # Test with dummy input
+            with torch.no_grad():
+                dummy_img = torch.zeros((1, n_input_channels, height, width))
+                cnn_out = self.cnn(dummy_img)
+                self.cnn_out_size = cnn_out.shape[1]
+
+        logger.info(
+            f"CNN output features: {self.cnn_out_size}, Channel last: {self.channel_last}"
+        )
+
+        # Simple measurement network
         measurement_input_size = self.measurement_dim + self.goal_dim
         self.measurement_net = nn.Sequential(
             nn.Linear(measurement_input_size, 128),
             nn.ReLU(),
             nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
         )
         self.measurement_out_size = 128
 
-        # Combined network with residual connections
+        # Combined network
         combined_size = self.cnn_out_size + self.measurement_out_size
         self.combined_net = nn.Sequential(
             nn.Linear(combined_size, 512),
@@ -173,10 +225,54 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
         )
 
     def forward(self, observations):
+        # Increment call counter
+        self.n_calls += 1
+
         # Process image input
         image_tensor = observations["image"]
+
+        # Log shape occasionally for debugging
+        if self.n_calls % 1000 == 0:
+            logger.info(f"Original image tensor shape: {image_tensor.shape}")
+
+        # Handle 5D tensor with shape [batch, frames, height, width, channels]
+        if len(image_tensor.shape) == 5:
+            batch_size = image_tensor.shape[0]
+            frames = image_tensor.shape[1]
+            height = image_tensor.shape[2]
+            width = image_tensor.shape[3]
+
+            # Remove channel dimension if it's 1
+            if image_tensor.shape[4] == 1:
+                image_tensor = image_tensor.squeeze(
+                    4
+                )  # Now [batch, frames, height, width]
+
+                # For channel-first format, permute to [batch, frames, height, width]
+                if not self.channel_last:
+                    # Handle single batch case separately
+                    if batch_size == 1:
+                        # [1, frames, height, width] -> use frames as channels
+                        image_tensor = image_tensor.squeeze(
+                            0
+                        )  # [frames, height, width]
+                        image_tensor = image_tensor.unsqueeze(
+                            0
+                        )  # [1, frames, height, width]
+
+        # Handle 4D tensor with shape [batch, height, width, frames] or [batch, frames, height, width]
+        elif len(image_tensor.shape) == 4:
+            # Check if it's channel-last format [batch, height, width, frames/channels]
+            if self.channel_last:
+                # If the last dimension is 1, squeeze it
+                if image_tensor.shape[3] == 1:
+                    image_tensor = image_tensor.squeeze(3)
+                    # Add stack dimension if needed
+                    image_tensor = image_tensor.unsqueeze(1)
+            # If it's already in correct format [batch, frames, height, width], do nothing
+
         # Normalize image
-        image_features = self.cnn(image_tensor / 255.0)
+        image_features = self.cnn(image_tensor.float() / 255.0)
 
         # Process measurements and goals
         measurements = observations["measurements"]
@@ -197,14 +293,13 @@ class DFPFeaturesExtractor(BaseFeaturesExtractor):
         return self.combined_net(combined_features)
 
 
-# Enhanced DFP prediction head with better temporal modeling
+# Simplified DFP prediction head
 class DFPPredictionHead(nn.Module):
     def __init__(
         self,
         input_dim,
         measurement_dims=3,
         prediction_horizons=[1, 3, 5, 10, 20],
-        # Different weighting for different horizons (more weight to near future)
         horizon_weights=[1.0, 0.9, 0.8, 0.7, 0.6],
     ):
         super().__init__()
@@ -215,13 +310,11 @@ class DFPPredictionHead(nn.Module):
         self.n_horizons = len(prediction_horizons)
         self.output_dim = measurement_dims * self.n_horizons
 
-        # Deeper network for better prediction accuracy
+        # Prediction network
         self.prediction_net = nn.Sequential(
-            nn.Linear(input_dim, 512),
+            nn.Linear(input_dim, 256),
             nn.ReLU(),
-            nn.Linear(512, 384),
-            nn.ReLU(),
-            nn.Linear(384, 256),
+            nn.Linear(256, 256),
             nn.ReLU(),
             nn.Linear(256, self.output_dim),
         )
@@ -260,10 +353,10 @@ class DFPPredictionHead(nn.Module):
         return weighted_sum
 
 
-# Enhanced DFP Policy with improved future prediction
+# Simplified DFP Policy focusing on aggressive combat and progression
 class DFPPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, *args, **kwargs):
-        # Initialize with enhanced feature extractor
+        # Initialize with feature extractor
         super().__init__(
             observation_space=observation_space,
             action_space=action_space,
@@ -275,14 +368,17 @@ class DFPPolicy(ActorCriticPolicy):
         )
 
         # Get measurement dimensions from observation space
-        measurement_dims = observation_space.spaces["measurements"].shape[0]
+        # Each measurement vector contains history for 5 time steps with 3 values each
+        # Total measurement vector size is 15 (3 measurements * 5 history steps)
+        # We need to extract just the number of base measurements (3)
+        measurement_dims = 3  # Hardcode to 3 for [score, damage, progress]
 
-        # Create enhanced prediction head
+        # Create prediction head
         self.dfp_predictor = DFPPredictionHead(
             input_dim=512,
             measurement_dims=measurement_dims,
             prediction_horizons=[1, 3, 5, 10, 20],
-            horizon_weights=[1.0, 0.95, 0.9, 0.8, 0.7],  # More emphasis on near future
+            horizon_weights=[1.0, 0.9, 0.8, 0.7, 0.6],
         )
 
     def forward(self, obs, deterministic=False):
@@ -301,12 +397,6 @@ class DFPPolicy(ActorCriticPolicy):
 
         return actions, values, log_prob
 
-    def predict_future_measurements(self, obs):
-        # Extract features and predict future measurements
-        features = self.extract_features(obs)
-        predictions = self.dfp_predictor(features)
-        return predictions
-
     def evaluate_actions(self, obs, actions):
         features = self.extract_features(obs)
         latent_pi, latent_vf = self.mlp_extractor(features)
@@ -324,64 +414,6 @@ class DFPPolicy(ActorCriticPolicy):
         goals = obs.get("goals", None)
         # Get weighted predictions
         return self.dfp_predictor.get_weighted_predictions(predictions, goals)
-
-
-# Enhanced DFP Loss function
-class DFPLoss:
-    def __init__(self, policy, prediction_weight=0.8):
-        self.policy = policy
-        self.prediction_weight = prediction_weight
-        # Use smooth L1 loss for better gradient properties with outliers
-        self.prediction_loss = nn.SmoothL1Loss()
-
-    def __call__(self, rollout_data):
-        obs = rollout_data.observations
-        actions = rollout_data.actions
-        values, log_prob, entropy = self.policy.evaluate_actions(obs, actions)
-        advantages = rollout_data.advantages
-        returns = rollout_data.returns
-
-        # Standard policy loss
-        policy_loss = -(advantages * log_prob).mean()
-        value_loss = nn.functional.mse_loss(values, returns)
-        entropy_loss = -entropy.mean()
-
-        # Initialize prediction loss
-        prediction_loss = torch.tensor(0.0, device=policy_loss.device)
-
-        # Calculate prediction loss if future measurements available
-        if hasattr(rollout_data, "future_measurements"):
-            future_measurements = rollout_data.future_measurements
-            predictions = self.policy.predict_future_measurements(obs)
-
-            # Calculate loss for each prediction horizon
-            for i, horizon in enumerate(self.policy.dfp_predictor.prediction_horizons):
-                horizon_key = f"future_{horizon}"
-                if horizon_key in future_measurements:
-                    # Get predictions and targets for this horizon
-                    horizon_preds = (
-                        self.policy.dfp_predictor.get_measurements_for_horizon(
-                            predictions, i
-                        )
-                    )
-                    targets = future_measurements[horizon_key]
-
-                    # Apply horizon-specific weight
-                    horizon_weight = self.policy.dfp_predictor.horizon_weights[i]
-                    horizon_loss = (
-                        self.prediction_loss(horizon_preds, targets) * horizon_weight
-                    )
-                    prediction_loss += horizon_loss
-
-        # Calculate total loss with adjusted weights
-        total_loss = (
-            policy_loss
-            + 0.5 * value_loss
-            - 0.01 * entropy_loss
-            + self.prediction_weight * prediction_loss
-        )
-
-        return total_loss
 
 
 def create_dfp_model(env, resume=False, model_path=MODEL_PATH):
@@ -419,7 +451,7 @@ def create_dfp_model(env, resume=False, model_path=MODEL_PATH):
         verbose=1,
         device=device,
         policy_kwargs=dict(
-            net_arch=dict(pi=[256, 256], vf=[256, 256]),  # Updated to avoid warning
+            net_arch=dict(pi=[256, 256], vf=[256, 256]),
             optimizer_class=torch.optim.Adam,
             optimizer_kwargs=dict(eps=1e-5),
         ),
@@ -428,7 +460,7 @@ def create_dfp_model(env, resume=False, model_path=MODEL_PATH):
     return model
 
 
-# Enhanced training callback with additional metrics
+# Training callback with focus on training metrics
 class TrainingCallback(BaseCallback):
     def __init__(
         self, log_freq=1000, log_dir="logs", model_path=MODEL_PATH, save_freq=50000
@@ -533,74 +565,6 @@ class TrainingCallback(BaseCallback):
         return True
 
 
-def plot_training_metrics(metrics_file="logs/training_metrics.csv"):
-    plots_dir = "logs/plots"
-    os.makedirs(plots_dir, exist_ok=True)
-
-    if os.path.exists(metrics_file):
-        try:
-            metrics = pd.read_csv(metrics_file)
-
-            # Calculate grid size
-            total_plots = 5  # Reward, Score, Damage, Progress, Combat
-            rows = 3
-            cols = 2
-
-            fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows))
-
-            # Flatten axes for easier indexing
-            axes = axes.flatten()
-
-            # Core metrics
-            axes[0].plot(metrics["steps"], metrics["mean_reward"])
-            axes[0].set_title("Mean Reward vs. Training Steps")
-            axes[0].set_xlabel("Steps")
-            axes[0].set_ylabel("Mean Reward")
-            axes[0].grid(True)
-
-            axes[1].plot(metrics["steps"], metrics["mean_score"])
-            axes[1].set_title("Mean Score vs. Training Steps")
-            axes[1].set_xlabel("Steps")
-            axes[1].set_ylabel("Score")
-            axes[1].grid(True)
-
-            axes[2].plot(metrics["steps"], metrics["mean_damage"])
-            axes[2].set_title("Mean Damage vs. Training Steps")
-            axes[2].set_xlabel("Steps")
-            axes[2].set_ylabel("Damage")
-            axes[2].grid(True)
-
-            axes[3].plot(metrics["steps"], metrics["mean_progress"])
-            axes[3].set_title("Mean Progress vs. Training Steps")
-            axes[3].set_xlabel("Steps")
-            axes[3].set_ylabel("Progress")
-            axes[3].grid(True)
-
-            # Plot combat metrics
-            axes[4].plot(metrics["steps"], metrics["combat_engagement"])
-            axes[4].set_title("Combat Engagement vs. Training Steps")
-            axes[4].set_xlabel("Steps")
-            axes[4].set_ylabel("Value")
-            axes[4].grid(True)
-
-            # Hide empty subplot
-            if len(axes) > total_plots:
-                axes[5].axis("off")
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(plots_dir, "training_metrics.png"))
-            plt.close()
-
-            logger.info(
-                f"Training metrics plotted and saved to {plots_dir}/training_metrics.png"
-            )
-        except Exception as e:
-            logger.error(f"Error plotting training metrics: {str(e)}")
-            logger.error(traceback.format_exc())
-    else:
-        logger.warning(f"Metrics file {metrics_file} not found.")
-
-
 def train_model(model, timesteps):
     callback = TrainingCallback(log_freq=1000, save_freq=50000)
     try:
@@ -623,163 +587,9 @@ def train_model(model, timesteps):
         logger.error(traceback.format_exc())
 
 
-def evaluate_model(model_path=MODEL_PATH, num_episodes=10, render=True):
-    logger.info(f"Evaluating model from {model_path}")
-    env = make_kungfu_env(is_play_mode=render, frame_stack=4, use_dfp=True)
-    active_environments.add(env)
-    try:
-        logger.info(f"Loading model from {model_path}")
-        model = PPO.load(model_path, env=env, policy=DFPPolicy)
-        episode_rewards = []
-        episode_scores = []
-        episode_damages = []
-        episode_progress = []
-        max_stage_reached = 0
-        combat_metrics = []
-
-        for episode in range(num_episodes):
-            obs, info = env.reset()
-            done = False
-            episode_reward = 0
-            episode_score = 0
-            episode_damage = 0
-            episode_prog = 0
-            current_stage = 0
-            combat_metric = 0
-
-            while not done:
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                episode_reward += reward
-
-                # Extract info from step
-                if isinstance(info, dict):
-                    episode_score += info.get("score_increase", 0)
-                    episode_damage += info.get("damage_taken", 0)
-                    episode_prog += info.get("progress_made", 0)
-                    current_stage = max(current_stage, info.get("current_stage", 0))
-                    combat_metric += info.get("combat_engagement_reward", 0)
-
-            episode_rewards.append(episode_reward)
-            episode_scores.append(episode_score)
-            episode_damages.append(episode_damage)
-            episode_progress.append(episode_prog)
-            max_stage_reached = max(max_stage_reached, current_stage)
-            combat_metrics.append(combat_metric)
-
-            # Build evaluation log message
-            eval_msg = (
-                f"Episode {episode+1}/{num_episodes}: Reward={episode_reward:.2f}, "
-                f"Score={episode_score:.1f}, Damage={episode_damage:.1f}, "
-                f"Progress={episode_prog:.1f}, Stage={current_stage}, "
-                f"Combat={combat_metric:.2f}"
-            )
-
-            logger.info(eval_msg)
-
-        avg_reward = np.mean(episode_rewards)
-        avg_score = np.mean(episode_scores)
-        avg_damage = np.mean(episode_damages)
-        avg_progress = np.mean(episode_progress)
-        avg_combat = np.mean(combat_metrics)
-
-        # Log results summary
-        logger.info(f"Evaluation results over {num_episodes} episodes:")
-        logger.info(f"Average reward: {avg_reward:.2f}")
-        logger.info(f"Average score: {avg_score:.1f}")
-        logger.info(f"Average damage: {avg_damage:.1f}")
-        logger.info(f"Average progress: {avg_progress:.1f}")
-        logger.info(f"Max stage reached: {max_stage_reached}")
-        logger.info(f"Average combat engagement: {avg_combat:.2f}")
-
-        # Build and return results dictionary
-        results = {
-            "avg_reward": avg_reward,
-            "avg_score": avg_score,
-            "avg_damage": avg_damage,
-            "avg_progress": avg_progress,
-            "max_stage": max_stage_reached,
-            "avg_combat": avg_combat,
-        }
-
-        return results
-    except Exception as e:
-        logger.error(f"Error during evaluation: {e}")
-        logger.error(traceback.format_exc())
-        return None
-    finally:
-        logger.info("Closing evaluation environment")
-        env.close()
-        active_environments.discard(env)
-
-
-def evaluate_with_multiple_goals(model_path=MODEL_PATH, num_episodes=2, render=True):
-    """Evaluate the model with different goal configurations"""
-    logger.info(f"Evaluating model from {model_path} with multiple goal profiles")
-
-    for profile_name, goal_values in goals_config.items():
-        logger.info(f"Testing with {profile_name} profile: {goal_values}")
-
-        env = make_kungfu_env(is_play_mode=render, frame_stack=4, use_dfp=True)
-        # Set the goals in the environment
-        env.env.set_goals(goal_values)
-        active_environments.add(env)
-
-        try:
-            model = PPO.load(model_path, env=env, policy=DFPPolicy)
-            total_reward = 0
-            total_progress = 0
-            total_damage = 0
-
-            for episode in range(num_episodes):
-                obs, info = env.reset()
-                done = False
-                episode_reward = 0
-                episode_progress = 0
-                episode_damage = 0
-
-                while not done:
-                    action, _ = model.predict(obs, deterministic=True)
-                    obs, reward, terminated, truncated, info = env.step(action)
-                    done = terminated or truncated
-                    episode_reward += reward
-
-                    if isinstance(info, dict):
-                        episode_progress += info.get("progress_made", 0)
-                        episode_damage += info.get("damage_taken", 0)
-
-                total_reward += episode_reward
-                total_progress += episode_progress
-                total_damage += episode_damage
-
-                logger.info(
-                    f"[{profile_name}] Episode {episode+1}: Reward={episode_reward:.2f}, "
-                    f"Progress={episode_progress:.1f}, Damage={episode_damage:.1f}"
-                )
-
-            avg_reward = total_reward / num_episodes
-            avg_progress = total_progress / num_episodes
-            avg_damage = total_damage / num_episodes
-
-            logger.info(
-                f"[{profile_name}] Average over {num_episodes} episodes: "
-                f"Reward={avg_reward:.2f}, Progress={avg_progress:.1f}, "
-                f"Damage={avg_damage:.1f}"
-            )
-
-        except Exception as e:
-            logger.error(f"Error evaluating with {profile_name} profile: {e}")
-        finally:
-            env.close()
-            active_environments.discard(env)
-
-    logger.info("Multi-goal evaluation complete")
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Train a Direct Future Prediction agent for Kung Fu Master with enhanced combat"
+        description="Train a Direct Future Prediction agent for Kung Fu Master with aggressive combat"
     )
     parser.add_argument(
         "--timesteps", type=int, default=1000000, help="Number of timesteps to train"
@@ -789,14 +599,6 @@ def main():
     )
     parser.add_argument(
         "--render", action="store_true", help="Render the environment during training"
-    )
-    parser.add_argument(
-        "--eval-only", action="store_true", help="Only evaluate the model, no training"
-    )
-    parser.add_argument(
-        "--plot-metrics",
-        action="store_true",
-        help="Plot training metrics after training",
     )
     parser.add_argument(
         "--model-path",
@@ -816,51 +618,27 @@ def main():
         default=1.5,
         help="Weight for progression rewards (default: 1.5)",
     )
-    parser.add_argument(
-        "--goal-profile",
-        type=str,
-        default="balanced",
-        choices=["balanced", "aggressive", "cautious", "speedrun"],
-        help="Set the behavioral goals profile",
-    )
 
-    # arg
     args = parser.parse_args()
 
-    # overwrite model path
+    # Override model path if specified
     model_path = args.model_path
     if model_path != MODEL_PATH:
         logger.info(f"Using custom model path: {model_path}")
 
-    # env config
+    # Set environment config based on arguments
     ENV_CONFIG["combat_engagement_weight"] = args.combat_weight
     ENV_CONFIG["progression_weight"] = args.progression_weight
 
-    # Set the selected goal profile
-    selected_goals = goals_config[args.goal_profile]
-    logger.info(f"Using {args.goal_profile} goal profile: {selected_goals}")
-
-    # log
+    # Log configuration
     logger.info("Environment configuration:")
     logger.info(f"  combat_weight: {ENV_CONFIG['combat_engagement_weight']}")
     logger.info(f"  progression_weight: {ENV_CONFIG['progression_weight']}")
 
-    # not eval
-    if not args.eval_only:
-        logger.info("Evaluating trained model with multiple goal profiles...")
-        evaluate_with_multiple_goals(model_path, num_episodes=2, render=True)
-
-    # eval only
-    if args.eval_only:
-        if not os.path.exists(model_path):
-            logger.error(f"Error: Model file {model_path} not found.")
-            return
-        logger.info(f"Running evaluation-only mode on model: {model_path}")
-        evaluate_model(model_path, num_episodes=10, render=True)
-        return
-
     try:
-        logger.info("Creating Kung Fu Master environment with enhanced capabilities...")
+        logger.info(
+            "Creating Kung Fu Master environment with aggressive combat settings..."
+        )
         gc.collect()
         time.sleep(1)
         env = make_kungfu_env(is_play_mode=args.render, frame_stack=4, use_dfp=True)
@@ -874,12 +652,6 @@ def main():
         logger.info("Closing training environment")
         env.close()
         active_environments.discard(env)
-
-        if args.plot_metrics:
-            plot_training_metrics()
-
-        logger.info("Evaluating trained model...")
-        evaluate_model(model_path, num_episodes=5, render=True)
 
         logger.info("Training completed")
     except Exception as e:
