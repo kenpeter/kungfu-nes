@@ -12,6 +12,13 @@ import traceback
 from collections import deque
 import retro
 import cv2
+import time
+from threat_detection import (
+    ThreatDetection,
+    AgentActionType,
+    ThreatType,
+    ThreatDirection,
+)
 
 logger = logging.getLogger("kungfu_env")
 
@@ -67,9 +74,6 @@ MEMORY = {
     "player_x": 0x0094,
     "player_y": 0x00B6,
     "game_mode": 0x0051,
-    "boss_hp": 0x04A5,
-    "boss_x": 0x0093,
-    "boss_action": 0x004E,
     "player_action": 0x0069,
     "player_action_timer": 0x0021,
     "player_air_mode": 0x036A,
@@ -78,18 +82,6 @@ MEMORY = {
     "screen_scroll1": 0x00E5,
     "screen_scroll2": 0x00D4,
     "game_submode": 0x0008,
-    "enemy1_x": 0x008E,
-    "enemy2_x": 0x008F,
-    "enemy3_x": 0x0090,
-    "enemy4_x": 0x0091,
-    "enemy1_action": 0x0080,
-    "enemy2_action": 0x0081,
-    "enemy3_action": 0x0082,
-    "enemy4_action": 0x0083,
-    "enemy1_timer": 0x002B,
-    "enemy2_timer": 0x002C,
-    "enemy3_timer": 0x002D,
-    "enemy4_timer": 0x002E,
     "grab_counter": 0x0374,
     "shrug_counter": 0x0378,
 }
@@ -98,7 +90,7 @@ MEMORY = {
 MAX_EPISODE_STEPS = 3600  # 2 minutes
 
 # Set default model path
-MODEL_PATH = "model/kungfu_dfp.zip"
+MODEL_PATH = "model/kungfu_model.zip"
 
 # Global config for environment behavior
 ENV_CONFIG = {
@@ -154,8 +146,11 @@ class KungFuMasterEnv(gym.Wrapper):
         # Option 1: If using index-based actions with the PPO agent
         self.action_space = gym.spaces.Discrete(len(self.KUNGFU_ACTIONS))
 
-        # Option 2: Alternative if directly using button combinations
-        # self.action_space = gym.spaces.MultiBinary(9)  # For 9-button actions
+        # Initialize threat detection system
+        self.threat_detector = ThreatDetection(frame_size=(84, 84))
+
+        # Track last observation for threat detection
+        self.last_observation = None
 
         # State tracking - initialize all with proper types
         self.prev_score = 0
@@ -168,19 +163,9 @@ class KungFuMasterEnv(gym.Wrapper):
         self.no_progress_count = 0
         self.enemy_distance_history = deque(maxlen=10)
 
-        # Enemy tracking
-        self.prev_enemy_positions = {}
-        self.time_since_last_attack = 0
-        self.enemies_in_range_count = 0
-        self.last_engagement_reward = 0
-        self.priority_enemy = None  # Track the current priority enemy
-
-        # Track for DFP measurements - initialize all as proper types
-        self.total_steps = 0
-        self.scores_by_step = []
-        self.damage_by_step = []
-        self.progress_by_step = []
-        self.combat_engagement_by_step = []
+        # Tracking for threat-based decisions
+        self.last_recommended_action = None
+        self.recommended_action_taken = False
 
         # Flag to track whether reset has been called
         self.reset_called = False
@@ -244,78 +229,6 @@ class KungFuMasterEnv(gym.Wrapper):
             logger.error(f"Error getting score: {e}")
             return 0
 
-    def get_boss_hp(self):
-        return self.get_ram_value(MEMORY["boss_hp"])
-
-    def get_enemy_positions(self):
-        enemies = []
-        try:
-            player_x = self.get_ram_value(MEMORY["player_x"])
-            enemy_y_positions = [80, 120, 160, 200]  # Approximated y-positions
-
-            for i in range(1, 5):
-                x = self.get_ram_value(MEMORY[f"enemy{i}_x"])
-                action = self.get_ram_value(MEMORY[f"enemy{i}_action"])
-                timer = self.get_ram_value(MEMORY[f"enemy{i}_timer"])
-
-                # Only consider active enemies (timer > 0 and valid position)
-                if timer > 0 and 0 < x < 240:  # Valid position range
-                    y = enemy_y_positions[min(i - 1, len(enemy_y_positions) - 1)]
-                    distance = abs(x - player_x)
-                    enemies.append(
-                        {
-                            "id": i,
-                            "x": x,
-                            "y": y,
-                            "action": action,
-                            "timer": timer,
-                            "distance": distance,
-                            "relative_x": x - player_x,
-                        }
-                    )
-
-            # Sort enemies by distance (nearest first)
-            return sorted(enemies, key=lambda e: e["distance"])
-        except Exception as e:
-            logger.error(f"Error getting enemy positions: {e}")
-            return []
-
-    def get_priority_enemy(self):
-        enemies = self.get_enemy_positions()
-        return enemies[0] if enemies else None
-
-    def get_boss_info(self):
-        try:
-            boss_x = self.get_ram_value(MEMORY["boss_x"])
-            boss_hp = self.get_ram_value(MEMORY["boss_hp"])
-            boss_action = self.get_ram_value(MEMORY["boss_action"])
-            if boss_hp > 0 and boss_x > 0:
-                return {
-                    "x": boss_x,
-                    "hp": boss_hp,
-                    "action": boss_action,
-                    "y": 160,
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Error getting boss info: {e}")
-            return None
-
-    def calculate_engagement_status(self, enemies, player_x, player_y):
-        close_enemies = 0
-        distance_enemies = 0
-        for enemy in enemies:
-            dx = abs(enemy["x"] - player_x)
-            dy = abs(enemy["y"] - player_y)
-            if dx < 30 and dy < 20:
-                close_enemies += 1
-            elif dx < 100:
-                distance_enemies += 1
-        return {
-            "close_enemies": close_enemies,
-            "distance_enemies": distance_enemies,
-        }
-
     def reset(self, **kwargs):
         self.reset_called = True
         obs = np.zeros((84, 84, 1), dtype=np.uint8)
@@ -332,14 +245,10 @@ class KungFuMasterEnv(gym.Wrapper):
 
         # Explicitly ensure all tracking variables are correctly typed
         self.episode_steps = 0
-        self.scores_by_step = []
-        self.damage_by_step = []
-        self.progress_by_step = []
-        self.combat_engagement_by_step = []
         self.standing_still_count = 0
         self.no_progress_count = 0
-        self.time_since_last_attack = 0
-        self.priority_enemy = None
+        self.last_recommended_action = None
+        self.recommended_action_taken = False
 
         # Check if enemy_distance_history is a deque, recreate if not
         if not isinstance(self.enemy_distance_history, deque):
@@ -348,16 +257,13 @@ class KungFuMasterEnv(gym.Wrapper):
         else:
             self.enemy_distance_history.clear()
 
-        self.prev_enemy_positions = {}
-
         self.prev_hp = self.get_hp()
         self.prev_x_pos, self.prev_y_pos = self.get_player_position()
         self.prev_stage = self.get_stage()
         self.prev_score = self.get_score()
 
-        enemies = self.get_enemy_positions()
-        for enemy in enemies:
-            self.prev_enemy_positions[enemy["id"]] = (enemy["x"], enemy["y"])
+        # Reset threat detector
+        self.last_observation = obs
 
         # Debug log for episode_steps
         logger.debug(
@@ -390,40 +296,8 @@ class KungFuMasterEnv(gym.Wrapper):
             )
             self.episode_steps = 0
 
-        # Ensure other tracking variables are proper types
-        if not isinstance(self.total_steps, int):
-            logger.warning(
-                f"total_steps was not an integer: {type(self.total_steps)}. Fixing."
-            )
-            self.total_steps = 0
-
-        if not isinstance(self.time_since_last_attack, int):
-            logger.warning(
-                f"time_since_last_attack was not an integer: {type(self.time_since_last_attack)}. Fixing."
-            )
-            self.time_since_last_attack = 0
-
-        # Ensure step tracking variables are lists
-        if not isinstance(self.scores_by_step, list):
-            logger.warning(f"scores_by_step was not a list. Fixing.")
-            self.scores_by_step = []
-
-        if not isinstance(self.damage_by_step, list):
-            logger.warning(f"damage_by_step was not a list. Fixing.")
-            self.damage_by_step = []
-
-        if not isinstance(self.progress_by_step, list):
-            logger.warning(f"progress_by_step was not a list. Fixing.")
-            self.progress_by_step = []
-
-        if not isinstance(self.combat_engagement_by_step, list):
-            logger.warning(f"combat_engagement_by_step was not a list. Fixing.")
-            self.combat_engagement_by_step = []
-
         # Increment steps - ensure they're integers first
-        self.total_steps = int(self.total_steps) + 1
         self.episode_steps = int(self.episode_steps) + 1
-        self.time_since_last_attack = int(self.time_since_last_attack) + 1
 
         # Get the actual button combination for logging/info purpose only
         button_combination = None
@@ -448,6 +322,18 @@ class KungFuMasterEnv(gym.Wrapper):
             logger.error(f"Error converting action {action}: {e}")
             button_combination = self.KUNGFU_ACTIONS[0]  # Default to No-op
             actual_action = 0
+
+        # Check if this action matches the last recommended action
+        try:
+            if self.last_recommended_action is not None:
+                action_index = self.last_recommended_action.value
+                self.recommended_action_taken = action_index == actual_action
+                logger.debug(
+                    f"Recommended action taken: {self.recommended_action_taken}"
+                )
+        except Exception as e:
+            logger.error(f"Error checking recommended action: {e}")
+            self.recommended_action_taken = False
 
         try:
             # Use the integer action index with the retro environment
@@ -485,19 +371,40 @@ class KungFuMasterEnv(gym.Wrapper):
             current_x_pos, current_y_pos = self.get_player_position()
             current_stage = self.get_stage()
             current_score = self.get_score()
-            current_enemies = self.get_enemy_positions()
-            engagement = self.calculate_engagement_status(
-                current_enemies, current_x_pos, current_y_pos
+
+            # Process observation with threat detector
+            player_pos = (current_x_pos, current_y_pos)
+            current_time = time.time()
+
+            # Process frame for threats
+            highest_threat, all_threats = self.threat_detector.process_frame(
+                obs, player_pos, current_time
             )
 
-            # Get priority enemy (the closest one)
-            self.priority_enemy = self.get_priority_enemy()
+            # Store threat information
+            if highest_threat:
+                self.last_recommended_action = highest_threat.recommended_action
+                threat_info = {
+                    "threat_detected": True,
+                    "threat_type": highest_threat.threat_type.name,
+                    "threat_direction": highest_threat.direction.name,
+                    "threat_priority": highest_threat.priority,
+                    "recommended_action": highest_threat.recommended_action.name,
+                    "recommended_action_index": highest_threat.recommended_action.value,
+                    "threat_distance": highest_threat.distance_to_player,
+                    "num_threats": len(all_threats),
+                    "recommended_action_taken": self.recommended_action_taken,
+                }
+            else:
+                self.last_recommended_action = None
+                threat_info = {
+                    "threat_detected": False,
+                    "num_threats": 0,
+                    "recommended_action_taken": False,
+                }
 
-            # Update enemy distance history
-            closest_distance = (
-                self.priority_enemy["distance"] if self.priority_enemy else 999
-            )
-            self.enemy_distance_history.append(closest_distance)
+            # Save observation for next frame
+            self.last_observation = obs
 
             try:
                 score_diff = int(current_score - self.prev_score)
@@ -505,19 +412,9 @@ class KungFuMasterEnv(gym.Wrapper):
                 logger.error(f"Error calculating score_diff: {e}. Using 0.")
                 score_diff = 0
 
-            # Ensure scores_by_step is a list before appending
-            if not isinstance(self.scores_by_step, list):
-                self.scores_by_step = []
-            self.scores_by_step.append(score_diff)
-
             damage_taken = self.prev_hp - current_hp
             if damage_taken < 0:
                 damage_taken = 0
-
-            # Ensure damage_by_step is a list before appending
-            if not isinstance(self.damage_by_step, list):
-                self.damage_by_step = []
-            self.damage_by_step.append(damage_taken)
 
             # FIXED: Corrected stage progression logic
             # Odd stages (1,3,5) - progress is measured by moving RIGHT (x increases)
@@ -546,76 +443,40 @@ class KungFuMasterEnv(gym.Wrapper):
 
             recorded_progress = max(0, progress)
 
-            # Ensure progress_by_step is a list before appending
-            if not isinstance(self.progress_by_step, list):
-                self.progress_by_step = []
-            self.progress_by_step.append(recorded_progress)
-
             attack_attempt = action in [1, 6, 7, 9, 10, 11]
-            if attack_attempt:
-                self.time_since_last_attack = 0
 
             # SIMPLIFIED: Improved combat engagement reward calculation
             combat_engagement_reward = 0
 
-            # Base engagement reward for having enemies
-            if current_enemies:
+            # Add threat-based combat rewards
+            if highest_threat and highest_threat.threat_type == ThreatType.REGULAR:
+                # Reward for detecting threats
                 combat_engagement_reward += 0.3 * ENV_CONFIG["combat_engagement_weight"]
 
-            # Get priority enemy combat rewards
-            if self.priority_enemy:
-                enemy_distance = self.priority_enemy["distance"]
-
-                # Reward attacking when enemies are close
-                if attack_attempt:
-                    if enemy_distance < 40:  # Close combat bonus
-                        combat_engagement_reward += (
-                            0.8 * ENV_CONFIG["combat_engagement_weight"]
-                        )
-                    elif enemy_distance < 100:  # Medium distance bonus
-                        combat_engagement_reward += (
-                            0.3 * ENV_CONFIG["combat_engagement_weight"]
-                        )
-
-                # Direction-based movement rewards
-                move_right = action in [5, 8, 10]  # RIGHT actions
-                move_left = action in [4, 11]  # LEFT actions
-                enemy_dir = "right" if self.priority_enemy["relative_x"] > 0 else "left"
-
-                # Reward moving toward priority enemy
-                if (move_right and enemy_dir == "right") or (
-                    move_left and enemy_dir == "left"
-                ):
+                # Bonus for being close to threats
+                if highest_threat.distance_to_player < 30:
                     combat_engagement_reward += (
                         0.4 * ENV_CONFIG["combat_engagement_weight"]
                     )
 
-                # Reward attacking in the correct direction
+                # Reward for attacking in correct direction
                 if attack_attempt:
-                    attack_right = action in [10]  # Punch+RIGHT
-                    attack_left = action in [11]  # LEFT+Kick
-
-                    if (attack_right and enemy_dir == "right") or (
-                        attack_left and enemy_dir == "left"
+                    if (
+                        highest_threat.direction == ThreatDirection.LEFT
+                        and action in [11]
+                    ) or (
+                        highest_threat.direction == ThreatDirection.RIGHT
+                        and action in [10]
                     ):
                         combat_engagement_reward += (
-                            0.5 * ENV_CONFIG["combat_engagement_weight"]
+                            0.6 * ENV_CONFIG["combat_engagement_weight"]
                         )
 
-            # Additional reward for getting closer to enemies over time
-            if len(self.enemy_distance_history) > 3:
-                avg_prev_distance = sum(list(self.enemy_distance_history)[:-1]) / (
-                    len(self.enemy_distance_history) - 1
-                )
-                if closest_distance < avg_prev_distance:
+                # Reward for taking recommended action
+                if self.recommended_action_taken:
                     combat_engagement_reward += (
-                        0.4 * ENV_CONFIG["combat_engagement_weight"]
+                        0.5 * ENV_CONFIG["combat_engagement_weight"]
                     )
-
-            # Ensure combat_engagement_by_step is a list before appending
-            if not isinstance(self.combat_engagement_by_step, list):
-                self.combat_engagement_by_step = []
-            self.combat_engagement_by_step.append(combat_engagement_reward)
 
             # Check that episode_steps is still an integer before the modulo operation
             if not isinstance(self.episode_steps, int):
@@ -634,8 +495,7 @@ class KungFuMasterEnv(gym.Wrapper):
                     time_left = (MAX_EPISODE_STEPS - self.episode_steps) / 30
                     logger.info(
                         f"Stage: {current_stage}, Position: ({current_x_pos}, {current_y_pos}), "
-                        f"HP: {current_hp}, Score: {current_score}, Time left: {time_left:.1f}s, "
-                        f"Enemies: {len(current_enemies)}"
+                        f"HP: {current_hp}, Score: {current_score}, Time left: {time_left:.1f}s"
                     )
                 except Exception as e:
                     logger.error(f"Error in episode step logging: {e}")
@@ -709,15 +569,13 @@ class KungFuMasterEnv(gym.Wrapper):
                         "enemies_defeated": int(enemies_defeated),
                         "attack_attempt": int(attack_attempt),
                         "strategic_position": int(abs(current_y_pos - 160) < 30),
-                        "enemies_close": int(engagement["close_enemies"]),
-                        "enemies_distance": int(engagement["distance_enemies"]),
                         "combat_engagement_reward": float(combat_engagement_reward),
-                        "nearest_enemy_distance": float(
-                            closest_distance if closest_distance != 999 else 0
-                        ),
-                        "has_priority_enemy": int(self.priority_enemy is not None),
                     }
                 )
+
+                # Add threat information to info dictionary
+                info.update(threat_info)
+
             except Exception as e:
                 logger.error(f"Error updating info dictionary: {e}")
                 info.update(
@@ -734,15 +592,29 @@ class KungFuMasterEnv(gym.Wrapper):
             self.prev_y_pos = current_y_pos
             self.prev_stage = current_stage
             self.prev_score = current_score
-            self.prev_enemy_positions = {
-                enemy["id"]: (enemy["x"], enemy["y"]) for enemy in current_enemies
-            }
 
         except Exception as e:
             logger.error(f"Error in measurement calculation: {e}")
             logger.error(traceback.format_exc())
 
         return obs, reward, terminated, truncated, info
+
+    def render_with_threats(self):
+        """Render the game with threat visualization overlay"""
+        # This assumes the environment has a render method
+        frame = None
+        try:
+            frame = self.env.render(mode="rgb_array")
+        except Exception as e:
+            logger.error(f"Error in render: {e}")
+            # Create a blank frame if render fails
+            frame = np.zeros((210, 160, 3), dtype=np.uint8)
+
+        # Visualize threats
+        if self.last_observation is not None:
+            frame = self.threat_detector.visualize_threats(frame)
+
+        return frame
 
     def close(self):
         try:
@@ -754,152 +626,7 @@ class KungFuMasterEnv(gym.Wrapper):
         RetroEnvManager.get_instance().unregister_env(self)
 
 
-class DFPWrapper(gym.Wrapper):
-    def __init__(self, env, measurement_history_length=5, fixed_goals=None):
-        super().__init__(env)
-        self.image_shape = env.observation_space.shape
-        self.n_measurements = 3
-        self.measurement_history_length = measurement_history_length
-        self.measurement_history = deque(maxlen=measurement_history_length)
-        for _ in range(measurement_history_length):
-            self.measurement_history.append(np.zeros(self.n_measurements))
-        if fixed_goals is not None:
-            self.fixed_goals = np.array(fixed_goals, dtype=np.float32)
-        else:
-            # FIXED: Updated default DFP goals to prioritize combat and progress
-            self.fixed_goals = np.array([0.5, -0.3, 0.3], dtype=np.float32)
-        self.observation_space = gym.spaces.Dict(
-            {
-                "image": gym.spaces.Box(
-                    low=0, high=255, shape=self.image_shape, dtype=np.uint8
-                ),
-                "measurements": gym.spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self.n_measurements * self.measurement_history_length,),
-                    dtype=np.float32,
-                ),
-                "goals": gym.spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self.n_measurements,),
-                    dtype=np.float32,
-                ),
-            }
-        )
-        self.action_space = env.action_space
-        self.prev_score = 0
-        self.prev_damage = 0
-        self.prev_progress = 0
-
-    def reset(self, **kwargs):
-        obs = np.zeros(self.image_shape, dtype=np.uint8)
-        info = {}
-        try:
-            result = self.env.reset(**kwargs)
-            if isinstance(result, tuple) and len(result) == 2:
-                obs, info = result
-            else:
-                obs = result
-        except Exception as e:
-            logger.error(f"Error in DFPWrapper reset: {e}")
-            info["error"] = str(e)
-
-        # Clear and reinitialize measurement history
-        self.measurement_history = deque(maxlen=self.measurement_history_length)
-        for i in range(self.measurement_history_length):
-            self.measurement_history.append(np.zeros(self.n_measurements))
-
-        self.prev_score = 0
-        self.prev_damage = 0
-        self.prev_progress = 0
-
-        dict_obs = self._create_dict_observation(obs, info)
-        return dict_obs, info
-
-    def step(self, action):
-        result = self.env.step(action)
-        if len(result) == 5:
-            obs, reward, terminated, truncated, info = result
-            done = terminated or truncated
-        else:
-            obs, reward, done, info = result
-            terminated = done
-            truncated = False
-        current_score = info.get("score_increase", 0)
-        current_damage = info.get("damage_taken", 0)
-        current_progress = info.get("progress_made", 0)
-        measurements = np.array(
-            [current_score, current_damage, current_progress], dtype=np.float32
-        )
-        self.measurement_history.append(measurements)
-        self.prev_score = current_score
-        self.prev_damage = current_damage
-        self.prev_progress = current_progress
-        dict_obs = self._create_dict_observation(obs, info)
-        if len(result) == 5:
-            return dict_obs, reward, terminated, truncated, info
-        else:
-            return dict_obs, reward, done, info
-
-    def _create_dict_observation(self, image_obs, info=None):
-        # Ensure image_obs is properly formatted
-        if image_obs is None:
-            logger.warning(
-                "Received None for image_obs in _create_dict_observation. Creating blank image."
-            )
-            image_obs = np.zeros(self.image_shape, dtype=np.uint8)
-
-        # Handle different image shapes
-        if len(image_obs.shape) == 4 and image_obs.shape[-1] == 1:
-            image_obs = np.array(image_obs, dtype=np.uint8)
-        elif len(image_obs.shape) == 3 and image_obs.shape[-1] != 1:
-            image_obs = np.expand_dims(image_obs, axis=-1)
-
-        # Ensure measurement_history is properly initialized
-        if (
-            not isinstance(self.measurement_history, deque)
-            or len(self.measurement_history) == 0
-        ):
-            logger.warning(
-                "measurement_history is not properly initialized. Recreating it."
-            )
-            self.measurement_history = deque(maxlen=self.measurement_history_length)
-            for _ in range(self.measurement_history_length):
-                self.measurement_history.append(np.zeros(self.n_measurements))
-
-        try:
-            # Convert measurement history to a flat array
-            flat_measurements = np.concatenate(list(self.measurement_history)).astype(
-                np.float32
-            )
-        except Exception as e:
-            logger.error(
-                f"Error flattening measurements: {e}. Creating zero measurements."
-            )
-            flat_measurements = np.zeros(
-                self.n_measurements * self.measurement_history_length, dtype=np.float32
-            )
-
-        # Ensure goals is properly initialized
-        if not isinstance(self.fixed_goals, np.ndarray) or self.fixed_goals.shape != (
-            self.n_measurements,
-        ):
-            logger.warning("fixed_goals is not properly initialized. Recreating it.")
-            # FIXED: Updated default DFP goals to prioritize combat and progress
-            self.fixed_goals = np.array([0.5, -0.3, 0.3], dtype=np.float32)
-
-        return {
-            "image": image_obs,
-            "measurements": flat_measurements,
-            "goals": self.fixed_goals,
-        }
-
-    def set_goals(self, new_goals):
-        self.fixed_goals = np.array(new_goals, dtype=np.float32)
-
-
-def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
+def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=False):
     try:
         from stable_baselines3.common.atari_wrappers import (
             ClipRewardEnv,
@@ -907,11 +634,9 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
         )
         from gymnasium.wrappers import FrameStack
         from stable_baselines3.common.monitor import Monitor
-        from stable_baselines3.common.preprocessing import check_for_nested_spaces
 
         logger.info("Creating Kung Fu Master Retro environment")
 
-        # Keep using DISCRETE mode but ensure we handle out-of-bounds actions in our wrapper
         env = retro.make(
             game="KungFu-Nes",
             use_restricted_actions=retro.Actions.DISCRETE,
@@ -919,7 +644,34 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
         )
 
         RetroEnvManager.get_instance().register_env(env)
-        env = KungFuMasterEnv(env)  # Our wrapper will handle action mapping safely
+        env = KungFuMasterEnv(env)
+
+        # Use a wrapper that converts to channel-first format (what SB3 expects)
+        class ChannelFirstWrapper(gym.ObservationWrapper):
+            def __init__(self, env):
+                super().__init__(env)
+                # Update observation space to be channel-first
+                old_shape = self.observation_space.shape
+                # If last dimension is 1 (grayscale images), convert to (1, H, W)
+                if len(old_shape) == 3 and old_shape[-1] == 1:
+                    new_shape = (1, old_shape[0], old_shape[1])
+                    self.observation_space = gym.spaces.Box(
+                        low=0, high=255, shape=new_shape, dtype=np.uint8
+                    )
+                elif len(old_shape) == 4 and old_shape[-1] == 1:
+                    # Handle case when already stacked (N, H, W, 1)
+                    new_shape = (old_shape[0], old_shape[1], old_shape[2])
+                    self.observation_space = gym.spaces.Box(
+                        low=0, high=255, shape=new_shape, dtype=np.uint8
+                    )
+
+            def observation(self, observation):
+                # Convert from (H, W, C) to (C, H, W) or (N, H, W, 1) to (N, H, W)
+                if len(observation.shape) == 3 and observation.shape[-1] == 1:
+                    return np.transpose(observation, (2, 0, 1)).squeeze(-1)
+                elif len(observation.shape) == 4 and observation.shape[-1] == 1:
+                    return observation.squeeze(-1)
+                return observation
 
         class CustomWarpFrame(WarpFrame):
             def __init__(self, env, width=84, height=84):
@@ -939,6 +691,7 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
         env = CustomWarpFrame(env)
         env = ClipRewardEnv(env)
 
+        # Apply frame stacking
         class CustomFrameStack(FrameStack):
             def __init__(self, env, num_stack):
                 super().__init__(env, num_stack)
@@ -948,18 +701,13 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=True):
                 return np.array(obs)
 
         env = CustomFrameStack(env, frame_stack)
+
+        # Apply channel-first conversion after frame stacking
+        env = ChannelFirstWrapper(env)
+
         env = Monitor(env)
         logger.info(f"Observation space after wrapping: {env.observation_space}")
         logger.info(f"Observation space shape: {env.observation_space.shape}")
-        if use_dfp:
-            logger.info("Adding DFP wrapper to environment")
-            # FIXED: Updated goals to prioritize combat and progression
-            goals = [
-                ENV_CONFIG["combat_engagement_weight"] * 1.5,  # Prioritize combat/score
-                -0.3,  # Avoid damage but don't overemphasize
-                ENV_CONFIG["progression_weight"] * 0.5,  # Balance progression
-            ]
-            env = DFPWrapper(env, measurement_history_length=5, fixed_goals=goals)
         logger.info("Environment setup complete")
         return env
     except Exception as e:
