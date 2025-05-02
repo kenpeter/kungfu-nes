@@ -273,7 +273,9 @@ class ThreatDetection:
 
         # Visual processing parameters
         self.motion_history = deque(maxlen=4)  # Keep a few frames to detect motion
-        self.background_model = None
+
+        # Initialize background model with proper dimensions and type
+        self.background_model = np.zeros(frame_size, dtype=np.float32)
 
         # Prepare for CV operations
         self.foreground_mask = None
@@ -319,19 +321,35 @@ class ThreatDetection:
 
     def _process_visual_threats(self, frame):
         """Process frame to detect visual threats using computer vision techniques"""
-        # Convert to grayscale if needed
-        if len(frame.shape) == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = frame
+        try:
+            # Convert to grayscale if needed
+            if len(frame.shape) == 3 and frame.shape[2] == 3:
+                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            elif len(frame.shape) == 3 and frame.shape[2] == 1:
+                gray = frame.squeeze()
+            else:
+                gray = frame
 
-        # Initialize background model if needed
-        if self.background_model is None and len(self.motion_history) >= 2:
-            self.background_model = self.motion_history[-2].copy().astype(np.float32)
+            # Ensure gray is 2D
+            if len(gray.shape) > 2:
+                gray = gray.squeeze()
 
-        # Update background model with slow adaptation
-        if self.background_model is not None:
-            cv2.accumulateWeighted(gray, self.background_model, 0.05)
+            # Resize if needed
+            if gray.shape != self.frame_size:
+                gray = cv2.resize(gray, (self.frame_size[1], self.frame_size[0]))
+
+            # Ensure background model matches gray's shape and type
+            if (
+                self.background_model is None
+                or self.background_model.shape != gray.shape
+            ):
+                logger.info(f"Reinitializing background model to shape {gray.shape}")
+                self.background_model = np.zeros_like(gray, dtype=np.float32)
+
+            # Update background model with slow adaptation
+            # Convert gray to float32 before accumulation
+            gray_float = gray.astype(np.float32)
+            cv2.accumulateWeighted(gray_float, self.background_model, 0.05)
 
             # Convert back to uint8 for further processing
             bg_model_uint8 = self.background_model.astype(np.uint8)
@@ -379,8 +397,18 @@ class ThreatDetection:
 
             return detected_positions
 
-        # Return empty list if we don't have enough history yet
-        return []
+        except Exception as e:
+            logger.error(f"Error in _process_visual_threats: {e}")
+            logger.error(
+                f"Frame shape: {frame.shape if hasattr(frame, 'shape') else 'Unknown'}"
+            )
+            if hasattr(gray, "shape"):
+                logger.error(f"Gray shape: {gray.shape}")
+            if hasattr(self.background_model, "shape"):
+                logger.error(f"Background model shape: {self.background_model.shape}")
+
+            # Return empty list on error
+            return []
 
     def _update_threats(self, detected_positions, current_time, player_position):
         """Match detected positions with existing threats or create new ones"""
