@@ -92,12 +92,14 @@ MAX_EPISODE_STEPS = 3600  # 2 minutes
 # Set default model path
 MODEL_PATH = "model/kungfu_model.zip"
 
-# Global config for environment behavior
+# Global config for environment behavior with more balanced weights
 ENV_CONFIG = {
     "progression_weight": 1.5,
-    "combat_engagement_weight": 1.8,  # Increased from 1.2 to promote more combat
-    "enemy_detection_range": 120,  # Range to detect distant enemies
-    "proactive_combat_bonus": 0.8,  # Bonus for moving toward enemies
+    "combat_engagement_weight": 1.8,  # Will be dynamically adjusted per stage
+    "enemy_detection_range": 120,
+    "proactive_combat_bonus": 0.8,
+    "defensive_bonus": 0.5,  # New parameter for defensive positioning
+    "strategic_retreat_bonus": 0.3,  # New parameter for retreat when appropriate
 }
 
 
@@ -163,9 +165,22 @@ class KungFuMasterEnv(gym.Wrapper):
         self.no_progress_count = 0
         self.enemy_distance_history = deque(maxlen=10)
 
+        # New: Track time since last damage taken for defensive strategy evaluation
+        self.frames_since_damage = 0
+
+        # New: Track successful dodges and defensive positioning
+        self.successful_dodge_count = 0
+
+        # New: Track stage time to adjust rewards based on progression
+        self.current_stage_start_time = 0
+        self.stage_time_limit = 1200  # 40 seconds per stage
+
         # Tracking for threat-based decisions
         self.last_recommended_action = None
         self.recommended_action_taken = False
+
+        # New: Track enemy positions for strategic positioning rewards
+        self.known_enemy_positions = []
 
         # Flag to track whether reset has been called
         self.reset_called = False
@@ -250,6 +265,12 @@ class KungFuMasterEnv(gym.Wrapper):
         self.last_recommended_action = None
         self.recommended_action_taken = False
 
+        # Reset new tracking variables
+        self.frames_since_damage = 0
+        self.successful_dodge_count = 0
+        self.current_stage_start_time = 0
+        self.known_enemy_positions = []
+
         # Check if enemy_distance_history is a deque, recreate if not
         if not isinstance(self.enemy_distance_history, deque):
             logger.warning("enemy_distance_history was not a deque. Recreating.")
@@ -277,6 +298,23 @@ class KungFuMasterEnv(gym.Wrapper):
 
         return obs, info
 
+    # Calculate dynamic reward weights based on stage
+    def get_dynamic_weights(self, stage):
+        # Increase progression weight with stage to encourage completion of later levels
+        dynamic_progression_weight = ENV_CONFIG["progression_weight"] * (1 + stage / 10)
+
+        # Decrease combat weight in later stages to encourage more strategic play
+        dynamic_combat_weight = ENV_CONFIG["combat_engagement_weight"] * (0.9**stage)
+
+        # Increase defensive bonus in later stages
+        dynamic_defensive_bonus = ENV_CONFIG["defensive_bonus"] * (1 + stage / 5)
+
+        return {
+            "progression": dynamic_progression_weight,
+            "combat": dynamic_combat_weight,
+            "defensive": dynamic_defensive_bonus,
+        }
+
     def step(self, action):
         if not self.reset_called:
             logger.warning(
@@ -298,6 +336,9 @@ class KungFuMasterEnv(gym.Wrapper):
 
         # Increment steps - ensure they're integers first
         self.episode_steps = int(self.episode_steps) + 1
+
+        # Increment frames since damage
+        self.frames_since_damage += 1
 
         # Get the actual button combination for logging/info purpose only
         button_combination = None
@@ -372,6 +413,9 @@ class KungFuMasterEnv(gym.Wrapper):
             current_stage = self.get_stage()
             current_score = self.get_score()
 
+            # Get dynamic weights based on current stage
+            weights = self.get_dynamic_weights(current_stage)
+
             # Process observation with threat detector
             player_pos = (current_x_pos, current_y_pos)
             current_time = time.time()
@@ -380,6 +424,12 @@ class KungFuMasterEnv(gym.Wrapper):
             highest_threat, all_threats = self.threat_detector.process_frame(
                 obs, player_pos, current_time
             )
+
+            # Update known enemy positions from threats
+            self.known_enemy_positions = []
+            for threat in all_threats:
+                if hasattr(threat, "position") and threat.position:
+                    self.known_enemy_positions.append(threat.position)
 
             # Store threat information
             if highest_threat:
@@ -416,19 +466,62 @@ class KungFuMasterEnv(gym.Wrapper):
             if damage_taken < 0:
                 damage_taken = 0
 
-            # FIXED: Corrected stage progression logic
+            # If damage was taken, reset frames_since_damage counter
+            if damage_taken > 0:
+                self.frames_since_damage = 0
+
+            # Check for stage change
+            stage_changed = current_stage > self.prev_stage
+            if stage_changed:
+                self.current_stage_start_time = self.episode_steps
+
+            # Calculate time spent in current stage
+            stage_time = self.episode_steps - self.current_stage_start_time
+
+            # FIXED: Corrected stage progression logic with more nuanced understanding
             # Odd stages (1,3,5) - progress is measured by moving RIGHT (x increases)
             # Even stages (2,4,6) - progress is measured by moving LEFT (x decreases)
+            # But also consider boundaries and screen scrolling
             if current_stage in [2, 4, 6]:  # Even stages - progress left
                 progress = self.prev_x_pos - current_x_pos
+
+                # Check if at left boundary - don't penalize player for not moving left when at boundary
+                if current_x_pos < 20:  # Near left boundary
+                    progress = max(0, progress)  # Don't give negative progress
+
                 if current_stage > self.prev_stage:
                     progress += 100
             else:  # Odd stages (1,3,5) - progress right
                 progress = current_x_pos - self.prev_x_pos
+
+                # Check if at right boundary - don't penalize player for not moving right when at boundary
+                if current_x_pos > 230:  # Near right boundary
+                    progress = max(0, progress)  # Don't give negative progress
+
                 if current_stage > self.prev_stage:
                     progress += 100
 
-            if abs(progress) < 2:
+            # Detect strategic retreat - moving away from a group of enemies
+            strategic_retreat = False
+            if len(self.known_enemy_positions) >= 3:  # Multiple enemies detected
+                # Calculate center of enemy mass
+                enemy_center_x = sum(x for x, _ in self.known_enemy_positions) / len(
+                    self.known_enemy_positions
+                )
+
+                # Check if player is moving away from a cluster of enemies
+                if (
+                    current_stage % 2 == 1
+                    and current_x_pos < self.prev_x_pos
+                    and enemy_center_x < current_x_pos
+                ) or (
+                    current_stage % 2 == 0
+                    and current_x_pos > self.prev_x_pos
+                    and enemy_center_x > current_x_pos
+                ):
+                    strategic_retreat = True
+
+            if abs(progress) < 2 and not strategic_retreat:
                 self.no_progress_count += 1
             else:
                 self.no_progress_count = 0
@@ -444,20 +537,41 @@ class KungFuMasterEnv(gym.Wrapper):
             recorded_progress = max(0, progress)
 
             attack_attempt = action in [1, 6, 7, 9, 10, 11]
+            defensive_action = action in [2, 3, 4]  # Jump, crouch, move left (away)
 
-            # SIMPLIFIED: Improved combat engagement reward calculation
+            # Improved combat engagement reward calculation
             combat_engagement_reward = 0
 
-            # Add threat-based combat rewards
+            # Add threat-based combat rewards with dynamic scaling
             if highest_threat and highest_threat.threat_type == ThreatType.REGULAR:
                 # Reward for detecting threats
-                combat_engagement_reward += 0.3 * ENV_CONFIG["combat_engagement_weight"]
+                combat_engagement_reward += 0.3 * weights["combat"]
 
-                # Bonus for being close to threats
-                if highest_threat.distance_to_player < 30:
-                    combat_engagement_reward += (
-                        0.4 * ENV_CONFIG["combat_engagement_weight"]
-                    )
+                # Calculate appropriate action based on threat distance
+                # For close threats, reward attacking
+                if highest_threat.distance_to_player < 30 and attack_attempt:
+                    combat_engagement_reward += 0.6 * weights["combat"]
+
+                # For medium threats, reward positioning
+                elif 30 <= highest_threat.distance_to_player <= 60:
+                    # Reward moving toward enemy in appropriate direction
+                    if (
+                        highest_threat.direction == ThreatDirection.LEFT and action == 4
+                    ) or (
+                        highest_threat.direction == ThreatDirection.RIGHT
+                        and action == 5
+                    ):
+                        combat_engagement_reward += 0.4 * weights["combat"]
+
+                # For distant threats, smaller reward for approaching
+                elif highest_threat.distance_to_player > 60:
+                    if (
+                        highest_threat.direction == ThreatDirection.LEFT and action == 4
+                    ) or (
+                        highest_threat.direction == ThreatDirection.RIGHT
+                        and action == 5
+                    ):
+                        combat_engagement_reward += 0.2 * weights["combat"]
 
                 # Reward for attacking in correct direction
                 if attack_attempt:
@@ -468,15 +582,35 @@ class KungFuMasterEnv(gym.Wrapper):
                         highest_threat.direction == ThreatDirection.RIGHT
                         and action in [10]
                     ):
-                        combat_engagement_reward += (
-                            0.6 * ENV_CONFIG["combat_engagement_weight"]
-                        )
+                        combat_engagement_reward += 0.5 * weights["combat"]
 
                 # Reward for taking recommended action
                 if self.recommended_action_taken:
-                    combat_engagement_reward += (
-                        0.5 * ENV_CONFIG["combat_engagement_weight"]
-                    )
+                    combat_engagement_reward += 0.4 * weights["combat"]
+
+            # Defensive positioning reward - staying alive is important
+            defensive_reward = 0
+
+            # Reward for not taking damage over time
+            if self.frames_since_damage > 30:  # No damage for 1 second
+                defensive_reward += (
+                    min(self.frames_since_damage / 300, 1.0) * weights["defensive"]
+                )
+
+            # Reward for successful dodge (defensive action followed by no damage)
+            if defensive_action and self.frames_since_damage > 15 and highest_threat:
+                defensive_reward += 0.3 * weights["defensive"]
+                self.successful_dodge_count += 1
+
+            # Strategic retreat bonus when appropriate
+            if (
+                strategic_retreat
+                and highest_threat
+                and len(self.known_enemy_positions) >= 3
+            ):
+                defensive_reward += (
+                    ENV_CONFIG["strategic_retreat_bonus"] * weights["defensive"]
+                )
 
             # Check that episode_steps is still an integer before the modulo operation
             if not isinstance(self.episode_steps, int):
@@ -500,40 +634,53 @@ class KungFuMasterEnv(gym.Wrapper):
                 except Exception as e:
                     logger.error(f"Error in episode step logging: {e}")
 
-            # ENHANCED: Improved reward calculation
+            # ENHANCED: Improved reward calculation with dynamic weights
             reward = score_diff * 0.3
 
-            # Stage progression bonus
-            if current_stage > self.prev_stage:
-                stage_bonus = 20.0 * ENV_CONFIG["progression_weight"]
+            # Stage progression bonus - increases with stage number
+            if stage_changed:
+                stage_bonus = 20.0 * weights["progression"]
                 reward += stage_bonus
 
-            # Progress reward - adjusted based on stage direction
+            # Progress reward - adjusted based on stage direction and scaled by progression weight
             if progress > 0:
-                progress_reward = progress * 0.07 * ENV_CONFIG["progression_weight"]
+                # Scale progress reward by stage time - encourage faster completion
+                time_factor = max(0.5, 1.0 - (stage_time / self.stage_time_limit))
+                progress_reward = progress * 0.07 * weights["progression"] * time_factor
                 reward += progress_reward
 
-            # Damage penalty
+            # Damage penalty - more severe in later stages
             if damage_taken > 0:
-                reward -= damage_taken * 0.1
+                damage_penalty = damage_taken * 0.1 * (1 + current_stage * 0.2)
+                reward -= damage_penalty
 
             # Vertical positioning reward - optimal fighting position
             optimal_y = 160
             y_distance = abs(current_y_pos - optimal_y)
             if y_distance < 30:
-                reward += 0.05
+                reward += 0.05 * weights["defensive"]
 
-            # Penalties for standing still or making no progress
-            if self.standing_still_count > 15:
+            # Penalties for standing still or making no progress - less severe if strategic
+            if self.standing_still_count > 15 and not (
+                strategic_retreat or defensive_action
+            ):
                 reward -= 0.08 * (self.standing_still_count - 15)
-            if self.no_progress_count > 25:
+
+            if self.no_progress_count > 25 and not strategic_retreat:
                 reward -= 0.15 * (self.no_progress_count - 25)
 
             # Add combat engagement reward
             reward += combat_engagement_reward
 
-            # Small survival reward
-            reward += 0.01
+            # Add defensive reward
+            reward += defensive_reward
+
+            # Small survival reward that increases with stage number
+            reward += 0.01 * (1 + current_stage * 0.1)
+
+            # Health preservation bonus - reward for maintaining high health
+            health_ratio = current_hp / 100.0  # Assuming max health is 100
+            reward += health_ratio * 0.05 * weights["defensive"]
 
             enemies_defeated = 0
             try:
@@ -570,6 +717,12 @@ class KungFuMasterEnv(gym.Wrapper):
                         "attack_attempt": int(attack_attempt),
                         "strategic_position": int(abs(current_y_pos - 160) < 30),
                         "combat_engagement_reward": float(combat_engagement_reward),
+                        "defensive_reward": float(defensive_reward),
+                        "dynamic_progression_weight": float(weights["progression"]),
+                        "dynamic_combat_weight": float(weights["combat"]),
+                        "successful_dodges": int(self.successful_dodge_count),
+                        "frames_without_damage": int(self.frames_since_damage),
+                        "strategic_retreat": int(strategic_retreat),
                     }
                 )
 
@@ -610,21 +763,6 @@ class KungFuMasterEnv(gym.Wrapper):
             # Create a blank frame if render fails
             frame = np.zeros((210, 160, 3), dtype=np.uint8)
 
-        # Visualize threats
-        if self.last_observation is not None:
-            frame = self.threat_detector.visualize_threats(frame)
-
-        return frame
-
-    def close(self):
-        try:
-            if hasattr(self.env, "close"):
-                self.env.close()
-            logger.info("KungFuMasterEnv closed successfully")
-        except Exception as e:
-            logger.error(f"Error closing KungFuMasterEnv: {e}")
-        RetroEnvManager.get_instance().unregister_env(self)
-
 
 def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=False):
     try:
@@ -647,6 +785,7 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=False):
         env = KungFuMasterEnv(env)
 
         # Use a wrapper that converts to channel-first format (what SB3 expects)
+        # Fixed ChannelFirstWrapper class for kung_fu_env.py
         class ChannelFirstWrapper(gym.ObservationWrapper):
             def __init__(self, env):
                 super().__init__(env)
@@ -666,11 +805,20 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=False):
                     )
 
             def observation(self, observation):
-                # Convert from (H, W, C) to (C, H, W) or (N, H, W, 1) to (N, H, W)
+                # Check the shape to determine proper handling
                 if len(observation.shape) == 3 and observation.shape[-1] == 1:
-                    return np.transpose(observation, (2, 0, 1)).squeeze(-1)
+                    # For (H, W, 1) -> (1, H, W)
+                    return np.transpose(observation, (2, 0, 1))
                 elif len(observation.shape) == 4 and observation.shape[-1] == 1:
+                    # For (N, H, W, 1) -> (N, H, W)
                     return observation.squeeze(-1)
+                elif len(observation.shape) == 3 and observation.shape[0] == 1:
+                    # Already in (1, H, W) format
+                    return observation
+                elif len(observation.shape) == 2:
+                    # For (H, W) -> (1, H, W)
+                    return observation[np.newaxis, ...]
+                # Default fallback
                 return observation
 
         class CustomWarpFrame(WarpFrame):
@@ -700,7 +848,8 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=False):
                 obs = super().observation(observation)
                 return np.array(obs)
 
-        env = CustomFrameStack(env, frame_stack)
+        if frame_stack > 1:
+            env = CustomFrameStack(env, frame_stack)
 
         # Apply channel-first conversion after frame stacking
         env = ChannelFirstWrapper(env)
