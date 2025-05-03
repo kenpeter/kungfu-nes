@@ -24,7 +24,7 @@ logger = logging.getLogger("kungfu_env")
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG for detailed tracing
+    level=logging.INFO,  # Changed to INFO for less verbose logs
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     filename="kungfu_env.log",
 )
@@ -92,12 +92,14 @@ MAX_EPISODE_STEPS = 3600  # 2 minutes
 # Set default model path
 MODEL_PATH = "model/kungfu_model.zip"
 
-# Global config for environment behavior
+# Global config for environment behavior with simplified weights
 ENV_CONFIG = {
-    "progression_weight": 1.5,
-    "combat_engagement_weight": 1.8,  # Increased from 1.2 to promote more combat
-    "enemy_detection_range": 120,  # Range to detect distant enemies
-    "proactive_combat_bonus": 0.8,  # Bonus for moving toward enemies
+    "progression_weight": 2.0,  # Increased to emphasize progression
+    "combat_engagement_weight": 1.5,  # Adjusted for balance
+    "enemy_detection_range": 120,
+    "proactive_combat_bonus": 0.5,  # Reduced to avoid over-aggression
+    "defensive_bonus": 0.1,  # Significantly reduced to prevent over-defensive play
+    "strategic_retreat_bonus": 0.01,  # Minimal retreat bonus
 }
 
 
@@ -143,7 +145,6 @@ class KungFuMasterEnv(gym.Wrapper):
         self.KUNGFU_ACTION_NAMES = KUNGFU_ACTION_NAMES
 
         # Create an action space that matches the KUNGFU_ACTIONS format
-        # Option 1: If using index-based actions with the PPO agent
         self.action_space = gym.spaces.Discrete(len(self.KUNGFU_ACTIONS))
 
         # Initialize threat detection system
@@ -163,6 +164,13 @@ class KungFuMasterEnv(gym.Wrapper):
         self.no_progress_count = 0
         self.enemy_distance_history = deque(maxlen=10)
 
+        # Track time since last damage taken for defensive strategy evaluation
+        self.frames_since_damage = 0
+
+        # Track stage time to adjust rewards based on progression
+        self.current_stage_start_time = 0
+        self.stage_time_limit = 1200  # 40 seconds per stage
+
         # Tracking for threat-based decisions
         self.last_recommended_action = None
         self.recommended_action_taken = False
@@ -170,7 +178,7 @@ class KungFuMasterEnv(gym.Wrapper):
         # Flag to track whether reset has been called
         self.reset_called = False
 
-        logger.info("KungFuMasterEnv initialized with enhanced action space")
+        logger.info("KungFuMasterEnv initialized with simplified action space")
         logger.info(f"Environment configuration: {ENV_CONFIG}")
 
     def get_ram(self):
@@ -249,6 +257,8 @@ class KungFuMasterEnv(gym.Wrapper):
         self.no_progress_count = 0
         self.last_recommended_action = None
         self.recommended_action_taken = False
+        self.frames_since_damage = 0
+        self.current_stage_start_time = 0
 
         # Check if enemy_distance_history is a deque, recreate if not
         if not isinstance(self.enemy_distance_history, deque):
@@ -265,11 +275,6 @@ class KungFuMasterEnv(gym.Wrapper):
         # Reset threat detector
         self.last_observation = obs
 
-        # Debug log for episode_steps
-        logger.debug(
-            f"After reset, self.episode_steps type={type(self.episode_steps)}, value={self.episode_steps}"
-        )
-
         logger.info(
             f"Reset - Stage: {self.prev_stage}, HP: {self.prev_hp}, "
             f"Pos: ({self.prev_x_pos}, {self.prev_y_pos}), Score: {self.prev_score}"
@@ -284,11 +289,6 @@ class KungFuMasterEnv(gym.Wrapper):
             )
             self.reset()
 
-        # Debug logging at step start
-        logger.debug(
-            f"Step begin, self.episode_steps type={type(self.episode_steps)}, value={self.episode_steps}"
-        )
-
         # Ensure episode_steps is an integer
         if not isinstance(self.episode_steps, int):
             logger.error(
@@ -296,8 +296,11 @@ class KungFuMasterEnv(gym.Wrapper):
             )
             self.episode_steps = 0
 
-        # Increment steps - ensure they're integers first
+        # Increment steps
         self.episode_steps = int(self.episode_steps) + 1
+
+        # Increment frames since damage
+        self.frames_since_damage += 1
 
         # Get the actual button combination for logging/info purpose only
         button_combination = None
@@ -310,9 +313,7 @@ class KungFuMasterEnv(gym.Wrapper):
                     logger.warning(
                         f"Action {action} out of bounds, using {safe_action} instead"
                     )
-                # Store the button combination for reference, but don't pass it to env.step
                 button_combination = self.KUNGFU_ACTIONS[safe_action]
-                # The key fix: use the integer action directly
                 actual_action = safe_action
             else:
                 logger.error(f"Received non-integer action: {action}, using No-op")
@@ -328,9 +329,6 @@ class KungFuMasterEnv(gym.Wrapper):
             if self.last_recommended_action is not None:
                 action_index = self.last_recommended_action.value
                 self.recommended_action_taken = action_index == actual_action
-                logger.debug(
-                    f"Recommended action taken: {self.recommended_action_taken}"
-                )
         except Exception as e:
             logger.error(f"Error checking recommended action: {e}")
             self.recommended_action_taken = False
@@ -376,7 +374,7 @@ class KungFuMasterEnv(gym.Wrapper):
             player_pos = (current_x_pos, current_y_pos)
             current_time = time.time()
 
-            # Process frame for threats
+            # Process frame for threats - simplified
             highest_threat, all_threats = self.threat_detector.process_frame(
                 obs, player_pos, current_time
             )
@@ -416,18 +414,34 @@ class KungFuMasterEnv(gym.Wrapper):
             if damage_taken < 0:
                 damage_taken = 0
 
-            # FIXED: Corrected stage progression logic
+            # If damage was taken, reset frames_since_damage counter
+            if damage_taken > 0:
+                self.frames_since_damage = 0
+
+            # Check for stage change
+            stage_changed = current_stage > self.prev_stage
+            if stage_changed:
+                self.current_stage_start_time = self.episode_steps
+
+            # SIMPLIFIED: Stage progression logic
             # Odd stages (1,3,5) - progress is measured by moving RIGHT (x increases)
             # Even stages (2,4,6) - progress is measured by moving LEFT (x decreases)
             if current_stage in [2, 4, 6]:  # Even stages - progress left
                 progress = self.prev_x_pos - current_x_pos
+                # Don't penalize for being at left boundary
+                if current_x_pos < 20:
+                    progress = max(0, progress)
                 if current_stage > self.prev_stage:
                     progress += 100
             else:  # Odd stages (1,3,5) - progress right
                 progress = current_x_pos - self.prev_x_pos
+                # Don't penalize for being at right boundary
+                if current_x_pos > 230:
+                    progress = max(0, progress)
                 if current_stage > self.prev_stage:
                     progress += 100
 
+            # Track standing still and no progress
             if abs(progress) < 2:
                 self.no_progress_count += 1
             else:
@@ -444,52 +458,36 @@ class KungFuMasterEnv(gym.Wrapper):
             recorded_progress = max(0, progress)
 
             attack_attempt = action in [1, 6, 7, 9, 10, 11]
+            defensive_action = action in [2, 3, 4]  # Jump, crouch, move left
 
-            # SIMPLIFIED: Improved combat engagement reward calculation
+            # SIMPLIFIED: Combat engagement reward - focused on attacking
             combat_engagement_reward = 0
 
-            # Add threat-based combat rewards
+            # Add threat-based combat rewards - simplified
             if highest_threat and highest_threat.threat_type == ThreatType.REGULAR:
                 # Reward for detecting threats
-                combat_engagement_reward += 0.3 * ENV_CONFIG["combat_engagement_weight"]
+                combat_engagement_reward += 0.2 * ENV_CONFIG["combat_engagement_weight"]
 
-                # Bonus for being close to threats
-                if highest_threat.distance_to_player < 30:
-                    combat_engagement_reward += (
-                        0.4 * ENV_CONFIG["combat_engagement_weight"]
-                    )
-
-                # Reward for attacking in correct direction
-                if attack_attempt:
-                    if (
-                        highest_threat.direction == ThreatDirection.LEFT
-                        and action in [11]
-                    ) or (
-                        highest_threat.direction == ThreatDirection.RIGHT
-                        and action in [10]
-                    ):
-                        combat_engagement_reward += (
-                            0.6 * ENV_CONFIG["combat_engagement_weight"]
-                        )
-
-                # Reward for taking recommended action
-                if self.recommended_action_taken:
+                # Reward attacking threats that are close
+                if highest_threat.distance_to_player < 40 and attack_attempt:
                     combat_engagement_reward += (
                         0.5 * ENV_CONFIG["combat_engagement_weight"]
                     )
 
-            # Check that episode_steps is still an integer before the modulo operation
-            if not isinstance(self.episode_steps, int):
-                logger.error(
-                    f"self.episode_steps became non-integer before modulo: {type(self.episode_steps)}. Fixing."
-                )
-                # Convert or reset to integer to avoid modulo error
-                try:
-                    self.episode_steps = int(self.episode_steps)
-                except (ValueError, TypeError):
-                    self.episode_steps = 0
+                # Bonus for recommended action
+                if self.recommended_action_taken:
+                    combat_engagement_reward += (
+                        0.3 * ENV_CONFIG["combat_engagement_weight"]
+                    )
 
-            # Now safely perform the modulo operation
+            # SIMPLIFIED: Defensive reward - minimal to prevent over-defensive play
+            defensive_reward = 0
+            if (
+                self.frames_since_damage > 60 and attack_attempt
+            ):  # Only reward avoiding damage if also attacking
+                defensive_reward += 0.1 * ENV_CONFIG["defensive_bonus"]
+
+            # Log status every 100 steps
             if self.episode_steps % 100 == 0:
                 try:
                     time_left = (MAX_EPISODE_STEPS - self.episode_steps) / 30
@@ -500,37 +498,40 @@ class KungFuMasterEnv(gym.Wrapper):
                 except Exception as e:
                     logger.error(f"Error in episode step logging: {e}")
 
-            # ENHANCED: Improved reward calculation
+            # SIMPLIFIED: Reward calculation - emphasize progression and combat
             reward = score_diff * 0.3
 
-            # Stage progression bonus
-            if current_stage > self.prev_stage:
-                stage_bonus = 20.0 * ENV_CONFIG["progression_weight"]
+            # Stage progression bonus - big reward
+            if stage_changed:
+                stage_bonus = 25.0 * ENV_CONFIG["progression_weight"]  # Increased bonus
                 reward += stage_bonus
 
-            # Progress reward - adjusted based on stage direction
+            # Progress reward - major component
             if progress > 0:
-                progress_reward = progress * 0.07 * ENV_CONFIG["progression_weight"]
+                progress_reward = progress * 0.1 * ENV_CONFIG["progression_weight"]
                 reward += progress_reward
 
-            # Damage penalty
+            # Damage penalty - moderate
             if damage_taken > 0:
                 reward -= damage_taken * 0.1
 
-            # Vertical positioning reward - optimal fighting position
+            # Vertical positioning reward - minor
             optimal_y = 160
             y_distance = abs(current_y_pos - optimal_y)
             if y_distance < 30:
                 reward += 0.05
 
             # Penalties for standing still or making no progress
-            if self.standing_still_count > 15:
-                reward -= 0.08 * (self.standing_still_count - 15)
-            if self.no_progress_count > 25:
-                reward -= 0.15 * (self.no_progress_count - 25)
+            if self.standing_still_count > 20:  # Increased threshold
+                reward -= 0.05 * (self.standing_still_count - 20)  # Reduced penalty
+            if self.no_progress_count > 30:  # Increased threshold
+                reward -= 0.1 * (self.no_progress_count - 30)  # Reduced penalty
 
             # Add combat engagement reward
             reward += combat_engagement_reward
+
+            # Add defensive reward - minimal
+            reward += defensive_reward
 
             # Small survival reward
             reward += 0.01
@@ -542,16 +543,6 @@ class KungFuMasterEnv(gym.Wrapper):
             except Exception as e:
                 logger.error(f"Error calculating enemies_defeated: {e}")
                 enemies_defeated = 0
-
-            # Ensure episode_steps is still an integer before calculating time_remaining
-            if not isinstance(self.episode_steps, int):
-                logger.error(
-                    f"self.episode_steps became non-integer before time calculation: {type(self.episode_steps)}. Fixing."
-                )
-                try:
-                    self.episode_steps = int(self.episode_steps)
-                except (ValueError, TypeError):
-                    self.episode_steps = 0
 
             try:
                 time_remaining = (MAX_EPISODE_STEPS - self.episode_steps) / 30
@@ -570,6 +561,8 @@ class KungFuMasterEnv(gym.Wrapper):
                         "attack_attempt": int(attack_attempt),
                         "strategic_position": int(abs(current_y_pos - 160) < 30),
                         "combat_engagement_reward": float(combat_engagement_reward),
+                        "defensive_reward": float(defensive_reward),
+                        "frames_without_damage": int(self.frames_since_damage),
                     }
                 )
 
@@ -609,21 +602,7 @@ class KungFuMasterEnv(gym.Wrapper):
             logger.error(f"Error in render: {e}")
             # Create a blank frame if render fails
             frame = np.zeros((210, 160, 3), dtype=np.uint8)
-
-        # Visualize threats
-        if self.last_observation is not None:
-            frame = self.threat_detector.visualize_threats(frame)
-
         return frame
-
-    def close(self):
-        try:
-            if hasattr(self.env, "close"):
-                self.env.close()
-            logger.info("KungFuMasterEnv closed successfully")
-        except Exception as e:
-            logger.error(f"Error closing KungFuMasterEnv: {e}")
-        RetroEnvManager.get_instance().unregister_env(self)
 
 
 def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=False):
@@ -666,11 +645,20 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=False):
                     )
 
             def observation(self, observation):
-                # Convert from (H, W, C) to (C, H, W) or (N, H, W, 1) to (N, H, W)
+                # Check the shape to determine proper handling
                 if len(observation.shape) == 3 and observation.shape[-1] == 1:
-                    return np.transpose(observation, (2, 0, 1)).squeeze(-1)
+                    # For (H, W, 1) -> (1, H, W)
+                    return np.transpose(observation, (2, 0, 1))
                 elif len(observation.shape) == 4 and observation.shape[-1] == 1:
+                    # For (N, H, W, 1) -> (N, H, W)
                     return observation.squeeze(-1)
+                elif len(observation.shape) == 3 and observation.shape[0] == 1:
+                    # Already in (1, H, W) format
+                    return observation
+                elif len(observation.shape) == 2:
+                    # For (H, W) -> (1, H, W)
+                    return observation[np.newaxis, ...]
+                # Default fallback
                 return observation
 
         class CustomWarpFrame(WarpFrame):
@@ -691,7 +679,7 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=False):
         env = CustomWarpFrame(env)
         env = ClipRewardEnv(env)
 
-        # Apply frame stacking
+        # Apply frame stacking - using standard consecutive frames
         class CustomFrameStack(FrameStack):
             def __init__(self, env, num_stack):
                 super().__init__(env, num_stack)
@@ -700,7 +688,8 @@ def make_kungfu_env(is_play_mode=False, frame_stack=4, use_dfp=False):
                 obs = super().observation(observation)
                 return np.array(obs)
 
-        env = CustomFrameStack(env, frame_stack)
+        if frame_stack > 1:
+            env = CustomFrameStack(env, frame_stack)
 
         # Apply channel-first conversion after frame stacking
         env = ChannelFirstWrapper(env)
