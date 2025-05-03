@@ -98,8 +98,8 @@ ENV_CONFIG = {
     "combat_engagement_weight": 1.5,  # Adjusted for balance
     "enemy_detection_range": 120,
     "proactive_combat_bonus": 0.5,  # Reduced to avoid over-aggression
-    "defensive_bonus": 0.2,  # Significantly reduced to prevent over-defensive play
-    "strategic_retreat_bonus": 0.1,  # Minimal retreat bonus
+    "defensive_bonus": 0.1,  # Significantly reduced to prevent over-defensive play
+    "strategic_retreat_bonus": 0.01,  # Minimal retreat bonus
 }
 
 
