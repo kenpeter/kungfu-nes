@@ -428,7 +428,13 @@ class TrainingCallback(BaseCallback):
 
     def _on_step(self):
         # Update training progress
-        progress = self.n_calls / self.total_timesteps
+        # Ensure total_timesteps is an integer
+        if isinstance(self.total_timesteps, list):
+            total_steps = self.total_timesteps[0] if self.total_timesteps else 1000000
+        else:
+            total_steps = self.total_timesteps
+
+        progress = self.n_calls / total_steps
 
         # Log metrics at regular intervals
         if self.n_calls % self.log_freq == 0:
@@ -455,7 +461,7 @@ class TrainingCallback(BaseCallback):
                     damages = [
                         ep_info.get("damage_taken", 0) for ep_info in valid_episodes
                     ]
-                    progress = [
+                    progress_values = [
                         ep_info.get("progress_made", 0) for ep_info in valid_episodes
                     ]
                     stages = [
@@ -475,7 +481,9 @@ class TrainingCallback(BaseCallback):
 
                         # Estimate progress in current highest stage
                         if max_stage_seen <= 5:
-                            progress_in_stage = max(progress) / 1000 if progress else 0
+                            progress_in_stage = (
+                                max(progress_values) / 1000 if progress_values else 0
+                            )
                             self.stage_progress[max_stage_seen] = min(
                                 progress_in_stage, 1.0
                             )
@@ -516,7 +524,7 @@ class TrainingCallback(BaseCallback):
 
                     mean_score = np.mean(scores) if scores else 0
                     mean_damage = np.mean(damages) if damages else 0
-                    mean_progress = np.mean(progress) if progress else 0
+                    mean_progress = np.mean(progress_values) if progress_values else 0
                     max_stage = np.max(stages) if stages else 0
 
                     # Store metrics in reward components for analysis
@@ -541,15 +549,20 @@ class TrainingCallback(BaseCallback):
             if hasattr(self.model.policy, "get_entropy_coef"):
                 entropy_coef = self.model.policy.get_entropy_coef()
 
+            # Create a string representation of stage progress for logging
+            stage_progress_str = ", ".join(
+                [f"{s}:{self.stage_progress[s]:.1%}" for s in self.stage_progress]
+            )
+
             # Build log message
             log_msg = (
-                f"Step: {self.n_calls}/{self.total_timesteps} ({progress:.1%}), "
+                f"Step: {self.n_calls}/{total_steps} ({progress:.1%}), "
                 f"Mean reward: {mean_reward:.2f}, "
                 f"Mean score: {mean_score:.1f}, Mean damage: {mean_damage:.1f}, "
                 f"Mean progress: {mean_progress:.1f}, Max stage: {max_stage}, "
                 f"Combat engagement: {combat_engagement:.2f}, "
                 f"Entropy: {entropy_coef:.4f}, "
-                f"Stage progress: {[f'{s}:{p:.1%}' for s, p in self.stage_progress.items()]}"
+                f"Stage progress: {stage_progress_str}"
             )
 
             logger.info(log_msg)
