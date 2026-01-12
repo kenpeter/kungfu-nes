@@ -1,3 +1,5 @@
+![Kung Fu Master](kungfu-banner.jpg)
+
 # Kung Fu Master AI Agent
 
 **Teaching AI to master retro games through deep reinforcement learning** - A production-grade RL system featuring custom neural architectures, distributed GPU training, and advanced reward engineering.
