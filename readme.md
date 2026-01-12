@@ -1,24 +1,41 @@
-# Kung Fu Master AI
+# Kung Fu Master AI Agent
 
-Deep reinforcement learning agent that masters the NES game Kung Fu using PPO and custom neural networks.
+**Teaching AI to master retro games through deep reinforcement learning** - A production-grade RL system featuring custom neural architectures, distributed GPU training, and advanced reward engineering.
 
-## What I Built
+## Core Achievements
 
-- **Custom RL Agent**: PPO with multi-input policy (visual + game state)
-- **Neural Architecture**: Custom CNN for vision + dense layers for game state
-- **Distributed Training**: Multi-process parallelization with GPU acceleration
-- **Training Tools**: Recording/playback system, checkpointing, metrics tracking
+🧠 **Custom Multi-Modal Neural Architecture** - Designed and implemented a hybrid CNN + MLP network that processes both visual frames (84x84x4) and structured game state (enemy positions, HP, projectiles) for superior decision-making
+
+⚡ **High-Performance Distributed Training** - Built CUDA-optimized training pipeline with multi-process parallelization (4+ environments), achieving efficient learning through vectorized experience collection
+
+🎯 **Advanced Reward Engineering** - Solved the sparse reward problem by designing dense reward signals across multiple objectives: combat effectiveness, survival optimization, and tactical positioning
+
+🛠️ **Production-Ready ML System** - Implemented robust training infrastructure with emergency saves, checkpoint recovery, experience replay, and comprehensive metrics tracking
 
 ## Tech Stack
 
-Python • PyTorch • Stable-Baselines3 • CUDA • OpenAI Gym-Retro
+**ML/AI**: PyTorch • Stable-Baselines3 PPO • Custom CNN Architecture • CUDA
+**Environment**: OpenAI Gym-Retro • NumPy • Multi-process vectorization
 
-## Key Features
+## Technical Deep Dive
 
-**Smart Reward Design** - Shaped rewards for combat, survival, and positioning
-**GPU Optimized** - CUDA training with multi-environment parallelization
-**Production Ready** - Error handling, logging, emergency saves, checkpoint recovery
-**Imitation Learning** - Record human gameplay to bootstrap training
+### Multi-Modal State Processing
+- **Visual Pipeline**: Custom CNN with adaptive pooling processes 84x84x4 stacked frames
+- **State Vector**: 144-dimensional feature space tracking 5 enemies + projectiles + player stats
+- **Fusion Architecture**: Multi-input actor-critic policy combines visual and symbolic reasoning
+
+### Training Infrastructure
+- **Parallelized Learning**: SubprocVecEnv with 4+ simultaneous game instances
+- **GPU Acceleration**: CUDA-optimized neural network training with efficient memory management
+- **Smart Checkpointing**: Auto-save best models based on composite scoring (combat + survival + diversity)
+- **Imitation Learning**: Bootstrap training from human demonstrations via NPZ recording system
+
+### Intelligent Reward Shaping
+Engineered multi-objective reward function balancing:
+- Combat metrics (enemy hits, damage dealt)
+- Survival incentives (HP preservation, dodge rewards)
+- Tactical positioning (enemy distance, action diversity)
+- Normalized rewards for stable gradient descent
 
 ## Quick Start
 
@@ -36,18 +53,30 @@ python train.py --render --resume
 python capture.py --state_file gameplay.state
 ```
 
-## Technical Highlights
+## Implementation Highlights
 
-**Multi-Modal Input Processing** - Combines CNN visual features with structured game state (enemy positions, HP, projectiles)
+**Custom Environment Design** - Built wrapper with observation preprocessing, multi-enemy tracking system, and frame stacking for temporal awareness
 
-**Distributed Training** - Parallel environment processing for faster learning
+**Neural Architecture Innovation** - Designed hybrid network architecture processing both pixel data and structured state vectors (144-dim feature space)
 
-**Reward Engineering** - Solved sparse reward problem with dense signals for combat effectiveness and survival
+**Distributed GPU Training** - Multi-process vectorized environments with CUDA optimization for 4x+ training speedup
 
-## Skills Demonstrated
+**Robust ML Pipeline** - Production-grade error handling, emergency saves, SIGINT handlers, and comprehensive logging
 
-Deep RL • Neural Network Design • GPU Optimization • System Engineering • Python
+## What This Demonstrates
+
+**Deep RL Expertise** → Implemented PPO from Stable-Baselines3 with custom multi-input policy and reward engineering
+
+**System Design** → Architected complete ML pipeline: data collection, training, evaluation, deployment
+
+**Performance Engineering** → CUDA optimization, multi-process parallelization, efficient memory management
+
+**Problem Solving** → Solved sparse rewards, designed multi-objective reward functions, balanced exploration vs exploitation
+
+**Production Skills** → Error handling, checkpointing, logging, graceful degradation, user-facing tools
 
 ---
 
-Built end-to-end: from environment design and reward shaping to distributed training and model deployment.
+**Built end-to-end**: Environment design → Reward engineering → Neural architecture → Distributed training → Model deployment
+
+💼 This project showcases skills directly applicable to ML engineering roles in robotics, autonomous systems, game AI, and production ML infrastructure.
